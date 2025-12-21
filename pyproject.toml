@@ -4,9 +4,29 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = [
-    "apache-airflow==3.1.3",
-    "apache-airflow-providers-fab",
-    "polars>=1.36.1",
-    "requests>=2.32.5",
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
 ]
+dependencies = [
+  "apache-airflow==3.1.3",
+  "apache-airflow-providers-fab",
+  "polars>=1.36.1",
+  "requests>=2.32.5",
+]
+
+[dependency-groups]
+dev = [
+  "pre-commit>=4.5.1",
+  "pyproject-fmt>=2.11.1",
+  "pytest>=9.0.2",
+  "ruff>=0.14.10",
+  "ty>=0.0.5",
+]
+
+[tool.ruff]
+# Extend default rules with Airflow-specific rules
+lint.extend-select = [ "AIR" ]
