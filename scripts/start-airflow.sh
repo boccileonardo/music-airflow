@@ -1,7 +1,11 @@
 #!/bin/bash
 
-export AIRFLOW_HOME=/home/leo/repos/music-airflow/airflow
+# Get the project root directory (parent of scripts/)
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
+
+export AIRFLOW_HOME="$PROJECT_ROOT/airflow"
 export AIRFLOW__CORE__LOAD_EXAMPLES=False
+export AIRFLOW__CORE__DAGS_FOLDER="$PROJECT_ROOT/src/dags"
 
 # Create .env if it doesn't exist
 touch .env
