@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import datetime as dt
 
@@ -21,46 +22,73 @@ def tutorial_taskflow_api():
     [here](https://airflow.apache.org/docs/apache-airflow/stable/tutorial_taskflow_api.html)
     """
 
-    @task()
+    @task(retries=3)
     def extract():
         """
         #### Extract task
         A simple Extract task to get data ready for the rest of the data
         pipeline. In this case, getting data is simulated by reading from a
         hardcoded JSON string.
+
+        Returns only the file path (metadata), not the data itself.
         """
         data_string = '{"1001": 301.27, "1002": 433.21, "1003": 502.22}'
-
         order_data_dict = json.loads(data_string)
-        return order_data_dict
 
-    @task(multiple_outputs=True)
-    def transform(order_data_dict: dict):
+        # Create data directory if it doesn't exist
+        data_dir = Path(__file__).parent.parent.parent / "data"
+        data_dir.mkdir(exist_ok=True)
+
+        # Write data to file
+        output_path = data_dir / "order_data.json"
+        with open(output_path, "w") as f:
+            json.dump(order_data_dict, f, indent=2)
+
+        # Return only metadata (file path and record count)
+        return {"path": str(output_path), "records": len(order_data_dict)}
+
+    @task()
+    def transform(extract_metadata: dict):
         """
         #### Transform task
-        A simple Transform task which takes in the collection of order data and
+        A simple Transform task which takes in the file location of order data and
         computes the total order value.
-        """
-        total_order_value = 0
 
+        Returns only the file path (metadata), not the data itself.
+        """
+        # Read data from file
+        with open(extract_metadata["path"], "r") as f:
+            order_data_dict = json.load(f)
+
+        total_order_value = 0
         for value in order_data_dict.values():
             total_order_value += value
 
-        return {"total_order_value": total_order_value}
+        # Write results to file
+        data_dir = Path(extract_metadata["path"]).parent
+        output_path = data_dir / "order_summary.json"
+        with open(output_path, "w") as f:
+            json.dump({"total_order_value": total_order_value}, f, indent=2)
+
+        # Return only metadata (file path)
+        return {"path": str(output_path), "total_order_value": total_order_value}
 
     @task()
-    def load(total_order_value: float):
+    def load(transform_metadata: dict):
         """
         #### Load task
         A simple Load task which takes in the result of the Transform task and
-        instead of saving it to end user review, just prints it out.
+        prints it out.
         """
+        # Read from file
+        with open(transform_metadata["path"], "r") as f:
+            data = json.load(f)
 
-        print(f"Total order value is: {total_order_value:.2f}")
+        print(f"Total order value is: {data['total_order_value']:.2f}")
 
-    order_data = extract()
-    order_summary = transform(order_data)
-    load(order_summary["total_order_value"])
+    extract_metadata = extract()
+    transform_metadata = transform(extract_metadata)
+    load(transform_metadata)
 
 
 tutorial_taskflow_api()
