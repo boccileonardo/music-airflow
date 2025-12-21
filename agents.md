@@ -98,7 +98,14 @@ def analyze_data(metadata: dict):
     # ... analyze
 ```
 
-## 4. Testing
+## 4. Data processing library (polars not pandas)
+
+- Use `polars` for all data processing tasks.
+- Avoid using `pandas` unless absolutely necessary for compatibility reasons.
+- Use the polars lazyframe API instead of the dataframe API where possible for better performance.
+
+
+## 5. Testing
 
 **Test Location:** `tests/`
 
@@ -121,7 +128,7 @@ def test_dag_loads():
     assert len(dag_bag.import_errors) == 0
 ```
 
-## 5. Project Structure
+## 6. Project Structure
 
 ```
 src/

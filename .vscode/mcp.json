@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "lastfm-docs": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "mcp/last_fm_docs.py"]
+    }
+  }
+}
