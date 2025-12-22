@@ -66,6 +66,7 @@ class JSONIOManager:
 
         return {
             "path": str(path.absolute()),
+            "filename": filename,
             "rows": record_count,
             "format": "json",
             "medallion_layer": self.medallion_layer,
@@ -158,6 +159,7 @@ class PolarsParquetIOManager:
 
         return {
             "path": str(path.absolute()),
+            "filename": filename,
             "rows": rows,
             "schema": {name: str(dtype) for name, dtype in schema.items()},
             "format": "parquet",

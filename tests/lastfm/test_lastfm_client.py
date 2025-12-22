@@ -1,0 +1,240 @@
+"""
+Tests for LastFMClient API functionality.
+
+Tests API client methods including pagination, error handling,
+filtering, and retry logic.
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+import requests
+
+from music_airflow.lastfm_client import LastFMClient
+
+
+class TestLastFMClientInit:
+    """Test LastFMClient initialization."""
+
+    def test_init_with_api_key(self):
+        """Test initialization with explicit API key."""
+        client = LastFMClient(api_key="test_key", username="testuser")
+        assert client.api_key == "test_key"
+        assert client.username == "testuser"
+
+    def test_init_from_env(self, monkeypatch):
+        """Test initialization from environment variables."""
+        monkeypatch.setenv("api_key", "env_test_key")
+        client = LastFMClient(username="testuser")
+        assert client.api_key == "env_test_key"
+
+    def test_init_no_api_key_raises(self, monkeypatch, tmp_path):
+        """Test initialization fails without API key."""
+        # Create an empty .env file and remove any existing API key from environment
+        monkeypatch.delenv("api_key", raising=False)
+        # Mock the .env path to not load any keys
+        fake_env = tmp_path / ".env"
+        fake_env.touch()
+        with patch("music_airflow.lastfm_client.Path") as mock_path_class:
+            mock_path_class.return_value.parent.parent.parent = tmp_path
+            with pytest.raises(ValueError, match="Last.fm API key not found"):
+                LastFMClient()
+
+
+class TestGetRecentTracks:
+    """Test get_recent_tracks method."""
+
+    @patch.object(LastFMClient, "_make_request")
+    def test_basic_fetch(self, mock_request, sample_tracks_response):
+        """Test basic track fetching."""
+        mock_request.return_value = sample_tracks_response
+
+        client = LastFMClient(api_key="test_key")
+        tracks = client.get_recent_tracks(username="testuser")
+
+        assert len(tracks) == 3
+        assert tracks[0]["name"] == "Creep"
+        assert tracks[0]["artist"]["name"] == "Radiohead"
+        assert tracks[1]["name"] == "Yesterday"
+        assert tracks[2]["name"] == "Paint It Black"
+
+    @patch.object(LastFMClient, "_make_request")
+    def test_single_track_response(self, mock_request, sample_single_track_response):
+        """Test handling single track (dict instead of list)."""
+        mock_request.return_value = sample_single_track_response
+
+        client = LastFMClient(api_key="test_key")
+        tracks = client.get_recent_tracks(username="testuser")
+
+        assert len(tracks) == 1
+        assert tracks[0]["name"] == "Creep"
+
+    @patch.object(LastFMClient, "_make_request")
+    def test_filters_now_playing(self, mock_request, sample_now_playing_response):
+        """Test that 'now playing' tracks are filtered out."""
+        mock_request.return_value = sample_now_playing_response
+
+        client = LastFMClient(api_key="test_key")
+        tracks = client.get_recent_tracks(username="testuser")
+
+        # Should only get the track with timestamp, not the now playing one
+        assert len(tracks) == 1
+        assert tracks[0]["name"] == "Creep"
+        assert "date" in tracks[0]
+
+    @patch.object(LastFMClient, "_make_request")
+    def test_empty_response(self, mock_request, sample_empty_response):
+        """Test handling empty response."""
+        mock_request.return_value = sample_empty_response
+
+        client = LastFMClient(api_key="test_key")
+        tracks = client.get_recent_tracks(username="testuser")
+
+        assert len(tracks) == 0
+
+    @patch.object(LastFMClient, "_make_request")
+    def test_pagination(
+        self,
+        mock_request,
+        sample_paginated_response_page1,
+        sample_paginated_response_page2,
+    ):
+        """Test that pagination works correctly."""
+        mock_request.side_effect = [
+            sample_paginated_response_page1,
+            sample_paginated_response_page2,
+        ]
+
+        client = LastFMClient(api_key="test_key")
+        tracks = client.get_recent_tracks(username="testuser")
+
+        # Should get all 3 tracks from both pages
+        assert len(tracks) == 3
+        assert mock_request.call_count == 2
+        assert tracks[0]["name"] == "Track 1"
+        assert tracks[1]["name"] == "Track 2"
+        assert tracks[2]["name"] == "Track 3"
+
+    @patch.object(LastFMClient, "_make_request")
+    def test_with_time_range(self, mock_request, sample_tracks_response):
+        """Test fetching with from/to timestamps."""
+        mock_request.return_value = sample_tracks_response
+
+        client = LastFMClient(api_key="test_key")
+        tracks = client.get_recent_tracks(
+            username="testuser", from_timestamp=1609459200, to_timestamp=1609545600
+        )
+
+        # Verify parameters were passed correctly
+        call_args = mock_request.call_args[0][0]
+        assert call_args["from"] == 1609459200
+        assert call_args["to"] == 1609545600
+        assert len(tracks) == 3
+
+    def test_no_username_raises(self):
+        """Test that missing username raises error."""
+        client = LastFMClient(api_key="test_key")
+        with pytest.raises(ValueError, match="Username must be provided"):
+            client.get_recent_tracks()
+
+    def test_uses_instance_username(self):
+        """Test that instance username is used when not provided."""
+        with patch.object(LastFMClient, "_make_request") as mock_request:
+            mock_request.return_value = {"recenttracks": {"track": []}}
+
+            client = LastFMClient(api_key="test_key", username="default_user")
+            client.get_recent_tracks()
+
+            call_args = mock_request.call_args[0][0]
+            assert call_args["user"] == "default_user"
+
+
+class TestMakeRequest:
+    """Test _make_request method and retry logic."""
+
+    @patch("requests.get")
+    def test_successful_request(self, mock_get, sample_tracks_response):
+        """Test successful API request."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = sample_tracks_response
+        mock_get.return_value = mock_response
+
+        client = LastFMClient(api_key="test_key")
+        result = client._make_request({"method": "user.getrecenttracks"})
+
+        assert result == sample_tracks_response
+        mock_response.raise_for_status.assert_called_once()
+
+    @patch("requests.get")
+    def test_api_error_response(self, mock_get, sample_error_response):
+        """Test Last.fm API error response."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = sample_error_response
+        mock_get.return_value = mock_response
+
+        client = LastFMClient(api_key="test_key")
+        with pytest.raises(ValueError, match="Last.fm API error 6: User not found"):
+            client._make_request({"method": "user.getinfo"})
+
+    @patch("requests.get")
+    def test_http_error_retries(self, mock_get):
+        """Test that HTTP errors trigger retries."""
+        mock_get.side_effect = requests.exceptions.RequestException("Connection error")
+
+        client = LastFMClient(api_key="test_key")
+        with pytest.raises(requests.exceptions.RequestException):
+            client._make_request({"method": "user.getrecenttracks"})
+
+        # Should retry 3 times (default in tenacity decorator)
+        assert mock_get.call_count == 3
+
+    @patch("requests.get")
+    def test_retry_then_success(self, mock_get, sample_tracks_response):
+        """Test that retries eventually succeed."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = sample_tracks_response
+
+        # First two calls fail, third succeeds
+        mock_get.side_effect = [
+            requests.exceptions.RequestException("Error 1"),
+            requests.exceptions.RequestException("Error 2"),
+            mock_response,
+        ]
+
+        client = LastFMClient(api_key="test_key")
+        result = client._make_request({"method": "user.getrecenttracks"})
+
+        assert result == sample_tracks_response
+        assert mock_get.call_count == 3
+
+
+class TestGetUserInfo:
+    """Test get_user_info method."""
+
+    @patch.object(LastFMClient, "_make_request")
+    def test_get_user_info(self, mock_request, sample_user_info):
+        """Test fetching user information."""
+        mock_request.return_value = sample_user_info
+
+        client = LastFMClient(api_key="test_key")
+        user = client.get_user_info(username="testuser")
+
+        assert user["name"] == "testuser"
+        assert user["playcount"] == "12345"
+
+    def test_no_username_raises(self):
+        """Test that missing username raises error."""
+        client = LastFMClient(api_key="test_key")
+        with pytest.raises(ValueError, match="Username must be provided"):
+            client.get_user_info()
+
+    def test_uses_instance_username(self):
+        """Test that instance username is used when not provided."""
+        with patch.object(LastFMClient, "_make_request") as mock_request:
+            mock_request.return_value = {"user": {}}
+
+            client = LastFMClient(api_key="test_key", username="default_user")
+            client.get_user_info()
+
+            call_args = mock_request.call_args[0][0]
+            assert call_args["user"] == "default_user"
