@@ -4,6 +4,20 @@
       "type": "stdio",
       "command": "uv",
       "args": ["run", "mcp/last_fm_docs.py"]
+    },
+    "polars-docs": {
+      "command": "npx",
+      "args": ["mcp-remote", "https://mcp.polars.workers.dev/sse"]
+    },
+    "airflow-docs": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "mcp/airflow_docs.py"]
+    },
+    "streamlit-docs": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "mcp/streamlit_docs.py"]
     }
   }
 }
