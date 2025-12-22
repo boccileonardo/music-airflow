@@ -1,12 +1,12 @@
 """
 IO Manager for handling Polars DataFrame/LazyFrame and JSON read/write operations.
 
-This module provides centralized interfaces for Parquet and JSON I/O operations.
+This module provides centralized interfaces for Parquet, Delta, and JSON I/O operations.
 Supports both DataFrame and LazyFrame with automatic collection when needed.
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 import polars as pl
 
 
@@ -184,3 +184,152 @@ class PolarsParquetIOManager:
         if lazy:
             return pl.scan_parquet(path, **kwargs)
         return pl.read_parquet(path, **kwargs)
+
+
+class PolarsDeltaIOManager:
+    """
+    Manager for reading and writing Polars DataFrames to Delta Lake format.
+
+    Automatically handles LazyFrame collection (Delta Lake requires materialized DataFrames).
+    Supports merge operations for upserts with partition key optimization.
+
+    Methods:
+        write_delta: Write DataFrame or LazyFrame to Delta Lake with merge/upsert support.
+        read_delta: Read DataFrame or LazyFrame from Delta Lake.
+    """
+
+    def __init__(self, medallion_layer: str = "silver"):
+        """
+        Initialize Delta IO Manager.
+
+        Args:
+            medallion_layer: Medallion architecture layer (bronze, silver, or gold)
+        """
+        if medallion_layer not in ["bronze", "silver", "gold"]:
+            raise ValueError(
+                f"medallion_layer must be 'bronze', 'silver', or 'gold', got '{medallion_layer}'"
+            )
+        self.medallion_layer = medallion_layer
+        self.base_dir = (
+            Path(__file__).parent.parent.parent.parent / "data" / medallion_layer
+        )
+
+    def write_delta(
+        self,
+        df: pl.DataFrame | pl.LazyFrame,
+        table_name: str,
+        mode: Literal["merge", "append", "overwrite", "error"] = "merge",
+        predicate: str | None = None,
+        partition_by: str | list[str] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """
+        Write DataFrame or LazyFrame to Delta Lake format with merge/upsert support.
+
+        Args:
+            df: Polars DataFrame or LazyFrame to write
+            table_name: Table name (relative to medallion layer directory)
+            mode: Write mode - 'merge' for upsert, 'append', 'overwrite', or 'error'
+            predicate: Merge predicate for upsert (e.g., "s.id = t.id AND s.username = t.username")
+                      Required when mode='merge'. Use 's' for source and 't' for target alias.
+            partition_by: Column name(s) to partition by. Passed to delta_write_options.
+            **kwargs: Additional arguments passed to write_delta()
+
+        Returns:
+            Metadata dict with path, rows, schema, and format information
+        """
+        # Collect LazyFrame to DataFrame (Delta Lake doesn't support sink operations)
+        if isinstance(df, pl.LazyFrame):
+            try:
+                df = df.collect(engine="streaming")
+            except Exception:
+                df = df.collect()
+
+        path = self.base_dir / table_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Prepare delta_write_options
+        delta_write_options = kwargs.pop("delta_write_options", {})
+        if partition_by:
+            delta_write_options["partition_by"] = partition_by
+
+        # Check if table exists
+        table_exists = (path / "_delta_log").exists()
+
+        if mode == "merge":
+            if not predicate:
+                raise ValueError("predicate is required when mode='merge'")
+
+            # If table doesn't exist, create it with initial write
+            if not table_exists:
+                df.write_delta(
+                    str(path),
+                    mode="overwrite",
+                    delta_write_options=delta_write_options
+                    if delta_write_options
+                    else None,
+                    **kwargs,
+                )
+            else:
+                # Setup merge options
+                delta_merge_options = {
+                    "predicate": predicate,
+                    "source_alias": "s",
+                    "target_alias": "t",
+                }
+
+                # Perform merge operation
+                (
+                    df.write_delta(
+                        str(path),
+                        mode="merge",
+                        delta_merge_options=delta_merge_options,
+                        **kwargs,
+                    )
+                    .when_matched_update_all()
+                    .when_not_matched_insert_all()
+                    .execute()
+                )
+        else:
+            # Direct write for append/overwrite/error modes
+            df.write_delta(
+                str(path),
+                mode=mode,
+                delta_write_options=delta_write_options
+                if delta_write_options
+                else None,
+                **kwargs,
+            )
+
+        # Collect metadata
+        rows = len(df)
+        schema = {name: str(dtype) for name, dtype in df.schema.items()}
+
+        return {
+            "path": str(path.absolute()),
+            "table_name": table_name,
+            "rows": rows,
+            "schema": schema,
+            "format": "delta",
+            "medallion_layer": self.medallion_layer,
+            "mode": mode,
+        }
+
+    def read_delta(
+        self, table_name: str, lazy: bool = True, **kwargs
+    ) -> pl.DataFrame | pl.LazyFrame:
+        """
+        Read DataFrame or LazyFrame from Delta Lake.
+
+        Args:
+            table_name: Table name (relative to medallion layer directory)
+            lazy: If True (default), return LazyFrame. If False, return DataFrame.
+            **kwargs: Additional arguments passed to pl.scan_delta() or pl.read_delta()
+
+        Returns:
+            Polars LazyFrame (default) or DataFrame
+        """
+        path = self.base_dir / table_name
+        if lazy:
+            return pl.scan_delta(str(path), **kwargs)
+        return pl.read_delta(str(path), **kwargs)

@@ -170,11 +170,11 @@ class TestTransformPlaysToSilver:
     """Test transform_plays_to_silver integration function."""
 
     def test_successful_transformation(self, test_data_dir, monkeypatch):
-        """Test successful transformation from bronze to silver."""
+        """Test successful transformation from bronze to silver Delta table."""
         # Setup: Create bronze data
         bronze_dir = test_data_dir / "bronze" / "plays" / "testuser"
         bronze_dir.mkdir(parents=True, exist_ok=True)
-        silver_dir = test_data_dir / "silver" / "plays" / "testuser"
+        silver_dir = test_data_dir / "silver"
         silver_dir.mkdir(parents=True, exist_ok=True)
 
         import json
@@ -206,23 +206,23 @@ class TestTransformPlaysToSilver:
         with (
             patch("music_airflow.transform.plays.JSONIOManager") as mock_json_io,
             patch(
-                "music_airflow.transform.plays.PolarsParquetIOManager"
-            ) as mock_parquet_io,
+                "music_airflow.transform.plays.PolarsDeltaIOManager"
+            ) as mock_delta_io,
         ):
             # Create real instances but override base_dir
             from music_airflow.utils.polars_io_manager import (
                 JSONIOManager,
-                PolarsParquetIOManager,
+                PolarsDeltaIOManager,
             )
 
             json_mgr = JSONIOManager(medallion_layer="bronze")
             json_mgr.base_dir = test_data_dir / "bronze"
 
-            parquet_mgr = PolarsParquetIOManager(medallion_layer="silver")
-            parquet_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+            delta_mgr.base_dir = test_data_dir / "silver"
 
             mock_json_io.return_value = json_mgr
-            mock_parquet_io.return_value = parquet_mgr
+            mock_delta_io.return_value = delta_mgr
 
             # Execute transformation
             fetch_metadata = {
@@ -237,16 +237,17 @@ class TestTransformPlaysToSilver:
         # Verify result metadata
         assert result["rows"] == 2
         assert result["username"] == "testuser"
-        assert result["format"] == "parquet"
+        assert result["format"] == "delta"
         assert result["medallion_layer"] == "silver"
-        assert result["filename"] == "plays/testuser/20210101.parquet"
+        assert result["table_name"] == "plays"
+        assert result["mode"] == "merge"
 
-        # Verify file was created
-        silver_file = Path(result["path"])
-        assert silver_file.exists()
+        # Verify Delta table was created
+        delta_table_path = Path(result["path"])
+        assert delta_table_path.exists()
 
-        # Verify content
-        df = pl.read_parquet(silver_file)
+        # Verify content from Delta table
+        df = pl.read_delta(str(delta_table_path))
         assert len(df) == 2
         assert df["track_name"].to_list() == ["Track 1", "Track 2"]
         assert df["username"].to_list() == ["testuser", "testuser"]
@@ -286,66 +287,103 @@ class TestTransformPlaysToSilver:
         assert result["path"] is None
         assert result["reason"] == "No tracks in time range"
 
-    def test_filename_format_matches_bronze(self, test_data_dir):
-        """Test that silver filename matches bronze date."""
-        bronze_dir = test_data_dir / "bronze" / "plays" / "user123"
+    def test_multiple_users_in_single_table(self, test_data_dir):
+        """Test that multiple users write to the same Delta table with partitioning."""
+        bronze_dir = test_data_dir / "bronze" / "plays"
         bronze_dir.mkdir(parents=True, exist_ok=True)
-        silver_dir = test_data_dir / "silver" / "plays" / "user123"
+        silver_dir = test_data_dir / "silver"
         silver_dir.mkdir(parents=True, exist_ok=True)
 
         import json
 
-        tracks = [
+        # Create bronze data for user1
+        user1_dir = bronze_dir / "user1"
+        user1_dir.mkdir(parents=True, exist_ok=True)
+        tracks_user1 = [
             {
-                "name": "Track",
-                "mbid": "mbid",
-                "url": "url",
+                "name": "Track User1",
+                "mbid": "mbid1",
+                "url": "url1",
                 "date": {"uts": "1672531200", "#text": "01 Jan 2023"},
-                "artist": {"name": "Artist", "mbid": "artist_mbid"},
-                "album": {"#text": "Album", "mbid": "album_mbid"},
+                "artist": {"name": "Artist 1", "mbid": "artist_mbid1"},
+                "album": {"#text": "Album 1", "mbid": "album_mbid1"},
             }
         ]
+        with open(user1_dir / "20230101.json", "w") as f:
+            json.dump(tracks_user1, f)
 
-        bronze_file = bronze_dir / "20230101.json"
-        with open(bronze_file, "w") as f:
-            json.dump(tracks, f)
+        # Create bronze data for user2
+        user2_dir = bronze_dir / "user2"
+        user2_dir.mkdir(parents=True, exist_ok=True)
+        tracks_user2 = [
+            {
+                "name": "Track User2",
+                "mbid": "mbid2",
+                "url": "url2",
+                "date": {"uts": "1672531200", "#text": "01 Jan 2023"},
+                "artist": {"name": "Artist 2", "mbid": "artist_mbid2"},
+                "album": {"#text": "Album 2", "mbid": "album_mbid2"},
+            }
+        ]
+        with open(user2_dir / "20230101.json", "w") as f:
+            json.dump(tracks_user2, f)
 
         with (
             patch("music_airflow.transform.plays.JSONIOManager") as mock_json_io,
             patch(
-                "music_airflow.transform.plays.PolarsParquetIOManager"
-            ) as mock_parquet_io,
+                "music_airflow.transform.plays.PolarsDeltaIOManager"
+            ) as mock_delta_io,
         ):
             from music_airflow.utils.polars_io_manager import (
                 JSONIOManager,
-                PolarsParquetIOManager,
+                PolarsDeltaIOManager,
             )
 
             json_mgr = JSONIOManager(medallion_layer="bronze")
             json_mgr.base_dir = test_data_dir / "bronze"
 
-            parquet_mgr = PolarsParquetIOManager(medallion_layer="silver")
-            parquet_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+            delta_mgr.base_dir = test_data_dir / "silver"
 
             mock_json_io.return_value = json_mgr
-            mock_parquet_io.return_value = parquet_mgr
+            mock_delta_io.return_value = delta_mgr
 
-            fetch_metadata = {
-                "filename": "plays/user123/20230101.json",
-                "username": "user123",
-                "from_datetime": "2023-01-01T00:00:00+00:00",
-                "to_datetime": "2023-01-02T00:00:00+00:00",
-            }
+            # Process user1
+            result1 = transform_plays_to_silver(
+                {
+                    "filename": "plays/user1/20230101.json",
+                    "username": "user1",
+                    "from_datetime": "2023-01-01T00:00:00+00:00",
+                    "to_datetime": "2023-01-02T00:00:00+00:00",
+                }
+            )
 
-            result = transform_plays_to_silver(fetch_metadata)
+            # Process user2
+            result2 = transform_plays_to_silver(
+                {
+                    "filename": "plays/user2/20230101.json",
+                    "username": "user2",
+                    "from_datetime": "2023-01-01T00:00:00+00:00",
+                    "to_datetime": "2023-01-02T00:00:00+00:00",
+                }
+            )
 
-        assert result["filename"] == "plays/user123/20230101.parquet"
+        # Both should write to same table
+        assert result1["table_name"] == "plays"
+        assert result2["table_name"] == "plays"
+        assert result1["path"] == result2["path"]
+
+        # Verify both users' data is in the table
+        df = pl.read_delta(str(result2["path"]))
+        assert len(df) == 2
+        usernames = df["username"].unique().sort().to_list()
+        assert usernames == ["user1", "user2"]
 
     def test_preserves_datetime_metadata(self, test_data_dir):
         """Test that from/to datetimes are preserved in result."""
         bronze_dir = test_data_dir / "bronze" / "plays" / "testuser"
         bronze_dir.mkdir(parents=True, exist_ok=True)
-        silver_dir = test_data_dir / "silver" / "plays" / "testuser"
+        silver_dir = test_data_dir / "silver"
         silver_dir.mkdir(parents=True, exist_ok=True)
 
         import json
@@ -368,22 +406,22 @@ class TestTransformPlaysToSilver:
         with (
             patch("music_airflow.transform.plays.JSONIOManager") as mock_json_io,
             patch(
-                "music_airflow.transform.plays.PolarsParquetIOManager"
-            ) as mock_parquet_io,
+                "music_airflow.transform.plays.PolarsDeltaIOManager"
+            ) as mock_delta_io,
         ):
             from music_airflow.utils.polars_io_manager import (
                 JSONIOManager,
-                PolarsParquetIOManager,
+                PolarsDeltaIOManager,
             )
 
             json_mgr = JSONIOManager(medallion_layer="bronze")
             json_mgr.base_dir = test_data_dir / "bronze"
 
-            parquet_mgr = PolarsParquetIOManager(medallion_layer="silver")
-            parquet_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+            delta_mgr.base_dir = test_data_dir / "silver"
 
             mock_json_io.return_value = json_mgr
-            mock_parquet_io.return_value = parquet_mgr
+            mock_delta_io.return_value = delta_mgr
 
             fetch_metadata = {
                 "filename": "plays/testuser/20210101.json",

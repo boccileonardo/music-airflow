@@ -2,27 +2,28 @@
 Plays transformation logic.
 
 Pure transformation functions for converting raw Last.fm play data
-from bronze to silver layer.
+from bronze to silver layer using Delta Lake.
 """
 
 from typing import Any
 import polars as pl
 
-from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsParquetIOManager
+from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
 
 
 def transform_plays_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]:
     """
-    Transform raw JSON plays from bronze to structured Parquet in silver layer.
+    Transform raw JSON plays from bronze to structured Delta table in silver layer.
 
-    Reads raw data from bronze layer, applies transformations, and writes to silver layer.
+    Reads raw data from bronze layer, applies transformations, and merges into silver
+    Delta table partitioned by username. Uses upsert to avoid duplicates.
     Returns empty metadata dict if no tracks found.
 
     Args:
         fetch_metadata: Metadata from extraction containing filename, username, timestamps
 
     Returns:
-        Metadata dict with path, filename, rows, schema, format, medallion_layer, username, from/to datetimes
+        Metadata dict with path, table_name, rows, schema, format, medallion_layer, username, from/to datetimes
         Or dict with skipped=True if no tracks in time range
     """
     # Read raw JSON using Polars
@@ -46,15 +47,21 @@ def transform_plays_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]:
     # Apply transformation using extracted business logic
     df = transform_plays_raw_to_structured(tracks_df, username)
 
-    # Write to silver layer
-    import datetime as dt
+    # Write to silver layer Delta table with merge/upsert
+    # Use a single table for all users, partitioned by username
+    table_name = "plays"
 
-    interval_start = dt.datetime.fromisoformat(fetch_metadata["from_datetime"])
-    date_str = interval_start.strftime("%Y%m%d")
-    output_filename = f"plays/{username}/{date_str}.parquet"
+    # Define merge predicate: match on username and scrobbled_at (unique identifier for a play)
+    predicate = "s.username = t.username AND s.scrobbled_at = t.scrobbled_at"
 
-    io_manager = PolarsParquetIOManager(medallion_layer="silver")
-    write_metadata = io_manager.write_parquet(df, output_filename)
+    io_manager = PolarsDeltaIOManager(medallion_layer="silver")
+    write_metadata = io_manager.write_delta(
+        df,
+        table_name=table_name,
+        mode="merge",
+        predicate=predicate,
+        partition_by="username",
+    )
 
     # Return io_manager metadata with additional context
     return {
