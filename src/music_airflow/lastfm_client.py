@@ -194,3 +194,63 @@ class LastFMClient:
 
         response_data = self._make_request(params)
         return response_data.get("user", {})
+
+    def get_track_info(
+        self, track: str, artist: str, mbid: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Get detailed information about a track.
+
+        Args:
+            track: Track name
+            artist: Artist name
+            mbid: MusicBrainz ID (optional, used if provided)
+
+        Returns:
+            Track information dictionary including tags, listeners, playcount
+
+        Raises:
+            ValueError: If track not found or API error
+        """
+        params = {
+            "method": "track.getinfo",
+            "api_key": self.api_key,
+            "format": "json",
+        }
+
+        if mbid:
+            params["mbid"] = mbid
+        else:
+            params["track"] = track
+            params["artist"] = artist
+
+        response_data = self._make_request(params)
+        return response_data.get("track", {})
+
+    def get_artist_info(self, artist: str, mbid: str | None = None) -> dict[str, Any]:
+        """
+        Get detailed information about an artist.
+
+        Args:
+            artist: Artist name
+            mbid: MusicBrainz ID (optional, used if provided)
+
+        Returns:
+            Artist information dictionary including tags, listeners, playcount, bio
+
+        Raises:
+            ValueError: If artist not found or API error
+        """
+        params = {
+            "method": "artist.getinfo",
+            "api_key": self.api_key,
+            "format": "json",
+        }
+
+        if mbid:
+            params["mbid"] = mbid
+        else:
+            params["artist"] = artist
+
+        response_data = self._make_request(params)
+        return response_data.get("artist", {})

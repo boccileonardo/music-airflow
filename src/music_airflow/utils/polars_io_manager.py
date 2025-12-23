@@ -166,9 +166,7 @@ class PolarsParquetIOManager:
             "medallion_layer": self.medallion_layer,
         }
 
-    def read_parquet(
-        self, filename: str, lazy: bool = True, **kwargs
-    ) -> pl.DataFrame | pl.LazyFrame:
+    def read_parquet(self, filename: str, **kwargs) -> pl.LazyFrame:
         """
         Read DataFrame or LazyFrame from Parquet format.
 
@@ -181,9 +179,7 @@ class PolarsParquetIOManager:
             Polars LazyFrame (default) or DataFrame
         """
         path = self.base_dir / filename
-        if lazy:
-            return pl.scan_parquet(path, **kwargs)
-        return pl.read_parquet(path, **kwargs)
+        return pl.scan_parquet(path, **kwargs)
 
 
 class PolarsDeltaIOManager:
@@ -322,9 +318,7 @@ class PolarsDeltaIOManager:
 
         return result
 
-    def read_delta(
-        self, table_name: str, lazy: bool = True, **kwargs
-    ) -> pl.DataFrame | pl.LazyFrame:
+    def read_delta(self, table_name: str, **kwargs) -> pl.LazyFrame:
         """
         Read DataFrame or LazyFrame from Delta Lake.
 
@@ -337,6 +331,4 @@ class PolarsDeltaIOManager:
             Polars LazyFrame (default) or DataFrame
         """
         path = self.base_dir / table_name
-        if lazy:
-            return pl.scan_delta(str(path), **kwargs)
-        return pl.read_delta(str(path), **kwargs)
+        return pl.scan_delta(str(path), **kwargs)

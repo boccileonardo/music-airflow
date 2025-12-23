@@ -33,6 +33,7 @@ dev = [
   "pre-commit>=4.5.1",
   "pyproject-fmt>=2.11.1",
   "pytest>=9.0.2",
+  "pytest-cov>=7",
   "ruff>=0.14.10",
   "ty>=0.0.5",
 ]
@@ -40,3 +41,6 @@ dev = [
 [tool.ruff]
 # Extend default rules with Airflow-specific rules
 lint.extend-select = [ "AIR" ]
+
+[tool.pytest.ini_options]
+addopts = "--cov=music_airflow"
