@@ -255,6 +255,7 @@ class PolarsDeltaIOManager:
 
         # Check if table exists
         table_exists = (path / "_delta_log").exists()
+        merge_metrics = None
 
         if mode == "merge":
             if not predicate:
@@ -278,8 +279,8 @@ class PolarsDeltaIOManager:
                     "target_alias": "t",
                 }
 
-                # Perform merge operation
-                (
+                # Perform merge operation and capture metrics
+                merge_metrics = (
                     df.write_delta(
                         str(path),
                         mode="merge",
@@ -305,7 +306,7 @@ class PolarsDeltaIOManager:
         rows = len(df)
         schema = {name: str(dtype) for name, dtype in df.schema.items()}
 
-        return {
+        result = {
             "path": str(path.absolute()),
             "table_name": table_name,
             "rows": rows,
@@ -314,6 +315,12 @@ class PolarsDeltaIOManager:
             "medallion_layer": self.medallion_layer,
             "mode": mode,
         }
+
+        # Add merge metrics if available
+        if merge_metrics:
+            result["merge_metrics"] = merge_metrics
+
+        return result
 
     def read_delta(
         self, table_name: str, lazy: bool = True, **kwargs

@@ -434,3 +434,240 @@ class TestTransformPlaysToSilver:
 
         assert result["from_datetime"] == "2021-01-01T00:00:00+00:00"
         assert result["to_datetime"] == "2021-01-02T00:00:00+00:00"
+
+
+class TestDeltaMergeMetrics:
+    """Test Delta table merge metrics capture and partition handling."""
+
+    def test_merge_with_updates_and_inserts(self, test_data_dir):
+        """Test merge operation captures correct metrics for updates and inserts."""
+        from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
+
+        delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+        delta_mgr.base_dir = test_data_dir / "silver"
+
+        # Initial data
+        df1 = pl.DataFrame(
+            {
+                "username": ["user1", "user1", "user2"],
+                "scrobbled_at": [1000, 2000, 3000],
+                "track_name": ["Track A", "Track B", "Track C"],
+            }
+        )
+
+        delta_mgr.write_delta(
+            df1,
+            table_name="plays",
+            mode="merge",
+            predicate="s.username = t.username AND s.scrobbled_at = t.scrobbled_at",
+            partition_by="username",
+        )
+
+        # New data: 1 update (user1, 1000), 2 new inserts
+        df2 = pl.DataFrame(
+            {
+                "username": ["user1", "user1", "user2"],
+                "scrobbled_at": [1000, 4000, 5000],  # 1000 exists, 4000 & 5000 are new
+                "track_name": [
+                    "Track A Updated",
+                    "Track D",
+                    "Track E",
+                ],
+            }
+        )
+
+        result = delta_mgr.write_delta(
+            df2,
+            table_name="plays",
+            mode="merge",
+            predicate="s.username = t.username AND s.scrobbled_at = t.scrobbled_at",
+            partition_by="username",
+        )
+
+        # Check merge metrics
+        assert "merge_metrics" in result
+        metrics = result["merge_metrics"]
+        assert metrics["num_source_rows"] == 3
+        assert metrics["num_target_rows_inserted"] == 2  # 2 new tracks
+        assert metrics["num_target_rows_updated"] == 1  # 1 updated track
+        assert metrics["num_target_rows_deleted"] == 0
+
+        # Verify final table content
+        final_df = pl.read_delta(str(test_data_dir / "silver" / "plays")).sort(
+            "scrobbled_at"
+        )
+        assert len(final_df) == 5  # 3 original + 2 new
+        # Check the update happened
+        track_a = final_df.filter(pl.col("scrobbled_at") == 1000)
+        assert track_a["track_name"].to_list() == ["Track A Updated"]
+
+    def test_partition_isolation_in_merge(self, test_data_dir):
+        """Test that merge only affects files in relevant partitions."""
+        from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
+
+        delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+        delta_mgr.base_dir = test_data_dir / "silver"
+
+        # Create data for multiple users (partitions)
+        df1 = pl.DataFrame(
+            {
+                "username": ["user1", "user1", "user2", "user2", "user3"],
+                "scrobbled_at": [1000, 2000, 3000, 4000, 5000],
+                "track_name": ["A1", "A2", "B1", "B2", "C1"],
+            }
+        )
+
+        delta_mgr.write_delta(
+            df1,
+            table_name="plays",
+            mode="merge",
+            predicate="s.username = t.username AND s.scrobbled_at = t.scrobbled_at",
+            partition_by="username",
+        )
+
+        # Update only user2 partition
+        df2 = pl.DataFrame(
+            {
+                "username": ["user2", "user2"],
+                "scrobbled_at": [3000, 6000],  # 3000 update, 6000 insert
+                "track_name": ["B1 Updated", "B3"],
+            }
+        )
+
+        result = delta_mgr.write_delta(
+            df2,
+            table_name="plays",
+            mode="merge",
+            predicate="s.username = t.username AND s.scrobbled_at = t.scrobbled_at",
+            partition_by="username",
+        )
+
+        # Check merge metrics show partition isolation
+        metrics = result["merge_metrics"]
+        assert metrics["num_source_rows"] == 2
+        assert metrics["num_target_rows_inserted"] == 1
+        assert metrics["num_target_rows_updated"] == 1
+
+        # num_target_rows_copied represents rows from the affected partition (user2)
+        # that weren't matched in the merge (B2 with scrobbled_at=4000)
+        assert metrics["num_target_rows_copied"] == 1  # B2 copied through
+
+        # num_output_rows is the total for the affected partition after merge
+        assert metrics["num_output_rows"] == 3  # B1 Updated, B2, B3
+
+        # Files metrics: should show targeted file operations
+        # num_target_files_scanned includes all partitions scanned (3 partitions = 3 files)
+        assert metrics["num_target_files_scanned"] == 3
+        # Only user2 partition file is rewritten
+        assert metrics["num_target_files_added"] == 1
+        assert metrics["num_target_files_removed"] == 1
+
+        # Verify other partitions unchanged
+        final_df = pl.read_delta(str(test_data_dir / "silver" / "plays"))
+        user1_data = final_df.filter(pl.col("username") == "user1").sort("scrobbled_at")
+        assert user1_data["track_name"].to_list() == ["A1", "A2"]  # Unchanged
+
+        user2_data = final_df.filter(pl.col("username") == "user2").sort("scrobbled_at")
+        assert user2_data["track_name"].to_list() == ["B1 Updated", "B2", "B3"]
+
+        user3_data = final_df.filter(pl.col("username") == "user3")
+        assert user3_data["track_name"].to_list() == ["C1"]  # Unchanged
+
+    def test_merge_metrics_included_in_transform_result(self, test_data_dir):
+        """Test that transform_plays_to_silver includes merge metrics on actual merges."""
+        import json
+
+        bronze_dir = test_data_dir / "bronze" / "plays" / "testuser"
+        bronze_dir.mkdir(parents=True, exist_ok=True)
+        silver_dir = test_data_dir / "silver"
+        silver_dir.mkdir(parents=True, exist_ok=True)
+
+        # First write - create initial data
+        tracks1 = [
+            {
+                "name": "Track 1",
+                "mbid": "mbid1",
+                "url": "url1",
+                "date": {"uts": "1609459200", "#text": "01 Jan 2021"},
+                "artist": {"name": "Artist 1", "mbid": "artist_mbid1"},
+                "album": {"#text": "Album 1", "mbid": "album_mbid1"},
+            }
+        ]
+
+        bronze_file1 = bronze_dir / "20210101.json"
+        with open(bronze_file1, "w") as f:
+            json.dump(tracks1, f)
+
+        with (
+            patch("music_airflow.transform.plays.JSONIOManager") as mock_json_io,
+            patch(
+                "music_airflow.transform.plays.PolarsDeltaIOManager"
+            ) as mock_delta_io,
+        ):
+            from music_airflow.utils.polars_io_manager import (
+                JSONIOManager,
+                PolarsDeltaIOManager,
+            )
+
+            json_mgr = JSONIOManager(medallion_layer="bronze")
+            json_mgr.base_dir = test_data_dir / "bronze"
+
+            delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+            delta_mgr.base_dir = test_data_dir / "silver"
+
+            mock_json_io.return_value = json_mgr
+            mock_delta_io.return_value = delta_mgr
+
+            # Initial write (no merge metrics expected)
+            fetch_metadata1 = {
+                "filename": "plays/testuser/20210101.json",
+                "username": "testuser",
+                "from_datetime": "2021-01-01T00:00:00+00:00",
+                "to_datetime": "2021-01-02T00:00:00+00:00",
+            }
+
+            result1 = transform_plays_to_silver(fetch_metadata1)
+            assert "merge_metrics" not in result1  # Initial write has no merge metrics
+
+            # Second write with 1 update and 1 insert - should have merge metrics
+            tracks2 = [
+                {
+                    "name": "Track 1 Updated",  # Update existing
+                    "mbid": "mbid1",
+                    "url": "url1",
+                    "date": {"uts": "1609459200", "#text": "01 Jan 2021"},
+                    "artist": {"name": "Artist 1", "mbid": "artist_mbid1"},
+                    "album": {"#text": "Album 1", "mbid": "album_mbid1"},
+                },
+                {
+                    "name": "Track 2",  # New insert
+                    "mbid": "mbid2",
+                    "url": "url2",
+                    "date": {"uts": "1609462800", "#text": "01 Jan 2021"},
+                    "artist": {"name": "Artist 2", "mbid": "artist_mbid2"},
+                    "album": {"#text": "Album 2", "mbid": "album_mbid2"},
+                },
+            ]
+
+            bronze_file2 = bronze_dir / "20210102.json"
+            with open(bronze_file2, "w") as f:
+                json.dump(tracks2, f)
+
+            fetch_metadata2 = {
+                "filename": "plays/testuser/20210102.json",
+                "username": "testuser",
+                "from_datetime": "2021-01-02T00:00:00+00:00",
+                "to_datetime": "2021-01-03T00:00:00+00:00",
+            }
+
+            result2 = transform_plays_to_silver(fetch_metadata2)
+
+        # Verify merge metrics are present for actual merge
+        assert "merge_metrics" in result2
+        metrics = result2["merge_metrics"]
+        assert "num_source_rows" in metrics
+        assert "num_target_rows_inserted" in metrics
+        assert "num_target_rows_updated" in metrics
+        assert metrics["num_source_rows"] == 2
+        assert metrics["num_target_rows_inserted"] == 1  # Track 2 is new
+        assert metrics["num_target_rows_updated"] == 1  # Track 1 is updated

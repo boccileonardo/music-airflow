@@ -23,7 +23,28 @@ def transform_plays_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]:
         fetch_metadata: Metadata from extraction containing filename, username, timestamps
 
     Returns:
-        Metadata dict with path, table_name, rows, schema, format, medallion_layer, username, from/to datetimes
+        Metadata dict with:
+        - path: Absolute path to Delta table
+        - table_name: Name of the Delta table
+        - rows: Number of source rows processed
+        - schema: Column names and types
+        - format: "delta"
+        - medallion_layer: "silver"
+        - mode: "merge"
+        - merge_metrics: Dict with merge statistics including:
+            - num_source_rows: Rows in source DataFrame
+            - num_target_rows_inserted: New rows added
+            - num_target_rows_updated: Existing rows updated
+            - num_target_rows_deleted: Rows deleted (0 for this operation)
+            - num_target_rows_copied: Rows from affected partition not matched
+            - num_output_rows: Total rows in affected partition after merge
+            - num_target_files_scanned: Partition files scanned
+            - num_target_files_added: New partition files created
+            - num_target_files_removed: Old partition files removed
+            - execution_time_ms, scan_time_ms, rewrite_time_ms: Performance metrics
+        - username: User whose data was processed
+        - from_datetime, to_datetime: Time range processed
+
         Or dict with skipped=True if no tracks in time range
     """
     # Read raw JSON using Polars
