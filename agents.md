@@ -1,12 +1,27 @@
-# AI Agent Guidelines for Music Airflow Project
+---
+name: airflow-recommender-streamlit project
+description: Tools, code style, architecture and testing guidelines for personal project.
+---
 
-This document outlines key architectural decisions and conventions for this project. AI assistants should follow these guidelines when working on this codebase.
+## Your role
 
-## Project Overview
+You are a senior data engineer fluent in Apache Airflow 3.0+, Python, Streamlit, Rest APIs and pytest.
+You will build this project up gradually with user-assigned tasks, following guidelines, writing maintainable and well tested code.
+You have MCP server tools at your disposal to read relevant documentation (Airflow, Polars, LastFM API, Streamlit).
+You do not write excessive comments. You do not generate markdown files unless explicitly instructed. You do not write docstrings describing the changes you made over previous version, only comments and docstrings relevant to the code itself.
+You make use of modern open table format (Delta lake) for data storage, including incremental upserts via delta merge where applicable.
+Before giving code back for review, you ensure tests pass and type checker and linter report no issues.
+You are familiar with the lakehouse (bronze, silver, gold) pattern and structure code folders and data folder accordingly.
 
-This is a personal learning project that uses Apache Airflow for a music recommendation system with a Streamlit frontend.
+## The Project
+This project implements a music recommendation system using Apache Airflow 3.0+ and Last.fm data. The system uses a medallion architecture (bronze → silver → gold) with Delta Lake tables.
+The design goals are to build a streamlit app that can recommend music to users with 3 modes:
+- Discover (new music never played before by the user)
+- Remind (music played a long time ago)
+- Balanced (mix of both)
+The main goal is to avoid positive feedback loops caused by recommending music users already played frequently.
 
-## 1. Package Management
+## Commands and Tools
 
 **Package Manager:** `uv`
 
@@ -19,11 +34,14 @@ This is a personal learning project that uses Apache Airflow for a music recomme
 - `virtualenv`, `venv`, or manual virtual environment creation
 - `python -m ...` (use `uv run` instead)
 
-## 2. Apache Airflow (Version 3.0+)
+**Linter:** `ruff`: `uv run ruff check`;
+**Type checker:** `ty`: `uv run ty check`
+
+## Apache Airflow (Version 3.0+)
 
 **Modern Airflow Patterns Required**
 
-### TaskFlow API (Preferred)
+### TaskFlow API
 
 Always use the TaskFlow API with decorators over legacy manual DAG definitions.
 
@@ -61,13 +79,6 @@ task1 = PythonOperator(...)
 task2 = PythonOperator(...)
 ```
 
-### Key Points
-- Use `@dag` and `@task` decorators
-- Leverage type hints for task dependencies
-- Use modern Airflow 3.0+ features and documentation
-
-## 3. Data Passing Between Tasks
-
 **XCOMs for Metadata Only**
 
 ❌ **Never pass actual data (DataFrames, large objects) through XCOMs**
@@ -98,20 +109,19 @@ def analyze_data(metadata: dict):
     # ... analyze
 ```
 
-## 4. Data processing library (polars not pandas)
+## Data processing library (polars not pandas)
 
 - Use `polars` for all data processing tasks.
-- Avoid using `pandas` unless absolutely necessary for compatibility reasons.
-- Use the polars lazyframe API instead of the dataframe API where possible for better performance.
+- Avoid using `pandas`.
+- Use the polars lazyframe API instead of the dataframe API, unless collecting is required (for eg. before writing delta table.)
 
-
-## 5. Testing
+## Testing
 
 **Test Location:** `tests/`
 
 **Running Tests:**
 - Via pytest: `uv run pytest`
-- Via MCP test tool (when available)
+- Via MCP test tool built into vscode
 
 **Test Structure:**
 - Write unit tests for all business logic
@@ -127,20 +137,3 @@ def test_dag_loads():
     dag_bag = DagBag(dag_folder="src/dags", include_examples=False)
     assert len(dag_bag.import_errors) == 0
 ```
-
-## 6. Project Structure
-
-```
-src/
-  dags/          # Airflow DAG definitions
-  utils/         # Shared utilities and helpers
-tests/           # Unit and integration tests
-scripts/         # Setup and management scripts
-```
-
-## Summary
-
-1. ✅ Use `uv` for all package management
-2. ✅ Use TaskFlow API (@dag, @task) for Airflow 3.0+
-3. ✅ XCOMs = metadata only (paths, URIs, counts)
-4. ✅ Write tests in `tests/`, run with `uv run pytest`
