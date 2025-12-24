@@ -4,15 +4,22 @@ Transform dimension data (tracks, artists) from bronze to silver layer.
 Cleans and structures raw Last.fm metadata for analytics.
 """
 
+from datetime import datetime
 from typing import Any
 
 import polars as pl
+from airflow.exceptions import AirflowSkipException
+from deltalake.exceptions import TableNotFoundError
 
 from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
+
+# Minimum half-life for new users (30 days)
+MIN_HALF_LIFE_DAYS = 30.0
 
 __all__ = [
     "transform_tracks_to_silver",
     "transform_artists_to_silver",
+    "compute_dim_users",
     "_transform_tracks_raw_to_structured",
     "_transform_artists_raw_to_structured",
 ]
@@ -252,3 +259,85 @@ def _transform_artists_raw_to_structured(raw_artists: pl.LazyFrame) -> pl.LazyFr
     )
 
     return df
+
+
+def compute_dim_users(execution_date: datetime) -> dict[str, Any]:
+    """
+    Compute user dimension table with listening profile metadata.
+
+    Creates a dimension table with per-user metrics:
+    - Listening span (first to last play dates)
+    - User-specific half-life for recency calculations
+    - Total plays count
+
+    Half-life is calculated as: max(listening_span_days / 3, 30 days)
+    This ensures:
+    - New users (30 day history): 30 day half-life
+    - Users with 6 months history: 60 day half-life
+    - Users with 1 year history: 120 day half-life
+
+    Args:
+        execution_date: Reference date for calculations (typically DAG run date)
+
+    Returns:
+        Metadata dict with:
+        - path: Path to Delta table
+        - table_name: "dim_users"
+        - rows: Number of unique users
+        - schema: Column schema
+        - format: "delta"
+        - medallion_layer: "silver"
+        - execution_date: Reference date used
+
+    Raises:
+        AirflowSkipException: If no plays data available yet
+    """
+    # Read silver plays table
+    try:
+        io_manager = PolarsDeltaIOManager(medallion_layer="silver")
+        plays_lf: pl.LazyFrame = io_manager.read_delta("plays")  # type: ignore[assignment]
+    except (FileNotFoundError, TableNotFoundError):
+        # No plays data yet - nothing to process
+        raise AirflowSkipException("No plays data available yet - run plays DAG first")
+
+    # Compute user-level aggregations
+    dim_users_lf = (
+        plays_lf.group_by("username")
+        .agg(
+            [
+                pl.col("scrobbled_at_utc").min().alias("first_play_date"),
+                pl.col("scrobbled_at_utc").max().alias("last_play_date"),
+                pl.len().alias("total_plays"),
+            ]
+        )
+        .with_columns(
+            [
+                # Listening span in days
+                (pl.col("last_play_date") - pl.col("first_play_date"))
+                .dt.total_days()
+                .alias("listening_span_days"),
+            ]
+        )
+        .with_columns(
+            [
+                # Half-life = max(listening_span / 3, 30 days)
+                pl.max_horizontal(
+                    pl.col("listening_span_days") / 3.0, pl.lit(MIN_HALF_LIFE_DAYS)
+                ).alias("user_half_life_days"),
+            ]
+        )
+        .sort("username")
+    )
+
+    # Write to silver layer
+    silver_io = PolarsDeltaIOManager(medallion_layer="silver")
+    write_metadata = silver_io.write_delta(
+        dim_users_lf,
+        table_name="dim_users",
+        mode="overwrite",  # Full refresh
+    )
+
+    return {
+        **write_metadata,
+        "execution_date": execution_date.isoformat(),
+    }

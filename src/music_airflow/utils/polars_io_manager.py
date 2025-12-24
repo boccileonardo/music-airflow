@@ -242,7 +242,7 @@ class PolarsDeltaIOManager:
                 df = df.collect()
 
         path = self.base_dir / table_name
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir(parents=True, exist_ok=True)
 
         # Prepare delta_write_options
         delta_write_options = kwargs.pop("delta_write_options", {})

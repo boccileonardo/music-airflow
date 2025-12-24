@@ -17,6 +17,7 @@ from music_airflow.transform.dimensions import (
     _transform_artists_raw_to_structured,
     transform_tracks_to_silver,
     transform_artists_to_silver,
+    compute_dim_users,
 )
 
 
@@ -560,3 +561,63 @@ class TestTransformArtistsToSilver:
         df = pl.read_delta(str(delta_table_path))
         assert len(df) == 1
         assert df["artist_name"][0] == "Artist X"
+
+
+class TestExtractWithoutPlaysData:
+    """Test extraction functions when plays data doesn't exist yet."""
+
+    @patch("music_airflow.extract.dimensions.PolarsDeltaIOManager")
+    def test_extract_tracks_skips_without_plays(self, mock_delta_io):
+        """Test that extract_tracks_to_bronze skips when no plays data exists."""
+        # Mock IO manager to raise FileNotFoundError when reading plays
+        mock_plays_io = MagicMock()
+        mock_plays_io.read_delta.side_effect = FileNotFoundError(
+            "No such file or directory: 'data/silver/plays'"
+        )
+        mock_delta_io.return_value = mock_plays_io
+
+        # Should raise AirflowSkipException
+        with pytest.raises(AirflowSkipException) as exc_info:
+            extract_tracks_to_bronze()
+
+        assert "No plays data available yet" in str(exc_info.value)
+
+    @patch("music_airflow.extract.dimensions.PolarsDeltaIOManager")
+    def test_extract_artists_skips_without_plays(self, mock_delta_io):
+        """Test that extract_artists_to_bronze skips when no plays data exists."""
+        # Mock IO manager to raise FileNotFoundError when reading plays
+        mock_plays_io = MagicMock()
+        mock_plays_io.read_delta.side_effect = FileNotFoundError(
+            "No such file or directory: 'data/silver/plays'"
+        )
+        mock_delta_io.return_value = mock_plays_io
+
+        # Should raise AirflowSkipException
+        with pytest.raises(AirflowSkipException) as exc_info:
+            extract_artists_to_bronze()
+
+        assert "No plays data available yet" in str(exc_info.value)
+
+
+class TestComputeDimUsersWithoutPlaysData:
+    """Test compute_dim_users when plays data doesn't exist yet."""
+
+    @patch("music_airflow.transform.dimensions.PolarsDeltaIOManager")
+    def test_compute_dim_users_skips_without_plays(self, mock_delta_io):
+        """Test that compute_dim_users skips when no plays data exists."""
+        import datetime as dt
+
+        # Mock IO manager to raise FileNotFoundError when reading plays
+        mock_plays_io = MagicMock()
+        mock_plays_io.read_delta.side_effect = FileNotFoundError(
+            "No such file or directory: 'data/silver/plays'"
+        )
+        mock_delta_io.return_value = mock_plays_io
+
+        execution_date = dt.datetime(2025, 1, 20, tzinfo=dt.timezone.utc)
+
+        # Should raise AirflowSkipException
+        with pytest.raises(AirflowSkipException) as exc_info:
+            compute_dim_users(execution_date)
+
+        assert "No plays data available yet" in str(exc_info.value)

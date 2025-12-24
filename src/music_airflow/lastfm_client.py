@@ -196,7 +196,7 @@ class LastFMClient:
         return response_data.get("user", {})
 
     def get_track_info(
-        self, track: str, artist: str, mbid: str | None = None
+        self, track: str, artist: str, mbid: str | None = None, autocorrect: bool = True
     ) -> dict[str, Any]:
         """
         Get detailed information about a track.
@@ -205,6 +205,7 @@ class LastFMClient:
             track: Track name
             artist: Artist name
             mbid: MusicBrainz ID (optional, used if provided)
+            autocorrect: Transform misspelled names into correct versions (default: True)
 
         Returns:
             Track information dictionary including tags, listeners, playcount
@@ -216,6 +217,7 @@ class LastFMClient:
             "method": "track.getinfo",
             "api_key": self.api_key,
             "format": "json",
+            "autocorrect": 1 if autocorrect else 0,
         }
 
         if mbid:
@@ -227,13 +229,16 @@ class LastFMClient:
         response_data = self._make_request(params)
         return response_data.get("track", {})
 
-    def get_artist_info(self, artist: str, mbid: str | None = None) -> dict[str, Any]:
+    def get_artist_info(
+        self, artist: str, mbid: str | None = None, autocorrect: bool = True
+    ) -> dict[str, Any]:
         """
         Get detailed information about an artist.
 
         Args:
             artist: Artist name
             mbid: MusicBrainz ID (optional, used if provided)
+            autocorrect: Transform misspelled names into correct versions (default: True)
 
         Returns:
             Artist information dictionary including tags, listeners, playcount, bio
@@ -245,6 +250,7 @@ class LastFMClient:
             "method": "artist.getinfo",
             "api_key": self.api_key,
             "format": "json",
+            "autocorrect": 1 if autocorrect else 0,
         }
 
         if mbid:

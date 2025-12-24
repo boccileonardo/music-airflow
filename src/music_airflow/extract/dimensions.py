@@ -39,8 +39,12 @@ def extract_tracks_to_bronze() -> dict[str, Any]:
         ValueError: If API key not configured
     """
     # Read silver plays to get unique tracks across all users
-    plays_io = PolarsDeltaIOManager(medallion_layer="silver")
-    plays_lf = plays_io.read_delta("plays")
+    try:
+        plays_io = PolarsDeltaIOManager(medallion_layer="silver")
+        plays_lf = plays_io.read_delta("plays")
+    except (FileNotFoundError, TableNotFoundError):
+        # No plays data yet - nothing to process
+        raise AirflowSkipException("No plays data available yet - run plays DAG first")
 
     # Get unique tracks (keep as LazyFrame)
     unique_tracks_lf = plays_lf.select(
@@ -59,7 +63,7 @@ def extract_tracks_to_bronze() -> dict[str, Any]:
             on=["track_name", "artist_name"],
             how="anti",
         )
-    except TableNotFoundError:
+    except (FileNotFoundError, TableNotFoundError):
         # No existing tracks table - all tracks are new
         new_tracks_lf = unique_tracks_lf
 
@@ -156,8 +160,12 @@ def extract_artists_to_bronze() -> dict[str, Any]:
         ValueError: If API key not configured
     """
     # Read silver plays to get unique artists across all users
-    plays_io = PolarsDeltaIOManager(medallion_layer="silver")
-    plays_lf = plays_io.read_delta("plays")
+    try:
+        plays_io = PolarsDeltaIOManager(medallion_layer="silver")
+        plays_lf = plays_io.read_delta("plays")
+    except (FileNotFoundError, TableNotFoundError):
+        # No plays data yet - nothing to process
+        raise AirflowSkipException("No plays data available yet - run plays DAG first")
 
     # Get unique artists (keep as LazyFrame)
     unique_artists_lf = plays_lf.select(["artist_name", "artist_mbid"]).unique()
@@ -172,7 +180,7 @@ def extract_artists_to_bronze() -> dict[str, Any]:
             on=["artist_name"],
             how="anti",
         )
-    except TableNotFoundError:
+    except (FileNotFoundError, TableNotFoundError):
         # No existing artists table - all artists are new
         new_artists_lf = unique_artists_lf
 

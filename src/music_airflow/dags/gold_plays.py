@@ -18,8 +18,10 @@ from typing import Any
 
 from airflow.sdk import Asset, dag, task
 
-# Asset produced by lastfm_plays DAG - triggers this DAG when updated
+# Assets consumed by this DAG - triggers when any of these are updated
 plays_asset = Asset("delta://data/silver/plays")
+dim_users_asset = Asset("delta://data/silver/dim_users")
+artists_asset = Asset("delta://data/silver/artists")
 
 # Assets produced by this DAG
 artist_play_count_asset = Asset("delta://data/gold/artist_play_count")
@@ -27,7 +29,11 @@ track_play_count_asset = Asset("delta://data/gold/track_play_count")
 
 
 @dag(
-    schedule=[plays_asset],  # Run when plays asset is updated
+    schedule=[
+        plays_asset,
+        dim_users_asset,
+        artists_asset,
+    ],  # Run when any input asset is updated
     start_date=dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc),
     catchup=False,  # Only process latest date
     max_active_runs=1,
@@ -38,17 +44,23 @@ def gold_play_aggregations():
     """
     Compute gold layer aggregate fact tables with recency measures.
 
-    Reads silver plays and creates:
-    - artist_play_count (username, artist, counts, recency)
+    Reads silver plays, dim_users, and artists to create:
+    - artist_play_count (username, artist, artist_mbid, counts, recency)
     - track_play_count (username, track, counts, recency)
     """
 
-    @task(multiple_outputs=False, outlets=[artist_play_count_asset])
+    @task(
+        multiple_outputs=False,
+        outlets=[artist_play_count_asset],
+        inlets=[plays_asset, dim_users_asset, artists_asset],
+    )
     def compute_artist_aggregations() -> dict[str, Any]:
         """
-        Compute artist play counts with dynamic per-user recency measures.
+        Compute artist play counts with per-user recency measures.
 
         Aggregates all historical plays to create per-user artist statistics.
+        Uses dim_users for user-specific half-life values.
+        Enriches with artist_mbid from artists dimension.
         Full refresh - recomputes entire table.
 
         Uses data_interval_start from Airflow context as reference for recency calculations.
@@ -71,12 +83,17 @@ def gold_play_aggregations():
 
         return compute_artist_play_counts(execution_date=execution_date)
 
-    @task(multiple_outputs=False, outlets=[track_play_count_asset])
+    @task(
+        multiple_outputs=False,
+        outlets=[track_play_count_asset],
+        inlets=[plays_asset, dim_users_asset],
+    )
     def compute_track_aggregations() -> dict[str, Any]:
         """
-        Compute track play counts with dynamic per-user recency measures.
+        Compute track play counts with per-user recency measures.
 
         Aggregates all historical plays to create per-user track statistics.
+        Uses dim_users for user-specific half-life values.
         Full refresh - recomputes entire table.
 
         Uses data_interval_start from Airflow context as reference for recency calculations.

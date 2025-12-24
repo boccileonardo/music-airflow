@@ -2,7 +2,7 @@
 Gold layer fact table transformations for play aggregations.
 
 Creates aggregate fact tables from silver plays with recency measures
-for recommendation systems. Uses dynamic per-user half-life based on listening history.
+for recommendation systems. Uses user dimension table for per-user half-life.
 """
 
 from datetime import datetime
@@ -13,23 +13,17 @@ import polars as pl
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
 
-# Minimum half-life for new users (30 days)
-MIN_HALF_LIFE_DAYS = 30.0
-
-
 def compute_artist_play_counts(execution_date: datetime) -> dict[str, Any]:
     """
-    Compute artist play counts per user with dynamic recency measures from silver plays.
+    Compute artist play counts per user with recency measures from silver plays.
 
     Aggregates all historical plays to create per-user artist statistics with
-    per-user recency decay. Half-life is calculated per user based on their listening
-    history span, with a minimum of 30 days for new users.
+    per-user recency decay. Uses dim_users for user-specific half-life values.
 
     Recency measures:
     - last_played_on: Most recent play timestamp (for time capsule filtering)
-    - recency_score: Exponential decay score (higher = more recent)
-      Formula: sum(exp(-days_ago / half_life))
-      Half-life = max(listening_span_days / 3, 30 days)
+    - recency_score: Exponential decay score sum(exp(-days_ago / half_life))
+    - recency_score_normalized: recency_score / play_count (prevents feedback loops)
     - days_since_last_play: Days between execution_date and last play
 
     Args:
@@ -45,12 +39,16 @@ def compute_artist_play_counts(execution_date: datetime) -> dict[str, Any]:
         - medallion_layer: "gold"
         - execution_date: Reference date used
     """
-    # Read silver plays table
+    # Read silver tables
     io_manager = PolarsDeltaIOManager(medallion_layer="silver")
     plays_lf: pl.LazyFrame = io_manager.read_delta("plays")  # type: ignore[assignment]
+    dim_users_lf: pl.LazyFrame = io_manager.read_delta("dim_users")  # type: ignore[assignment]
+    artists_lf: pl.LazyFrame = io_manager.read_delta("artists")  # type: ignore[assignment]
 
-    # Compute aggregations with dynamic per-user recency measures
-    gold_lf = _compute_artist_aggregations(plays_lf, execution_date)
+    # Compute aggregations with per-user recency measures
+    gold_lf = _compute_artist_aggregations(
+        plays_lf, dim_users_lf, artists_lf, execution_date
+    )
 
     # Write to gold layer
     gold_io_manager = PolarsDeltaIOManager(medallion_layer="gold")
@@ -69,17 +67,15 @@ def compute_artist_play_counts(execution_date: datetime) -> dict[str, Any]:
 
 def compute_track_play_counts(execution_date: datetime) -> dict[str, Any]:
     """
-    Compute track play counts per user with dynamic recency measures from silver plays.
+    Compute track play counts per user with recency measures from silver plays.
 
     Aggregates all historical plays to create per-user track statistics with
-    per-user recency decay. Half-life is calculated per user based on their listening
-    history span, with a minimum of 30 days for new users.
+    per-user recency decay. Uses dim_users for user-specific half-life values.
 
     Recency measures:
     - last_played_on: Most recent play timestamp (for time capsule filtering)
-    - recency_score: Exponential decay score (higher = more recent)
-      Formula: sum(exp(-days_ago / half_life))
-      Half-life = max(listening_span_days / 3, 30 days)
+    - recency_score: Exponential decay score sum(exp(-days_ago / half_life))
+    - recency_score_normalized: recency_score / play_count (prevents feedback loops)
     - days_since_last_play: Days between execution_date and last play
 
     Args:
@@ -95,12 +91,13 @@ def compute_track_play_counts(execution_date: datetime) -> dict[str, Any]:
         - medallion_layer: "gold"
         - execution_date: Reference date used
     """
-    # Read silver plays table
+    # Read silver tables
     io_manager = PolarsDeltaIOManager(medallion_layer="silver")
     plays_lf: pl.LazyFrame = io_manager.read_delta("plays")  # type: ignore[assignment]
+    dim_users_lf: pl.LazyFrame = io_manager.read_delta("dim_users")  # type: ignore[assignment]
 
-    # Compute aggregations with dynamic per-user recency measures
-    gold_lf = _compute_track_aggregations(plays_lf, execution_date)
+    # Compute aggregations with per-user recency measures
+    gold_lf = _compute_track_aggregations(plays_lf, dim_users_lf, execution_date)
 
     # Write to gold layer
     gold_io_manager = PolarsDeltaIOManager(medallion_layer="gold")
@@ -118,25 +115,26 @@ def compute_track_play_counts(execution_date: datetime) -> dict[str, Any]:
 
 
 def _compute_artist_aggregations(
-    plays_lf: pl.LazyFrame, execution_date: datetime
+    plays_lf: pl.LazyFrame,
+    dim_users_lf: pl.LazyFrame,
+    artists_lf: pl.LazyFrame,
+    execution_date: datetime,
 ) -> pl.LazyFrame:
     """
-    Compute artist-level aggregations with dynamic per-user recency measures.
+    Compute artist-level aggregations with per-user recency measures.
 
     Groups plays by username and artist, calculating:
     - Total play count
     - First and last play dates
-    - Recency score with per-user exponential decay
+    - Normalized recency score (prevents feedback loops)
     - Days since last play
 
-    Half-life is calculated per user as: max(listening_span_days / 3, 30)
-    This means:
-    - New users (30 day history): 30 day half-life
-    - Users with 6 months history: 60 day half-life
-    - Users with 1 year history: 120 day half-life
+    Enriches with artist_mbid from silver/artists dimension.
 
     Args:
         plays_lf: Silver plays LazyFrame
+        dim_users_lf: User dimension LazyFrame with half-life values
+        artists_lf: Artists dimension LazyFrame with artist_mbid
         execution_date: Reference date for recency calculations
 
     Returns:
@@ -144,38 +142,11 @@ def _compute_artist_aggregations(
         - username, artist_name, artist_mbid
         - play_count, first_played_on, last_played_on
         - recency_score, days_since_last_play
-        - user_half_life_days
     """
-    # Calculate per-user listening span and half-life
-    user_span_lf = (
-        plays_lf.group_by("username")
-        .agg(
-            [
-                pl.col("scrobbled_at_utc").min().alias("user_first_play"),
-                pl.col("scrobbled_at_utc").max().alias("user_last_play"),
-            ]
-        )
-        .with_columns(
-            [
-                # Listening span in days
-                (pl.col("user_last_play") - pl.col("user_first_play"))
-                .dt.total_days()
-                .alias("listening_span_days"),
-            ]
-        )
-        .with_columns(
-            [
-                # Half-life = max(listening_span / 3, 30 days)
-                pl.max_horizontal(
-                    pl.col("listening_span_days") / 3.0, pl.lit(MIN_HALF_LIFE_DAYS)
-                ).alias("user_half_life_days"),
-            ]
-        )
-        .select(["username", "user_half_life_days"])
+    # Join plays with user half-life from dim_users
+    df = plays_lf.join(
+        dim_users_lf.select(["username", "user_half_life_days"]), on="username"
     )
-
-    # Join plays with user half-life
-    df = plays_lf.join(user_span_lf, on="username")
 
     # Add days_ago column for recency calculation
     df = df.with_columns(
@@ -192,19 +163,18 @@ def _compute_artist_aggregations(
 
     # Group by user and artist, compute aggregations
     agg_lf = (
-        df.group_by("username", "artist_name", "artist_mbid")
+        df.group_by("username", "artist_name")
         .agg(
             [
                 pl.len().alias("play_count"),
                 pl.col("scrobbled_at_utc").min().alias("first_played_on"),
                 pl.col("scrobbled_at_utc").max().alias("last_played_on"),
-                pl.col("user_half_life_days").first().alias("user_half_life_days"),
-                # Recency score: sum of exponential decay for each play
-                # exp(-days_ago / user_half_life)
-                (-(pl.col("days_ago") / pl.col("user_half_life_days")))
-                .exp()
-                .sum()
-                .alias("recency_score"),
+                # Normalized recency score: average exponential decay per play
+                # Prevents feedback loops by normalizing for play frequency
+                (
+                    (-(pl.col("days_ago") / pl.col("user_half_life_days"))).exp().sum()
+                    / pl.len()
+                ).alias("recency_score"),
             ]
         )
         .with_columns(
@@ -219,28 +189,55 @@ def _compute_artist_aggregations(
                 .alias("days_since_last_play"),
             ]
         )
-        .sort("username", "artist_name")
     )
+
+    # Join with artists dimension to get proper artist_mbid
+    # Use left join to keep all artists even if not in dimension table
+    agg_lf = agg_lf.join(
+        artists_lf.select(["artist_name", "artist_mbid"]),
+        on="artist_name",
+        how="left",
+    ).with_columns(
+        [
+            # Fill null artist_mbid with empty string
+            pl.col("artist_mbid").fill_null(""),
+        ]
+    )
+
+    # Final sort and column order
+    agg_lf = agg_lf.select(
+        [
+            "username",
+            "artist_name",
+            "artist_mbid",
+            "play_count",
+            "first_played_on",
+            "last_played_on",
+            "recency_score",
+            "days_since_last_play",
+        ]
+    ).sort("username", "artist_name")
 
     return agg_lf
 
 
 def _compute_track_aggregations(
-    plays_lf: pl.LazyFrame, execution_date: datetime
+    plays_lf: pl.LazyFrame,
+    dim_users_lf: pl.LazyFrame,
+    execution_date: datetime,
 ) -> pl.LazyFrame:
     """
-    Compute track-level aggregations with dynamic per-user recency measures.
+    Compute track-level aggregations with per-user recency measures.
 
     Groups plays by username and track, calculating:
     - Total play count
     - First and last play dates
-    - Recency score with per-user exponential decay
+    - Normalized recency score (prevents feedback loops)
     - Days since last play
-
-    Half-life is calculated per user as: max(listening_span_days / 3, 30)
 
     Args:
         plays_lf: Silver plays LazyFrame
+        dim_users_lf: User dimension LazyFrame with half-life values
         execution_date: Reference date for recency calculations
 
     Returns:
@@ -248,38 +245,11 @@ def _compute_track_aggregations(
         - username, track_name, track_mbid, artist_name, album_name
         - play_count, first_played_on, last_played_on
         - recency_score, days_since_last_play
-        - user_half_life_days
     """
-    # Calculate per-user listening span and half-life
-    user_span_lf = (
-        plays_lf.group_by("username")
-        .agg(
-            [
-                pl.col("scrobbled_at_utc").min().alias("user_first_play"),
-                pl.col("scrobbled_at_utc").max().alias("user_last_play"),
-            ]
-        )
-        .with_columns(
-            [
-                # Listening span in days
-                (pl.col("user_last_play") - pl.col("user_first_play"))
-                .dt.total_days()
-                .alias("listening_span_days"),
-            ]
-        )
-        .with_columns(
-            [
-                # Half-life = max(listening_span / 3, 30 days)
-                pl.max_horizontal(
-                    pl.col("listening_span_days") / 3.0, pl.lit(MIN_HALF_LIFE_DAYS)
-                ).alias("user_half_life_days"),
-            ]
-        )
-        .select(["username", "user_half_life_days"])
+    # Join plays with user half-life from dim_users
+    df = plays_lf.join(
+        dim_users_lf.select(["username", "user_half_life_days"]), on="username"
     )
-
-    # Join plays with user half-life
-    df = plays_lf.join(user_span_lf, on="username")
 
     # Add days_ago column for recency calculation
     df = df.with_columns(
@@ -302,13 +272,12 @@ def _compute_track_aggregations(
                 pl.len().alias("play_count"),
                 pl.col("scrobbled_at_utc").min().alias("first_played_on"),
                 pl.col("scrobbled_at_utc").max().alias("last_played_on"),
-                pl.col("user_half_life_days").first().alias("user_half_life_days"),
-                # Recency score: sum of exponential decay for each play
-                # exp(-days_ago / user_half_life)
-                (-(pl.col("days_ago") / pl.col("user_half_life_days")))
-                .exp()
-                .sum()
-                .alias("recency_score"),
+                # Normalized recency score: average exponential decay per play
+                # Prevents feedback loops by normalizing for play frequency
+                (
+                    (-(pl.col("days_ago") / pl.col("user_half_life_days"))).exp().sum()
+                    / pl.len()
+                ).alias("recency_score"),
             ]
         )
         .with_columns(
@@ -321,6 +290,20 @@ def _compute_track_aggregations(
                 .dt.total_days()
                 .cast(pl.Int32)
                 .alias("days_since_last_play"),
+            ]
+        )
+        .select(
+            [
+                "username",
+                "track_name",
+                "track_mbid",
+                "artist_name",
+                "album_name",
+                "play_count",
+                "first_played_on",
+                "last_played_on",
+                "recency_score",
+                "days_since_last_play",
             ]
         )
         .sort("username", "track_name")

@@ -22,6 +22,10 @@ from airflow.sdk import Asset, dag, task
 # Assets produced by this DAG
 tracks_asset = Asset("delta://data/silver/tracks")
 artists_asset = Asset("delta://data/silver/artists")
+dim_users_asset = Asset("delta://data/silver/dim_users")
+
+# Asset consumed by this DAG
+plays_asset = Asset("delta://data/silver/plays")
 
 
 @dag(
@@ -34,10 +38,11 @@ artists_asset = Asset("delta://data/silver/artists")
 )
 def lastfm_dimensions():
     """
-    Fetch and maintain track and artist dimension tables.
+    Fetch and maintain track, artist, and user dimension tables.
 
     Incrementally fetches Last.fm metadata for tracks and artists
     that appear in any user's play history but aren't yet in dimension tables.
+    Also computes dim_users with per-user listening profile metadata.
     Dimensions are global across all users.
     """
 
@@ -105,12 +110,41 @@ def lastfm_dimensions():
 
         return transform_artists_to_silver(fetch_metadata)
 
+    @task(multiple_outputs=False, outlets=[dim_users_asset], inlets=[plays_asset])
+    def compute_dim_users() -> dict[str, Any]:
+        """
+        Compute user dimension table with listening profile metadata.
+
+        Creates per-user metrics from silver plays:
+        - Listening span (first to last play)
+        - User-specific half-life for recency calculations
+        - Total play count
+
+        Returns:
+            Metadata dict with path, rows, table_name, execution_date
+        """
+        from airflow.sdk import get_current_context
+        from music_airflow.transform import compute_dim_users as _compute_dim_users
+
+        context = get_current_context()
+        data_interval_start = context.get("data_interval_start")
+
+        if data_interval_start is None:
+            execution_date = dt.datetime.now(tz=dt.timezone.utc)
+        else:
+            execution_date = data_interval_start.replace(tzinfo=dt.timezone.utc)
+
+        return _compute_dim_users(execution_date=execution_date)
+
     # Process tracks and artists sequentially (no per-user expansion)
     track_metadata = fetch_tracks()
     transform_tracks(track_metadata)  # type: ignore[arg-type]
 
     artist_metadata = fetch_artists()
     transform_artists(artist_metadata)  # type: ignore[arg-type]
+
+    # Compute user dimension (depends on plays asset)
+    compute_dim_users()
 
 
 # Instantiate the DAG

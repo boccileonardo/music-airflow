@@ -53,20 +53,58 @@ def sample_plays_df():
     )
 
 
-def test_compute_artist_aggregations(sample_plays_df):
+@pytest.fixture
+def sample_dim_users_df():
+    """Create sample dim_users data for testing."""
+    return pl.LazyFrame(
+        {
+            "username": ["user1", "user2"],
+            "first_play_date": [
+                dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc),
+            ],
+            "last_play_date": [
+                dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc),
+                dt.datetime(2025, 1, 20, tzinfo=dt.timezone.utc),
+            ],
+            "listening_span_days": [14.0, 19.0],
+            "user_half_life_days": [30.0, 30.0],  # Min half-life for new users
+            "total_plays": [4, 2],
+        }
+    )
+
+
+@pytest.fixture
+def sample_artists_df():
+    """Create sample artists dimension data for testing."""
+    return pl.LazyFrame(
+        {
+            "artist_name": ["Artist X", "Artist Y", "Artist Z"],
+            "artist_mbid": ["mbid-x", "mbid-y", "mbid-z"],
+        }
+    )
+
+
+def test_compute_artist_aggregations(
+    sample_plays_df, sample_dim_users_df, sample_artists_df
+):
     """Test artist aggregation logic."""
     execution_date = dt.datetime(2025, 1, 21, tzinfo=dt.timezone.utc)
 
-    result_df = _compute_artist_aggregations(sample_plays_df, execution_date).collect()
+    result_df = _compute_artist_aggregations(
+        sample_plays_df, sample_dim_users_df, sample_artists_df, execution_date
+    ).collect()
 
-    # Check schema
+    # Check schema - should have new normalized column and no user_half_life_days
     assert "username" in result_df.columns
     assert "artist_name" in result_df.columns
+    assert "artist_mbid" in result_df.columns
     assert "play_count" in result_df.columns
     assert "first_played_on" in result_df.columns
     assert "last_played_on" in result_df.columns
     assert "recency_score" in result_df.columns
     assert "days_since_last_play" in result_df.columns
+    assert "user_half_life_days" not in result_df.columns
 
     # Check user1 - Artist X (3 plays)
     user1_artist_x = result_df.filter(
@@ -75,6 +113,10 @@ def test_compute_artist_aggregations(sample_plays_df):
     assert len(user1_artist_x) == 1
     assert user1_artist_x["play_count"][0] == 3
     assert user1_artist_x["days_since_last_play"][0] == 6  # Jan 21 - Jan 15
+    assert user1_artist_x["artist_mbid"][0] == "mbid-x"  # Should be enriched
+
+    # Check recency score is normalized (should be between 0 and 1)
+    assert 0 < user1_artist_x["recency_score"][0] <= 1
 
     # Check user1 - Artist Y (1 play)
     user1_artist_y = result_df.filter(
@@ -82,6 +124,7 @@ def test_compute_artist_aggregations(sample_plays_df):
     )
     assert len(user1_artist_y) == 1
     assert user1_artist_y["play_count"][0] == 1
+    assert user1_artist_y["artist_mbid"][0] == "mbid-y"
 
     # Check user2 - Artist Z (2 plays)
     user2_artist_z = result_df.filter(
@@ -90,13 +133,16 @@ def test_compute_artist_aggregations(sample_plays_df):
     assert len(user2_artist_z) == 1
     assert user2_artist_z["play_count"][0] == 2
     assert user2_artist_z["days_since_last_play"][0] == 1  # Jan 21 - Jan 20
+    assert user2_artist_z["artist_mbid"][0] == "mbid-z"
 
 
-def test_compute_track_aggregations(sample_plays_df):
+def test_compute_track_aggregations(sample_plays_df, sample_dim_users_df):
     """Test track aggregation logic."""
     execution_date = dt.datetime(2025, 1, 21, tzinfo=dt.timezone.utc)
 
-    result_df = _compute_track_aggregations(sample_plays_df, execution_date).collect()
+    result_df = _compute_track_aggregations(
+        sample_plays_df, sample_dim_users_df, execution_date
+    ).collect()
 
     # Check schema
     assert "username" in result_df.columns
@@ -104,6 +150,7 @@ def test_compute_track_aggregations(sample_plays_df):
     assert "artist_name" in result_df.columns
     assert "play_count" in result_df.columns
     assert "recency_score" in result_df.columns
+    assert "user_half_life_days" not in result_df.columns
 
     # Check user1 - Song A (3 plays)
     user1_song_a = result_df.filter(
@@ -121,15 +168,21 @@ def test_compute_track_aggregations(sample_plays_df):
     assert user2_song_c["play_count"][0] == 2
 
 
-def test_recency_score_decay(sample_plays_df):
+def test_recency_score_decay(sample_plays_df, sample_dim_users_df):
     """Test that recency score properly decays with time."""
     execution_date = dt.datetime(2025, 1, 21, tzinfo=dt.timezone.utc)
 
-    result_df = _compute_track_aggregations(sample_plays_df, execution_date).collect()
+    result_df = _compute_track_aggregations(
+        sample_plays_df, sample_dim_users_df, execution_date
+    ).collect()
 
-    # Song A: plays on Jan 1, 5, 15 (20, 16, 6 days ago)
-    # Song B: play on Jan 10 (11 days ago)
-    # Song A should have higher recency score (more recent plays)
+    # Song A: plays on Jan 1, 5, 15 (20, 16, 6 days ago) - 3 plays
+    # Song B: play on Jan 10 (11 days ago) - 1 play
+    # Since recency_score is now normalized (average per play), Song A with
+    # a more recent play (6 days ago) should still have lower average than
+    # Song B's single play at 11 days, but the most recent play matters.
+    # Actually Song B's single play at 11 days has higher per-play recency
+    # than Song A's average across 3 plays (including old ones at 20 and 16 days).
     user1_song_a = result_df.filter(
         (pl.col("username") == "user1") & (pl.col("track_name") == "Song A")
     )
@@ -137,13 +190,16 @@ def test_recency_score_decay(sample_plays_df):
         (pl.col("username") == "user1") & (pl.col("track_name") == "Song B")
     )
 
-    # Song A has 3 plays with most recent being 6 days ago
-    # Song B has 1 play 11 days ago
-    # Song A should have higher recency score
-    assert user1_song_a["recency_score"][0] > user1_song_b["recency_score"][0]
+    # Verify both have recency scores
+    assert user1_song_a["recency_score"][0] > 0
+    assert user1_song_b["recency_score"][0] > 0
+
+    # Song B (1 play at 11 days) has better average recency than
+    # Song A (3 plays averaged: very old + old + recent)
+    assert user1_song_b["recency_score"][0] > user1_song_a["recency_score"][0]
 
 
-def test_aggregations_with_lookback_window(sample_plays_df):
+def test_aggregations_with_lookback_window(sample_plays_df, sample_dim_users_df):
     """Test that lookback window filters old plays correctly."""
     execution_date = dt.datetime(2025, 1, 21, tzinfo=dt.timezone.utc)
 
@@ -151,7 +207,9 @@ def test_aggregations_with_lookback_window(sample_plays_df):
     cutoff_date = execution_date - pl.duration(days=10)
     filtered_df = sample_plays_df.filter(pl.col("scrobbled_at_utc") >= cutoff_date)
 
-    result_df = _compute_track_aggregations(filtered_df, execution_date).collect()
+    result_df = _compute_track_aggregations(
+        filtered_df, sample_dim_users_df, execution_date
+    ).collect()
 
     # Only Jan 15 and Jan 20 plays should be included
     # user1 - Song A should have 1 play (Jan 15)
@@ -167,11 +225,15 @@ def test_aggregations_with_lookback_window(sample_plays_df):
     assert len(user1_song_b) == 0
 
 
-def test_first_and_last_played_dates(sample_plays_df):
+def test_first_and_last_played_dates(
+    sample_plays_df, sample_dim_users_df, sample_artists_df
+):
     """Test that first and last played dates are correct."""
     execution_date = dt.datetime(2025, 1, 21, tzinfo=dt.timezone.utc)
 
-    result_df = _compute_artist_aggregations(sample_plays_df, execution_date).collect()
+    result_df = _compute_artist_aggregations(
+        sample_plays_df, sample_dim_users_df, sample_artists_df, execution_date
+    ).collect()
 
     # Artist X: first = Jan 1, last = Jan 15
     artist_x = result_df.filter(
@@ -190,7 +252,7 @@ class TestComputeArtistPlayCountsIntegration:
 
     def test_compute_artist_play_counts(self, test_data_dir):
         """Test full pipeline for computing artist play counts."""
-        # Setup: Create silver plays table
+        # Setup: Create silver plays, dim_users, and artists tables
         silver_dir = test_data_dir / "silver"
         silver_dir.mkdir(parents=True, exist_ok=True)
         gold_dir = test_data_dir / "gold"
@@ -214,8 +276,36 @@ class TestComputeArtistPlayCountsIntegration:
             }
         )
 
-        # Write to silver Delta table
+        # Create dim_users data
+        dim_users_df = pl.DataFrame(
+            {
+                "username": ["user1", "user2"],
+                "first_play_date": [
+                    dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc),
+                    dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc),
+                ],
+                "last_play_date": [
+                    dt.datetime(2025, 1, 10, tzinfo=dt.timezone.utc),
+                    dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc),
+                ],
+                "listening_span_days": [9.0, 0.0],
+                "user_half_life_days": [30.0, 30.0],
+                "total_plays": [3, 1],
+            }
+        )
+
+        # Create artists dimension data
+        artists_df = pl.DataFrame(
+            {
+                "artist_name": ["Artist X", "Artist Y"],
+                "artist_mbid": ["mbid-artist-x", "mbid-artist-y"],
+            }
+        )
+
+        # Write to silver Delta tables
         plays_df.write_delta(str(silver_dir / "plays"))
+        dim_users_df.write_delta(str(silver_dir / "dim_users"))
+        artists_df.write_delta(str(silver_dir / "artists"))
 
         # Patch IO managers to use test directories
         with (
@@ -251,6 +341,10 @@ class TestComputeArtistPlayCountsIntegration:
         assert "play_count" in gold_df.columns
         assert "recency_score" in gold_df.columns
         assert "days_since_last_play" in gold_df.columns
+        assert "artist_mbid" in gold_df.columns
+        # Verify artist_mbid is populated from artists dimension
+        artist_x_row = gold_df.filter(pl.col("artist_name") == "Artist X")
+        assert artist_x_row["artist_mbid"][0] == "mbid-artist-x"
 
 
 class TestComputeTrackPlayCountsIntegration:
@@ -258,7 +352,7 @@ class TestComputeTrackPlayCountsIntegration:
 
     def test_compute_track_play_counts(self, test_data_dir):
         """Test full pipeline for computing track play counts."""
-        # Setup: Create silver plays table
+        # Setup: Create silver plays and dim_users tables
         silver_dir = test_data_dir / "silver"
         silver_dir.mkdir(parents=True, exist_ok=True)
         gold_dir = test_data_dir / "gold"
@@ -282,8 +376,27 @@ class TestComputeTrackPlayCountsIntegration:
             }
         )
 
-        # Write to silver Delta table
+        # Create dim_users data
+        dim_users_df = pl.DataFrame(
+            {
+                "username": ["user1", "user2"],
+                "first_play_date": [
+                    dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc),
+                    dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc),
+                ],
+                "last_play_date": [
+                    dt.datetime(2025, 1, 10, tzinfo=dt.timezone.utc),
+                    dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc),
+                ],
+                "listening_span_days": [9.0, 0.0],
+                "user_half_life_days": [30.0, 30.0],
+                "total_plays": [3, 1],
+            }
+        )
+
+        # Write to silver Delta tables
         plays_df.write_delta(str(silver_dir / "plays"))
+        dim_users_df.write_delta(str(silver_dir / "dim_users"))
 
         # Patch IO managers to use test directories
         with (

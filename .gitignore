@@ -220,3 +220,5 @@ __marimo__/
 
 # Airflow
 airflow/*
+
+explore_data.py

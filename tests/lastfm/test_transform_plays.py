@@ -53,7 +53,6 @@ class TestTransformPlaysRawToStructured:
             "track_mbid",
             "track_url",
             "artist_name",
-            "artist_mbid",
             "album_name",
             "album_mbid",
         ]
@@ -80,7 +79,7 @@ class TestTransformPlaysRawToStructured:
         )
 
     def test_missing_mbids(self):
-        """Test handling of missing MBIDs (empty strings)."""
+        """Test handling of missing MBIDs (converted to None)."""
         raw_data = {
             "name": ["Track 1"],
             "mbid": [""],
@@ -93,10 +92,9 @@ class TestTransformPlaysRawToStructured:
         df = pl.LazyFrame(raw_data)
         result = transform_plays_raw_to_structured(df, "testuser").collect()
 
-        # MBIDs should be filled with empty strings
-        assert result["track_mbid"].to_list() == [""]
-        assert result["artist_mbid"].to_list() == [""]
-        assert result["album_mbid"].to_list() == [""]
+        # Empty string MBIDs should be converted to None
+        assert result["track_mbid"].to_list() == [None]
+        assert result["album_mbid"].to_list() == [None]
 
     def test_sorting_by_timestamp(self):
         """Test that results are sorted by scrobbled_at."""
@@ -160,7 +158,6 @@ class TestTransformPlaysRawToStructured:
             "track_mbid",
             "track_url",
             "artist_name",
-            "artist_mbid",
             "album_name",
             "album_mbid",
         ]
