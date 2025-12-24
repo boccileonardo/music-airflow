@@ -41,13 +41,14 @@ def compute_artist_play_counts(execution_date: datetime) -> dict[str, Any]:
     """
     # Read silver tables
     io_manager = PolarsDeltaIOManager(medallion_layer="silver")
-    plays_lf: pl.LazyFrame = io_manager.read_delta("plays")  # type: ignore[assignment]
-    dim_users_lf: pl.LazyFrame = io_manager.read_delta("dim_users")  # type: ignore[assignment]
-    artists_lf: pl.LazyFrame = io_manager.read_delta("artists")  # type: ignore[assignment]
+    plays_lf = io_manager.read_delta("plays")
+    dim_users_lf = io_manager.read_delta("dim_users")
+    tracks_lf = io_manager.read_delta("tracks")
+    artists_lf = io_manager.read_delta("artists")
 
     # Compute aggregations with per-user recency measures
     gold_lf = _compute_artist_aggregations(
-        plays_lf, dim_users_lf, artists_lf, execution_date
+        plays_lf, dim_users_lf, tracks_lf, artists_lf, execution_date
     )
 
     # Write to gold layer
@@ -117,34 +118,42 @@ def compute_track_play_counts(execution_date: datetime) -> dict[str, Any]:
 def _compute_artist_aggregations(
     plays_lf: pl.LazyFrame,
     dim_users_lf: pl.LazyFrame,
+    tracks_lf: pl.LazyFrame,
     artists_lf: pl.LazyFrame,
     execution_date: datetime,
 ) -> pl.LazyFrame:
     """
     Compute artist-level aggregations with per-user recency measures.
 
-    Groups plays by username and artist, calculating:
+    Groups plays by username and artist_id,
+    calculating:
     - Total play count
     - First and last play dates
     - Normalized recency score (prevents feedback loops)
     - Days since last play
 
-    Enriches with artist_mbid from silver/artists dimension.
-
     Args:
-        plays_lf: Silver plays LazyFrame
+        plays_lf: Silver plays LazyFrame with track_id
         dim_users_lf: User dimension LazyFrame with half-life values
-        artists_lf: Artists dimension LazyFrame with artist_mbid
+        tracks_lf: Tracks dimension LazyFrame with artist_id
+        artist_lf: Artists dimension LazyFrame with artist_name
         execution_date: Reference date for recency calculations
 
     Returns:
         Aggregated LazyFrame with columns:
-        - username, artist_name, artist_mbid
+        - username, artist_id, artist_name
         - play_count, first_played_on, last_played_on
         - recency_score, days_since_last_play
     """
-    # Join plays with user half-life from dim_users
+    # Enrich plays with proper artist_id from tracks dimension
     df = plays_lf.join(
+        tracks_lf.select(["track_id", "artist_id"]),
+        on="track_id",
+        how="left",
+    )
+
+    # Join with user half-life from dim_users
+    df = df.join(
         dim_users_lf.select(["username", "user_half_life_days"]), on="username"
     )
 
@@ -161,9 +170,9 @@ def _compute_artist_aggregations(
         ]
     )
 
-    # Group by user and artist, compute aggregations
+    # Group by user and artist_id, compute aggregations
     agg_lf = (
-        df.group_by("username", "artist_name")
+        df.group_by("username", "artist_id")
         .agg(
             [
                 pl.len().alias("play_count"),
@@ -191,32 +200,26 @@ def _compute_artist_aggregations(
         )
     )
 
-    # Join with artists dimension to get proper artist_mbid
-    # Use left join to keep all artists even if not in dimension table
+    # Join with artists dimension to get artist_name
     agg_lf = agg_lf.join(
-        artists_lf.select(["artist_name", "artist_mbid"]),
-        on="artist_name",
+        artists_lf.select(["artist_id", "artist_name"]).unique(),
+        on="artist_id",
         how="left",
-    ).with_columns(
-        [
-            # Fill null artist_mbid with empty string
-            pl.col("artist_mbid").fill_null(""),
-        ]
     )
 
     # Final sort and column order
     agg_lf = agg_lf.select(
         [
             "username",
+            "artist_id",
             "artist_name",
-            "artist_mbid",
             "play_count",
             "first_played_on",
             "last_played_on",
             "recency_score",
             "days_since_last_play",
         ]
-    ).sort("username", "artist_name")
+    ).sort("username", "artist_id")
 
     return agg_lf
 
@@ -229,20 +232,19 @@ def _compute_track_aggregations(
     """
     Compute track-level aggregations with per-user recency measures.
 
-    Groups plays by username and track, calculating:
+    Groups plays by username and track_id, calculating:
     - Total play count
     - First and last play dates
     - Normalized recency score (prevents feedback loops)
     - Days since last play
 
     Args:
-        plays_lf: Silver plays LazyFrame
+        plays_lf: Silver plays LazyFrame with track_id
         dim_users_lf: User dimension LazyFrame with half-life values
-        execution_date: Reference date for recency calculations
 
     Returns:
         Aggregated LazyFrame with columns:
-        - username, track_name, track_mbid, artist_name, album_name
+        - username, track_id, track_name, artist_name, album_name
         - play_count, first_played_on, last_played_on
         - recency_score, days_since_last_play
     """
@@ -264,9 +266,9 @@ def _compute_track_aggregations(
         ]
     )
 
-    # Group by user and track, compute aggregations
+    # Group by user and track_id (coalesced ID), compute aggregations
     agg_lf = (
-        df.group_by("username", "track_name", "track_mbid", "artist_name", "album_name")
+        df.group_by("username", "track_id")
         .agg(
             [
                 pl.len().alias("play_count"),
@@ -278,6 +280,10 @@ def _compute_track_aggregations(
                     (-(pl.col("days_ago") / pl.col("user_half_life_days"))).exp().sum()
                     / pl.len()
                 ).alias("recency_score"),
+                # Keep name columns for reference (should be consistent within track_id)
+                pl.col("track_name").first().alias("track_name"),
+                pl.col("artist_name").first().alias("artist_name"),
+                pl.col("album_name").first().alias("album_name"),
             ]
         )
         .with_columns(
@@ -295,8 +301,8 @@ def _compute_track_aggregations(
         .select(
             [
                 "username",
+                "track_id",
                 "track_name",
-                "track_mbid",
                 "artist_name",
                 "album_name",
                 "play_count",
@@ -306,7 +312,7 @@ def _compute_track_aggregations(
                 "days_since_last_play",
             ]
         )
-        .sort("username", "track_name")
+        .sort("username", "track_id")
     )
 
     return agg_lf

@@ -22,6 +22,8 @@ __all__ = [
     "compute_dim_users",
     "_transform_tracks_raw_to_structured",
     "_transform_artists_raw_to_structured",
+    "_deduplicate_tracks",
+    "_deduplicate_artists",
 ]
 
 
@@ -55,19 +57,14 @@ def transform_tracks_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]
     filename = fetch_metadata["filename"]
     tracks_lf = io_manager.read_json(filename)
 
-    # Apply transformation (keeps as LazyFrame)
+    # Apply transformations
     df = _transform_tracks_raw_to_structured(tracks_lf)
+    df = _deduplicate_tracks(df)
 
     # Write to silver layer Delta table with merge/upsert
-    # Use MBID when available, otherwise use track_name + artist_name + album_name for uniqueness
-    # This handles live versions, remixes, etc better than just track + artist
     table_name = "tracks"
     predicate = """
-        (s.track_mbid != '' AND s.track_mbid = t.track_mbid) OR
-        (s.track_mbid = '' AND t.track_mbid = '' AND
-         s.track_name = t.track_name AND
-         s.artist_name = t.artist_name AND
-         COALESCE(s.album_name, '') = COALESCE(t.album_name, ''))
+        s.track_id = t.track_id
     """
 
     silver_io = PolarsDeltaIOManager(medallion_layer="silver")
@@ -110,15 +107,14 @@ def transform_artists_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any
     filename = fetch_metadata["filename"]
     artists_lf = io_manager.read_json(filename)
 
-    # Apply transformation (keeps as LazyFrame)
+    # Apply transformations
     df = _transform_artists_raw_to_structured(artists_lf)
+    df = _deduplicate_artists(df)
 
     # Write to silver layer Delta table with merge/upsert
-    # Use MBID when available, otherwise use artist_name
     table_name = "artists"
     predicate = """
-        (s.artist_mbid != '' AND s.artist_mbid = t.artist_mbid) OR
-        (s.artist_mbid = '' AND t.artist_mbid = '' AND s.artist_name = t.artist_name)
+       s.artist_id = t.artist_id
     """
 
     silver_io = PolarsDeltaIOManager(medallion_layer="silver")
@@ -259,6 +255,132 @@ def _transform_artists_raw_to_structured(raw_artists: pl.LazyFrame) -> pl.LazyFr
     )
 
     return df
+
+
+def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Deduplicate tracks with same attributes, maintaining non-null metadata.
+
+    When multiple rows exist, consolidate by:
+    - Keeping non-null values preferentially
+    - Prioritizing rows with MBIDs
+    - Taking max for numeric fields (listeners, playcount, duration)
+
+    Args:
+        tracks_lf: LazyFrame with potentially duplicate tracks
+
+    Returns:
+        Deduplicated LazyFrame with one row per track
+    """
+    # same track name by same artist with same album name should be considered same track
+    deduplicated = (
+        tracks_lf.group_by(["track_name", "artist_name", "album_name"]).agg(
+            [
+                # non-null and non "", prefer rows with MBID
+                pl.col("track_mbid")
+                .filter(
+                    (pl.col("track_mbid") != "") & pl.col("track_mbid").is_not_null()
+                )
+                .first()
+                .alias("track_mbid"),
+                pl.col("artist_mbid")
+                .filter(
+                    (pl.col("artist_mbid") != "") & pl.col("artist_mbid").is_not_null()
+                )
+                .first()
+                .alias("artist_mbid"),
+                pl.col("duration_ms")
+                .filter(pl.col("duration_ms").is_not_null())
+                .first()
+                .alias("duration_ms"),
+                pl.col("track_url")
+                .filter((pl.col("track_url") != "") & pl.col("track_url").is_not_null())
+                .first()
+                .alias("track_url"),
+                pl.col("tags")
+                .filter((pl.col("tags") != "") & pl.col("tags").is_not_null())
+                .first()
+                .alias("tags"),
+                # Take max for numeric popularity metrics
+                pl.col("listeners").max().alias("listeners"),
+                pl.col("playcount").max().alias("playcount"),
+                # artist and track id
+            ]
+        )
+    ).with_columns(
+        # Create track_id: prefer MBID when available, else synthetic from names
+        pl.when((pl.col("track_mbid").is_not_null()) & (pl.col("track_mbid") != ""))
+        .then(pl.col("track_mbid"))
+        .otherwise(
+            pl.concat_str([pl.col("track_name"), pl.col("artist_name")], separator="|")
+        )
+        .alias("track_id"),
+        # Create artist_id: use MBID if available, else artist name
+        # TODO: instead of artist name as fallback, use lastfm search for mbid based on fuzzy name search
+        pl.when((pl.col("artist_mbid").is_not_null()) & (pl.col("artist_mbid") != ""))
+        .then(pl.col("artist_mbid"))
+        .otherwise(pl.col("artist_name"))
+        .alias("artist_id"),
+    )
+
+    return deduplicated
+
+
+def _deduplicate_artists(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Deduplicate artists.
+
+    When multiple rows exist, consolidate by:
+    - Keeping non-null values preferentially
+    - Prioritizing rows with MBIDs
+    - Taking max for numeric fields (listeners, playcount)
+
+    Args:
+        artists_lf: LazyFrame with potentially duplicate artists
+
+    Returns:
+        Deduplicated LazyFrame with one row per artist
+    """
+    deduplicated = (
+        artists_lf.group_by("artist_name").agg(
+            [
+                # non-null and non "", prefer rows with MBID
+                pl.col("artist_mbid")
+                .filter(
+                    (pl.col("artist_mbid") != "") & pl.col("artist_mbid").is_not_null()
+                )
+                .first()
+                .alias("artist_mbid"),
+                pl.col("artist_url")
+                .filter(
+                    (pl.col("artist_url") != "") & pl.col("artist_url").is_not_null()
+                )
+                .first()
+                .alias("artist_url"),
+                pl.col("tags")
+                .filter((pl.col("tags") != "") & pl.col("tags").is_not_null())
+                .first()
+                .alias("tags"),
+                pl.col("bio_summary")
+                .filter(
+                    (pl.col("bio_summary") != "") & pl.col("bio_summary").is_not_null()
+                )
+                .first()
+                .alias("bio_summary"),
+                # Take max for numeric popularity metrics
+                pl.col("listeners").max().alias("listeners"),
+                pl.col("playcount").max().alias("playcount"),
+            ]
+        )
+    ).with_columns(
+        # Create artist_id: use MBID if available, else artist name
+        pl.when((pl.col("artist_mbid").is_not_null()) & (pl.col("artist_mbid") != ""))
+        .then(pl.col("artist_mbid"))
+        .otherwise(pl.col("artist_name"))
+        .alias("artist_id"),
+    )
+
+    return deduplicated
 
 
 def compute_dim_users(execution_date: datetime) -> dict[str, Any]:

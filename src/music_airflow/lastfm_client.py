@@ -260,3 +260,238 @@ class LastFMClient:
 
         response_data = self._make_request(params)
         return response_data.get("artist", {})
+
+    def get_similar_artists(
+        self,
+        artist: str,
+        mbid: str | None = None,
+        limit: int = 100,
+        autocorrect: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Get similar artists to a given artist.
+
+        Args:
+            artist: Artist name
+            mbid: MusicBrainz ID (optional, used if provided)
+            limit: Number of results to return (max 100)
+            autocorrect: Transform misspelled names into correct versions (default: True)
+
+        Returns:
+            List of similar artists with match scores and metadata
+
+        Raises:
+            ValueError: If artist not found or API error
+        """
+        params = {
+            "method": "artist.getSimilar",
+            "api_key": self.api_key,
+            "format": "json",
+            "limit": min(limit, 100),
+            "autocorrect": 1 if autocorrect else 0,
+        }
+
+        if mbid:
+            params["mbid"] = mbid
+        else:
+            params["artist"] = artist
+
+        response_data = self._make_request(params)
+        similar_artists = response_data.get("similarartists", {})
+        artists = similar_artists.get("artist", [])
+
+        # Handle single artist response (not a list)
+        if isinstance(artists, dict):
+            artists = [artists]
+
+        return artists
+
+    def get_artist_top_tracks(
+        self,
+        artist: str,
+        mbid: str | None = None,
+        limit: int = 50,
+        autocorrect: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Get top tracks for an artist.
+
+        Args:
+            artist: Artist name
+            mbid: MusicBrainz ID (optional, used if provided)
+            limit: Number of results to return (default 50)
+            autocorrect: Transform misspelled names into correct versions (default: True)
+
+        Returns:
+            List of top tracks with playcount, listeners, and metadata
+
+        Raises:
+            ValueError: If artist not found or API error
+        """
+        params = {
+            "method": "artist.getTopTracks",
+            "api_key": self.api_key,
+            "format": "json",
+            "limit": limit,
+            "autocorrect": 1 if autocorrect else 0,
+        }
+
+        if mbid:
+            params["mbid"] = mbid
+        else:
+            params["artist"] = artist
+
+        response_data = self._make_request(params)
+        top_tracks = response_data.get("toptracks", {})
+        tracks = top_tracks.get("track", [])
+
+        # Handle single track response (not a list)
+        if isinstance(tracks, dict):
+            tracks = [tracks]
+
+        return tracks
+
+    def get_artist_top_albums(
+        self,
+        artist: str,
+        mbid: str | None = None,
+        limit: int = 50,
+        autocorrect: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Get top albums for an artist.
+
+        Args:
+            artist: Artist name
+            mbid: MusicBrainz ID (optional, used if provided)
+            limit: Number of results to return (default 50)
+            autocorrect: Transform misspelled names into correct versions (default: True)
+
+        Returns:
+            List of top albums with playcount and metadata
+
+        Raises:
+            ValueError: If artist not found or API error
+        """
+        params = {
+            "method": "artist.getTopAlbums",
+            "api_key": self.api_key,
+            "format": "json",
+            "limit": limit,
+            "autocorrect": 1 if autocorrect else 0,
+        }
+
+        if mbid:
+            params["mbid"] = mbid
+        else:
+            params["artist"] = artist
+
+        response_data = self._make_request(params)
+        top_albums = response_data.get("topalbums", {})
+        albums = top_albums.get("album", [])
+
+        # Handle single album response (not a list)
+        if isinstance(albums, dict):
+            albums = [albums]
+
+        return albums
+
+    def get_similar_tags(self, tag: str) -> list[dict[str, Any]]:
+        """
+        Get similar tags to a given tag.
+
+        Args:
+            tag: Tag name
+
+        Returns:
+            List of similar tags
+
+        Raises:
+            ValueError: If tag not found or API error
+        """
+        params = {
+            "method": "tag.getSimilar",
+            "tag": tag,
+            "api_key": self.api_key,
+            "format": "json",
+        }
+
+        response_data = self._make_request(params)
+        similar_tags = response_data.get("similartags", {})
+        tags = similar_tags.get("tag", [])
+
+        # Handle single tag response (not a list)
+        if isinstance(tags, dict):
+            tags = [tags]
+
+        return tags
+
+    def get_tag_top_tracks(self, tag: str, limit: int = 50) -> list[dict[str, Any]]:
+        """
+        Get top tracks for a tag.
+
+        Args:
+            tag: Tag name
+            limit: Number of results to return (default 50)
+
+        Returns:
+            List of top tracks with playcount, listeners, and metadata
+
+        Raises:
+            ValueError: If tag not found or API error
+        """
+        params = {
+            "method": "tag.getTopTracks",
+            "tag": tag,
+            "api_key": self.api_key,
+            "format": "json",
+            "limit": limit,
+        }
+
+        response_data = self._make_request(params)
+        top_tracks = response_data.get("tracks", {})
+        tracks = top_tracks.get("track", [])
+
+        # Handle single track response (not a list)
+        if isinstance(tracks, dict):
+            tracks = [tracks]
+
+        return tracks
+
+    def get_album_info(
+        self,
+        album: str,
+        artist: str,
+        mbid: str | None = None,
+        autocorrect: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Get detailed information about an album including its tracks.
+
+        Args:
+            album: Album name
+            artist: Artist name
+            mbid: MusicBrainz ID (optional, used if provided)
+            autocorrect: Transform misspelled names into correct versions (default: True)
+
+        Returns:
+            Album information dictionary including tracks, listeners, playcount
+
+        Raises:
+            ValueError: If album not found or API error
+        """
+        params = {
+            "method": "album.getinfo",
+            "api_key": self.api_key,
+            "format": "json",
+            "autocorrect": 1 if autocorrect else 0,
+        }
+
+        if mbid:
+            params["mbid"] = mbid
+        else:
+            params["album"] = album
+            params["artist"] = artist
+
+        response_data = self._make_request(params)
+        return response_data.get("album", {})

@@ -55,6 +55,8 @@ class TestTransformPlaysRawToStructured:
             "artist_name",
             "album_name",
             "album_mbid",
+            "track_id",
+            "artist_id",
         ]
         assert result.columns == expected_cols
 
@@ -160,6 +162,8 @@ class TestTransformPlaysRawToStructured:
             "artist_name",
             "album_name",
             "album_mbid",
+            "track_id",
+            "artist_id",
         ]
 
 

@@ -96,6 +96,10 @@ def extract_tracks_to_bronze() -> dict[str, Any]:
                 artist=artist_name,
                 mbid=track_mbid if track_mbid else None,
             )
+            # Preserve the MBID from plays rather than the one from API response
+            # (API often returns empty MBID even when we query with one)
+            if track_mbid:
+                track_info["mbid"] = track_mbid
             tracks_data.append(track_info)
 
             # Progress logging every 10 tracks
@@ -168,7 +172,7 @@ def extract_artists_to_bronze() -> dict[str, Any]:
         raise AirflowSkipException("No plays data available yet - run plays DAG first")
 
     # Get unique artists (keep as LazyFrame)
-    unique_artists_lf = plays_lf.select(["artist_name", "artist_mbid"]).unique()
+    unique_artists_lf = plays_lf.select(["artist_name"]).unique()
 
     # Check which artists already exist in silver (transform writes to silver, not bronze)
     try:
@@ -184,10 +188,9 @@ def extract_artists_to_bronze() -> dict[str, Any]:
         # No existing artists table - all artists are new
         new_artists_lf = unique_artists_lf
 
-    # Only collect once to preserve row order across columns
-    new_artists_df = new_artists_lf.select("artist_name", "artist_mbid").collect()
+    # Collect artist names
+    new_artists_df = new_artists_lf.collect()
     artist_names = new_artists_df["artist_name"].to_list()
-    artist_mbids = new_artists_df["artist_mbid"].to_list()
 
     artist_count = len(artist_names)
     if artist_count == 0:
@@ -201,13 +204,9 @@ def extract_artists_to_bronze() -> dict[str, Any]:
 
     for idx in range(artist_count):
         artist_name = artist_names[idx]
-        artist_mbid = artist_mbids[idx]
 
         try:
-            artist_info = client.get_artist_info(
-                artist=artist_name,
-                mbid=artist_mbid if artist_mbid else None,
-            )
+            artist_info = client.get_artist_info(artist=artist_name)
             artists_data.append(artist_info)
 
             # Progress logging every 10 artists

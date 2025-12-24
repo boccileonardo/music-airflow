@@ -114,6 +114,7 @@ def transform_plays_raw_to_structured(
         - track_name, track_mbid, track_url: str
         - artist_name: str
         - album_name, album_mbid: str
+        - track_id: str (coalesced: MBID or synthetic)
     """
     df = (
         raw_tracks.with_columns(
@@ -160,6 +161,21 @@ def transform_plays_raw_to_structured(
                 "artist_name",
                 "album_name",
                 "album_mbid",
+            ]
+        )
+        .with_columns(
+            [
+                # Create track_id: prefer MBID when available, else synthetic from names
+                pl.when(
+                    (pl.col("track_mbid").is_not_null()) & (pl.col("track_mbid") != "")
+                )
+                .then(pl.col("track_mbid"))
+                .otherwise(
+                    pl.concat_str(
+                        [pl.col("track_name"), pl.col("artist_name")], separator="|"
+                    )
+                )
+                .alias("track_id"),
             ]
         )
         .sort("scrobbled_at")

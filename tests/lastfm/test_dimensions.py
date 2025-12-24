@@ -110,6 +110,8 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
         "playcount",
         "tags",
         "track_url",
+        "track_id",
+        "artist_id",
     ]
     assert result.columns == expected_cols
 
@@ -143,6 +145,7 @@ def test_transform_artists_raw_to_structured(sample_raw_artists):
         "tags",
         "bio_summary",
         "artist_url",
+        "artist_id",
     ]
     assert result.columns == expected_cols
 

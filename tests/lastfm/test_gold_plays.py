@@ -31,7 +31,14 @@ def sample_plays_df():
                 dt.datetime(2025, 1, 20, tzinfo=dt.timezone.utc),
             ],
             "track_name": ["Song A", "Song A", "Song B", "Song A", "Song C", "Song C"],
-            "track_mbid": ["", "", "", "", "", ""],
+            "track_id": [
+                "Song A|Artist X",
+                "Song A|Artist X",
+                "Song B|Artist Y",
+                "Song A|Artist X",
+                "Song C|Artist Z",
+                "Song C|Artist Z",
+            ],
             "artist_name": [
                 "Artist X",
                 "Artist X",
@@ -40,7 +47,14 @@ def sample_plays_df():
                 "Artist Z",
                 "Artist Z",
             ],
-            "artist_mbid": ["", "", "", "", "", ""],
+            "artist_id": [
+                "Artist X",
+                "Artist X",
+                "Artist Y",
+                "Artist X",
+                "Artist Z",
+                "Artist Z",
+            ],
             "album_name": [
                 "Album 1",
                 "Album 1",
@@ -80,7 +94,7 @@ def sample_artists_df():
     return pl.LazyFrame(
         {
             "artist_name": ["Artist X", "Artist Y", "Artist Z"],
-            "artist_mbid": ["mbid-x", "mbid-y", "mbid-z"],
+            "artist_id": ["mbid-x", "mbid-y", "Artist Z"],  # Artist Z has no MBID
         }
     )
 
@@ -95,10 +109,10 @@ def test_compute_artist_aggregations(
         sample_plays_df, sample_dim_users_df, sample_artists_df, execution_date
     ).collect()
 
-    # Check schema - should have new normalized column and no user_half_life_days
+    # Check schema - should have artist_id instead of artist_mbid
     assert "username" in result_df.columns
+    assert "artist_id" in result_df.columns
     assert "artist_name" in result_df.columns
-    assert "artist_mbid" in result_df.columns
     assert "play_count" in result_df.columns
     assert "first_played_on" in result_df.columns
     assert "last_played_on" in result_df.columns
@@ -108,32 +122,34 @@ def test_compute_artist_aggregations(
 
     # Check user1 - Artist X (3 plays)
     user1_artist_x = result_df.filter(
-        (pl.col("username") == "user1") & (pl.col("artist_name") == "Artist X")
+        (pl.col("username") == "user1")
+        & (pl.col("artist_id") == "mbid-x")  # Should be enriched with MBID
     )
     assert len(user1_artist_x) == 1
     assert user1_artist_x["play_count"][0] == 3
     assert user1_artist_x["days_since_last_play"][0] == 6  # Jan 21 - Jan 15
-    assert user1_artist_x["artist_mbid"][0] == "mbid-x"  # Should be enriched
+    assert user1_artist_x["artist_name"][0] == "Artist X"
 
     # Check recency score is normalized (should be between 0 and 1)
     assert 0 < user1_artist_x["recency_score"][0] <= 1
 
     # Check user1 - Artist Y (1 play)
     user1_artist_y = result_df.filter(
-        (pl.col("username") == "user1") & (pl.col("artist_name") == "Artist Y")
+        (pl.col("username") == "user1")
+        & (pl.col("artist_id") == "mbid-y")  # Should be enriched with MBID
     )
     assert len(user1_artist_y) == 1
     assert user1_artist_y["play_count"][0] == 1
-    assert user1_artist_y["artist_mbid"][0] == "mbid-y"
+    assert user1_artist_y["artist_name"][0] == "Artist Y"
 
-    # Check user2 - Artist Z (2 plays)
+    # Check user2 - Artist Z (2 plays) - no MBID, uses artist_name as fallback
     user2_artist_z = result_df.filter(
-        (pl.col("username") == "user2") & (pl.col("artist_name") == "Artist Z")
+        (pl.col("username") == "user2") & (pl.col("artist_id") == "Artist Z")
     )
     assert len(user2_artist_z) == 1
     assert user2_artist_z["play_count"][0] == 2
     assert user2_artist_z["days_since_last_play"][0] == 1  # Jan 21 - Jan 20
-    assert user2_artist_z["artist_mbid"][0] == "mbid-z"
+    assert user2_artist_z["artist_name"][0] == "Artist Z"
 
 
 def test_compute_track_aggregations(sample_plays_df, sample_dim_users_df):
@@ -146,6 +162,7 @@ def test_compute_track_aggregations(sample_plays_df, sample_dim_users_df):
 
     # Check schema
     assert "username" in result_df.columns
+    assert "track_id" in result_df.columns
     assert "track_name" in result_df.columns
     assert "artist_name" in result_df.columns
     assert "play_count" in result_df.columns
@@ -154,7 +171,7 @@ def test_compute_track_aggregations(sample_plays_df, sample_dim_users_df):
 
     # Check user1 - Song A (3 plays)
     user1_song_a = result_df.filter(
-        (pl.col("username") == "user1") & (pl.col("track_name") == "Song A")
+        (pl.col("username") == "user1") & (pl.col("track_id") == "Song A|Artist X")
     )
     assert len(user1_song_a) == 1
     assert user1_song_a["play_count"][0] == 3
@@ -184,10 +201,10 @@ def test_recency_score_decay(sample_plays_df, sample_dim_users_df):
     # Actually Song B's single play at 11 days has higher per-play recency
     # than Song A's average across 3 plays (including old ones at 20 and 16 days).
     user1_song_a = result_df.filter(
-        (pl.col("username") == "user1") & (pl.col("track_name") == "Song A")
+        (pl.col("username") == "user1") & (pl.col("track_id") == "Song A|Artist X")
     )
     user1_song_b = result_df.filter(
-        (pl.col("username") == "user1") & (pl.col("track_name") == "Song B")
+        (pl.col("username") == "user1") & (pl.col("track_id") == "Song B|Artist Y")
     )
 
     # Verify both have recency scores
@@ -269,9 +286,14 @@ class TestComputeArtistPlayCountsIntegration:
                     dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc),
                 ],
                 "track_name": ["Song A", "Song B", "Song A", "Song C"],
-                "track_mbid": ["", "", "", ""],
+                "track_id": [
+                    "Song A|Artist X",
+                    "Song B|Artist X",
+                    "Song A|Artist X",
+                    "Song C|Artist Y",
+                ],
                 "artist_name": ["Artist X", "Artist X", "Artist X", "Artist Y"],
-                "artist_mbid": ["", "", "", ""],
+                "artist_id": ["Artist X", "Artist X", "Artist X", "Artist Y"],
                 "album_name": ["Album 1", "Album 1", "Album 1", "Album 2"],
             }
         )
@@ -298,7 +320,7 @@ class TestComputeArtistPlayCountsIntegration:
         artists_df = pl.DataFrame(
             {
                 "artist_name": ["Artist X", "Artist Y"],
-                "artist_mbid": ["mbid-artist-x", "mbid-artist-y"],
+                "artist_id": ["mbid-artist-x", "mbid-artist-y"],
             }
         )
 
@@ -341,10 +363,11 @@ class TestComputeArtistPlayCountsIntegration:
         assert "play_count" in gold_df.columns
         assert "recency_score" in gold_df.columns
         assert "days_since_last_play" in gold_df.columns
-        assert "artist_mbid" in gold_df.columns
-        # Verify artist_mbid is populated from artists dimension
-        artist_x_row = gold_df.filter(pl.col("artist_name") == "Artist X")
-        assert artist_x_row["artist_mbid"][0] == "mbid-artist-x"
+        assert "artist_id" in gold_df.columns
+        # Verify artist_id is enriched with MBID from artists dimension
+        artist_x_row = gold_df.filter(pl.col("artist_id") == "mbid-artist-x")
+        assert len(artist_x_row) == 1
+        assert artist_x_row["artist_name"][0] == "Artist X"
 
 
 class TestComputeTrackPlayCountsIntegration:
@@ -369,9 +392,14 @@ class TestComputeTrackPlayCountsIntegration:
                     dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc),
                 ],
                 "track_name": ["Song A", "Song B", "Song A", "Song C"],
-                "track_mbid": ["", "", "", ""],
+                "track_id": [
+                    "Song A|Artist X",
+                    "Song B|Artist X",
+                    "Song A|Artist X",
+                    "Song C|Artist Y",
+                ],
                 "artist_name": ["Artist X", "Artist X", "Artist X", "Artist Y"],
-                "artist_mbid": ["", "", "", ""],
+                "artist_id": ["Artist X", "Artist X", "Artist X", "Artist Y"],
                 "album_name": ["Album 1", "Album 1", "Album 1", "Album 2"],
             }
         )

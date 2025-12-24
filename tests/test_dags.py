@@ -34,6 +34,7 @@ class TestDagValidation:
             "lastfm_plays",
             "gold_play_aggregations",
             "lastfm_dimensions",
+            "candidate_generation",
         }
         dag_ids = set(dag_bag.dag_ids)
         assert expected_dags.issubset(dag_ids), (
@@ -185,3 +186,41 @@ class TestLastFmDimensionsDag:
         # tracks and artists pipelines can run in parallel
         assert fetch_artists not in fetch_tracks.upstream_list
         assert fetch_tracks not in fetch_artists.upstream_list
+
+
+class TestCandidateGenerationDAG:
+    """Test candidate_generation DAG structure."""
+
+    def test_dag_properties(self, dag_bag):
+        """Test basic DAG configuration."""
+        dag = dag_bag.get_dag("candidate_generation")
+
+        assert dag is not None
+        assert dag.catchup is False
+        assert "gold" in dag.tags
+        assert "candidates" in dag.tags
+
+    def test_task_count(self, dag_bag):
+        """Test that DAG has expected tasks."""
+        dag = dag_bag.get_dag("candidate_generation")
+
+        task_ids = [task.task_id for task in dag.tasks]
+
+        # Should have core tasks
+        assert "get_active_users" in task_ids
+        assert "generate_all_candidates_for_user" in task_ids
+        assert "consolidate_results" in task_ids
+
+    def test_task_dependencies(self, dag_bag):
+        """Test that task dependencies are correct."""
+        dag = dag_bag.get_dag("candidate_generation")
+
+        get_users = dag.get_task("get_active_users")
+        generate_candidates = dag.get_task("generate_all_candidates_for_user")
+        consolidate = dag.get_task("consolidate_results")
+
+        # Generate candidates should depend on get_users
+        assert get_users in generate_candidates.upstream_list
+
+        # Consolidate should depend on generate_candidates
+        assert generate_candidates in consolidate.upstream_list
