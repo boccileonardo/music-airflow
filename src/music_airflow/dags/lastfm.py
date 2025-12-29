@@ -20,7 +20,7 @@ from typing import Any
 
 from airflow.sdk import Asset, dag, task
 
-from music_airflow.utils.constants import LAST_FM_USERNAMES
+from music_airflow.utils.constants import LAST_FM_USERNAMES, DAG_START_DATE
 from music_airflow.extract import extract_plays_to_bronze
 from music_airflow.transform import transform_plays_to_silver
 
@@ -30,7 +30,7 @@ plays_asset = Asset("delta://data/silver/plays")
 
 @dag(
     schedule="@daily",
-    start_date=dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc),
+    start_date=DAG_START_DATE,
     catchup=True,  # backfill from start date
     max_active_runs=1,  # Prevent concurrent runs
     tags=["lastfm", "bronze", "silver"],

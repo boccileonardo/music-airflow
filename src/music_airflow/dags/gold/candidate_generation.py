@@ -13,9 +13,8 @@ Configuration:
 
 #todo: review outputs
 
-import datetime as dt
 from typing import Any
-
+from music_airflow.utils.constants import DAG_START_DATE
 from airflow.sdk import Asset, dag, task
 
 # Assets consumed by this DAG
@@ -23,13 +22,13 @@ plays_asset = Asset("delta://data/silver/plays")
 artists_asset = Asset("delta://data/silver/artists")
 tracks_asset = Asset("delta://data/silver/tracks")
 
-# Asset produced by this DAG (single unified table)
+# Asset produced by this DAG
 candidates_asset = Asset("delta://data/gold/track_candidates")
 
 
 @dag(
     schedule=[plays_asset, artists_asset, tracks_asset],
-    start_date=dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc),
+    start_date=DAG_START_DATE,
     catchup=False,
     max_active_runs=1,
     tags=["gold", "candidates", "recommendations"],

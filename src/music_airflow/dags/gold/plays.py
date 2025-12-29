@@ -15,7 +15,7 @@ Configuration:
 
 import datetime as dt
 from typing import Any
-
+from music_airflow.utils.constants import DAG_START_DATE
 from airflow.sdk import Asset, dag, task
 
 # Assets consumed by this DAG - triggers when any of these are updated
@@ -34,7 +34,7 @@ track_play_count_asset = Asset("delta://data/gold/track_play_count")
         dim_users_asset,
         artists_asset,
     ],  # Run when any input asset is updated
-    start_date=dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc),
+    start_date=DAG_START_DATE,
     catchup=False,  # Only process latest date
     max_active_runs=1,
     tags=["gold", "aggregations"],

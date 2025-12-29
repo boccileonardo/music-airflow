@@ -16,8 +16,10 @@ Configuration:
 
 import datetime as dt
 from typing import Any
-
+from music_airflow.utils.constants import DAG_START_DATE
 from airflow.sdk import Asset, dag, task
+
+
 
 # Assets produced by this DAG
 tracks_asset = Asset("delta://data/silver/tracks")
@@ -30,7 +32,7 @@ plays_asset = Asset("delta://data/silver/plays")
 
 @dag(
     schedule="@weekly",
-    start_date=dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc),
+    start_date=DAG_START_DATE,
     catchup=False,  # Don't backfill dimensions
     max_active_runs=1,
     tags=["dimensions", "bronze", "silver"],
