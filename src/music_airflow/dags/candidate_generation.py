@@ -11,6 +11,8 @@ Configuration:
 - Saves intermediate results to silver, final unified table to gold
 """
 
+#todo: review outputs
+
 import datetime as dt
 from typing import Any
 
@@ -79,10 +81,7 @@ def candidate_generation():
         )
 
         return generate_similar_artist_candidates(
-            username=username,
-            min_listeners=1000,
-            max_candidates=500,
-            tag_sample_rate=0.6,
+            username=username,    
         )
 
     @task(
@@ -105,9 +104,6 @@ def candidate_generation():
 
         return generate_similar_tag_candidates(
             username=username,
-            min_listeners=1000,
-            max_candidates=500,
-            tag_sample_rate=0.5,
         )
 
     @task(
@@ -130,9 +126,6 @@ def candidate_generation():
 
         return generate_deep_cut_candidates(
             username=username,
-            min_listeners=100,
-            max_listeners=50000,
-            max_candidates=300,
         )
 
     @task(

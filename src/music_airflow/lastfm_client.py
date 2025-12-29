@@ -19,6 +19,9 @@ from tenacity import (
     wait_random_exponential,
 )
 
+#todo: You will not make more than 5 requests per originating IP address per second, averaged over a 5 minute period
+# refactor to async
+
 
 class LastFMClient:
     """Client for interacting with the Last.fm API."""

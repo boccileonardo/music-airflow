@@ -9,6 +9,10 @@ Generates candidate track lists using Last.fm API similarity:
 Returns DataFrames for silver-layer storage; DAG consolidates into single gold table.
 """
 
+
+#todo: progress monitoring logs
+#todo: clean artist/track lists before sending requests
+
 import time
 from typing import Any
 
