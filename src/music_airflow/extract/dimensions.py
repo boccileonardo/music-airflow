@@ -70,7 +70,7 @@ def extract_tracks_to_bronze() -> dict[str, Any]:
     # Only collect once to preserve row order across columns
     new_tracks_df = new_tracks_lf.select(
         "track_name", "artist_name", "track_mbid"
-    ).collect()
+    ).collect(engine="streaming")
     track_names = new_tracks_df["track_name"].to_list()
     artist_names = new_tracks_df["artist_name"].to_list()
     track_mbids = new_tracks_df["track_mbid"].to_list()
@@ -189,7 +189,7 @@ def extract_artists_to_bronze() -> dict[str, Any]:
         new_artists_lf = unique_artists_lf
 
     # Collect artist names
-    new_artists_df = new_artists_lf.collect()
+    new_artists_df = new_artists_lf.collect(engine="streaming")
     artist_names = new_artists_df["artist_name"].to_list()
 
     artist_count = len(artist_names)

@@ -27,6 +27,8 @@ export AIRFLOW_HOME="$PROJECT_ROOT/airflow"
 export AIRFLOW__CORE__LOAD_EXAMPLES=False
 export AIRFLOW__CORE__DAGS_FOLDER="$PROJECT_ROOT/src/music_airflow/dags"
 export AIRFLOW__CORE__PARALLELISM=1 # prevent local oom
+export NO_PROXY="*" # prevent proxy staleness
+export AIRFLOW__OPERATORS__DEFAULT_RAM=4000 #default is 512, and had oom
 
 # Optional cleanup
 if [[ "$CLEAN" == "true" ]]; then

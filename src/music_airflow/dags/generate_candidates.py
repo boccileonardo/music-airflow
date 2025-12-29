@@ -58,7 +58,7 @@ def candidate_generation():
         import polars as pl
 
         plays_lf = pl.scan_delta("data/silver/plays")
-        users = plays_lf.select("username").unique().collect()
+        users = plays_lf.select("username").unique().collect(engine="streaming")
         return users["username"].to_list()
 
     @task(

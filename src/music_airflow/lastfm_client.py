@@ -399,6 +399,34 @@ class LastFMClient:
 
         return albums
 
+    def search_artist(self, artist: str, limit: int = 1) -> list[dict[str, Any]]:
+        """
+        Search for artists on Last.fm and return matches.
+
+        Args:
+            artist: Artist name to search for
+            limit: Maximum number of results to return (default 1)
+
+        Returns:
+            List of artist match dicts. Each may include 'name', 'mbid', 'url'.
+        """
+        params = {
+            "method": "artist.search",
+            "artist": artist,
+            "api_key": self.api_key,
+            "format": "json",
+            "limit": limit,
+        }
+
+        response_data = self._make_request(params)
+        results = response_data.get("results", {})
+        matches = results.get("artistmatches", {}).get("artist", [])
+
+        if isinstance(matches, dict):
+            matches = [matches]
+
+        return matches
+
     def get_similar_tags(self, tag: str) -> list[dict[str, Any]]:
         """
         Get similar tags to a given tag.

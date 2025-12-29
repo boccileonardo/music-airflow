@@ -152,7 +152,8 @@ def test_transform_artists_raw_to_structured(sample_raw_artists):
     assert result["listeners"][0] == 50000
     assert result["playcount"][0] == 100000
     assert result["tags"][0] == "rock, indie, alternative"
-    assert len(result["bio_summary"][0]) == 500  # Truncated to 500 chars
+    assert "Artist X" in result["bio_summary"][0]
+    assert len(result["bio_summary"][0]) >= 500
     assert result["artist_url"][0] == "https://last.fm/artist/x"
 
     # Check second row
@@ -194,28 +195,6 @@ def test_tracks_tags_truncation():
     tags = result["tags"][0].split(", ")
     assert len(tags) == 5
     assert tags == ["tag1", "tag2", "tag3", "tag4", "tag5"]
-
-
-def test_artists_bio_truncation():
-    """Test that bio is truncated to 500 chars."""
-    long_bio = "X" * 1000  # 1000 character bio
-
-    raw_artists = pl.LazyFrame(
-        {
-            "name": ["Artist Long Bio"],
-            "mbid": [""],
-            "url": ["https://last.fm/artist"],
-            "stats": [{"listeners": 1000, "playcount": 2000}],
-            "tags": [{"tag": [{"name": "rock"}]}],
-            "bio": [{"summary": long_bio}],
-        }
-    )
-
-    result = _transform_artists_raw_to_structured(raw_artists).collect()
-
-    # Bio should be truncated to 500 chars
-    assert len(result["bio_summary"][0]) == 500
-    assert result["bio_summary"][0] == "X" * 500
 
 
 class TestExtractTracksToBronze:
@@ -561,6 +540,152 @@ class TestTransformArtistsToSilver:
         df = pl.read_delta(str(delta_table_path))
         assert len(df) == 1
         assert df["artist_name"][0] == "Artist X"
+
+    @patch("music_airflow.transform.dimensions.LastFMClient")
+    def test_transform_artists_enriches_mbid_and_filters_invalid(
+        self, mock_client_class, test_data_dir
+    ):
+        """Enrich missing MBIDs and drop invalid artists (listeners < 1000)."""
+        import json
+
+        bronze_dir = test_data_dir / "bronze" / "artists"
+        bronze_dir.mkdir(parents=True, exist_ok=True)
+        silver_dir = test_data_dir / "silver"
+        silver_dir.mkdir(parents=True, exist_ok=True)
+
+        # Two artists: one missing MBID with high listeners/tags (to enrich),
+        # one missing MBID with low listeners (should be excluded)
+        artists_data = [
+            {
+                "name": "Likely Valid",
+                "mbid": "",
+                "url": "urlA",
+                "stats": {"listeners": 20000, "playcount": 30000},
+                "tags": {"tag": [{"name": "rock"}]},
+                "bio": {"summary": "Some bio"},
+            },
+            {
+                "name": "Likely Invalid",
+                "mbid": "",
+                "url": "urlB",
+                "stats": {"listeners": 500, "playcount": 1000},
+                "tags": {"tag": [{"name": "pop"}]},
+                "bio": {"summary": "short"},
+            },
+        ]
+
+        artists_file = bronze_dir / "artists_enrich_test.json"
+        with open(artists_file, "w") as f:
+            json.dump(artists_data, f)
+
+        # Mock LastFMClient.search_artist to return an MBID for "Likely Valid"
+        mock_client = MagicMock()
+
+        def _search_artist(name, limit=1):  # type: ignore[unused-argument]
+            if name == "Likely Valid":
+                return [{"name": name, "mbid": "mbid-123"}]
+            return []
+
+        mock_client.search_artist.side_effect = _search_artist
+        mock_client_class.return_value = mock_client
+
+        # Patch IO managers
+        with (
+            patch("music_airflow.transform.dimensions.JSONIOManager") as mock_json_io,
+            patch(
+                "music_airflow.transform.dimensions.PolarsDeltaIOManager"
+            ) as mock_delta_io,
+        ):
+            from music_airflow.utils.polars_io_manager import (
+                JSONIOManager,
+                PolarsDeltaIOManager,
+            )
+
+            json_mgr = JSONIOManager(medallion_layer="bronze")
+            json_mgr.base_dir = test_data_dir / "bronze"
+
+            delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+            delta_mgr.base_dir = test_data_dir / "silver"
+
+            mock_json_io.return_value = json_mgr
+            mock_delta_io.return_value = delta_mgr
+
+            fetch_metadata = {"filename": "artists/artists_enrich_test.json"}
+            result = transform_artists_to_silver(fetch_metadata)
+
+        assert result["rows"] == 1
+        df = pl.read_delta(str(silver_dir / "artists"))
+        assert set(df["artist_name"]) == {"Likely Valid"}
+        # Enriched MBID should be applied and artist_id should use MBID
+        row = df.filter(pl.col("artist_name") == "Likely Valid").to_dict(
+            as_series=False
+        )
+        assert row["artist_mbid"][0] == "mbid-123"
+        assert row["artist_id"][0] == "mbid-123"
+
+    @patch("music_airflow.transform.dimensions.LastFMClient")
+    @patch("music_airflow.transform.dimensions._search_musicbrainz_artist_mbid")
+    def test_transform_artists_enriches_via_musicbrainz_when_lastfm_has_no_mbid(
+        self, mock_mbz, mock_client_class, test_data_dir
+    ):
+        """Fallback to MusicBrainz if Last.fm search returns empty/blank MBID."""
+        import json
+
+        bronze_dir = test_data_dir / "bronze" / "artists"
+        bronze_dir.mkdir(parents=True, exist_ok=True)
+        silver_dir = test_data_dir / "silver"
+        silver_dir.mkdir(parents=True, exist_ok=True)
+
+        artists_data = [
+            {
+                "name": "Fallback Artist",
+                "mbid": "",
+                "url": "urlC",
+                "stats": {"listeners": 5000, "playcount": 8000},
+                "tags": {"tag": [{"name": "alt"}]},
+                "bio": {"summary": "bio"},
+            }
+        ]
+
+        artists_file = bronze_dir / "artists_enrich_mbz.json"
+        with open(artists_file, "w") as f:
+            json.dump(artists_data, f)
+
+        # LastFM returns match but empty mbid, forcing MBZ fallback
+        mock_client = MagicMock()
+        mock_client.search_artist.return_value = [
+            {"name": "Fallback Artist", "mbid": ""}
+        ]
+        mock_client_class.return_value = mock_client
+        mock_mbz.return_value = "mbid-fallback-999"
+
+        with (
+            patch("music_airflow.transform.dimensions.JSONIOManager") as mock_json_io,
+            patch(
+                "music_airflow.transform.dimensions.PolarsDeltaIOManager"
+            ) as mock_delta_io,
+        ):
+            from music_airflow.utils.polars_io_manager import (
+                JSONIOManager,
+                PolarsDeltaIOManager,
+            )
+
+            json_mgr = JSONIOManager(medallion_layer="bronze")
+            json_mgr.base_dir = test_data_dir / "bronze"
+
+            delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+            delta_mgr.base_dir = test_data_dir / "silver"
+
+            mock_json_io.return_value = json_mgr
+            mock_delta_io.return_value = delta_mgr
+
+            fetch_metadata = {"filename": "artists/artists_enrich_mbz.json"}
+            result = transform_artists_to_silver(fetch_metadata)
+
+        assert result["rows"] == 1
+        df = pl.read_delta(str(silver_dir / "artists"))
+        assert df["artist_mbid"][0] == "mbid-fallback-999"
+        assert df["artist_id"][0] == "mbid-fallback-999"
 
 
 class TestExtractWithoutPlaysData:

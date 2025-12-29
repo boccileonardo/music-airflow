@@ -12,6 +12,8 @@ from airflow.exceptions import AirflowSkipException
 from deltalake.exceptions import TableNotFoundError
 
 from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
+from music_airflow.lastfm_client import LastFMClient
+import requests
 
 # Minimum half-life for new users (30 days)
 MIN_HALF_LIFE_DAYS = 30.0
@@ -111,6 +113,17 @@ def transform_artists_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any
     df = _transform_artists_raw_to_structured(artists_lf)
     df = _deduplicate_artists(df)
 
+    # Exclude invalid artists (no mbid and listeners < 1000)
+    df = df.filter(
+        ~(
+            (pl.col("artist_mbid").is_null() | (pl.col("artist_mbid") == ""))
+            & (pl.col("listeners") < 1000)
+        )
+    )
+
+    # Enrich missing MBIDs for remaining artists
+    df = _enrich_missing_artist_mbids(df)
+
     # Write to silver layer Delta table with merge/upsert
     table_name = "artists"
     predicate = """
@@ -126,6 +139,93 @@ def transform_artists_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any
     )
 
     return write_metadata
+
+
+def _search_musicbrainz_artist_mbid(artist_name: str) -> str | None:
+    """Search MusicBrainz for an artist MBID (first hit)."""
+    try:
+        resp = requests.get(
+            "https://musicbrainz.org/ws/2/artist",
+            params={"query": artist_name, "fmt": "json", "limit": 1},
+            headers={
+                "User-Agent": "github.com/boccileonardo/music-airflow",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        artists = data.get("artists", [])
+        if artists:
+            return artists[0].get("id")
+        return None
+    except requests.RequestException:
+        # todo: log
+        print("Unable to get MBID from MusicBrainz for artist:", artist_name)
+        return None
+
+
+def _enrich_missing_artist_mbids(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Enrich missing artist MBIDs by consulting Last.fm artist.search and
+    falling back to MusicBrainz search. Then recompute artist_id.
+    """
+    artist_names = (
+        artists_lf.select("artist_name")
+        .unique()
+        .collect(engine="streaming")
+        .to_series()
+        .to_list()
+    )
+
+    if not artist_names:
+        return artists_lf
+
+    client = LastFMClient(api_key=None)
+    mapping_df = pl.DataFrame(
+        schema={"artist_name": pl.Utf8, "enriched_artist_mbid": pl.Utf8}
+    )
+    for name in artist_names:
+        print("Enriching MBID for artist:", name)
+        mbid: str | None = None
+        last_fm_search_result = client.search_artist(name, limit=1)
+        if last_fm_search_result:
+            mbid = last_fm_search_result[0].get("mbid")
+        if not mbid:
+            print("Falling back to MusicBrainz search for artist:", name)
+            mbid = _search_musicbrainz_artist_mbid(name)
+        if mbid:
+            mapping_df = mapping_df.vstack(
+                pl.DataFrame([{"artist_name": name, "enriched_artist_mbid": mbid}])
+            )
+
+    if mapping_df.is_empty():
+        return artists_lf
+
+    enriched = (
+        artists_lf.join(mapping_df.lazy(), on="artist_name", how="left")
+        .with_columns(
+            # only overwrite artist_mbid if it's missing and enriched_artist_mbid is not null or empty
+            pl.when(
+                (pl.col("artist_mbid").is_null() | (pl.col("artist_mbid") == ""))
+                & (pl.col("enriched_artist_mbid").is_not_null())
+                & (pl.col("enriched_artist_mbid") != "")
+            )
+            .then(pl.col("enriched_artist_mbid"))
+            .otherwise(pl.col("artist_mbid"))
+            .alias("artist_mbid")
+        )
+        .with_columns(
+            # recompute artist_id to prefer MBID when available
+            pl.when(
+                (pl.col("artist_mbid").is_not_null()) & (pl.col("artist_mbid") != "")
+            )
+            .then(pl.col("artist_mbid"))
+            .otherwise(pl.col("artist_name"))
+            .alias("artist_id")
+        )
+    )
+
+    return enriched
 
 
 def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFrame:
@@ -236,9 +336,9 @@ def _transform_artists_raw_to_structured(raw_artists: pl.LazyFrame) -> pl.LazyFr
             )
             .otherwise(None)
             .alias("tags"),
-            # Bio summary (truncate to 500 chars)
+            # Bio summary
             pl.when(pl.col("bio").is_not_null())
-            .then(pl.col("bio").struct.field("summary").str.slice(0, 500))
+            .then(pl.col("bio").struct.field("summary"))
             .otherwise(None)
             .alias("bio_summary"),
         ]
