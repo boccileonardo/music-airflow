@@ -20,7 +20,6 @@ from music_airflow.utils.constants import DAG_START_DATE
 from airflow.sdk import Asset, dag, task
 
 
-
 # Assets produced by this DAG
 tracks_asset = Asset("delta://data/silver/tracks")
 artists_asset = Asset("delta://data/silver/artists")

@@ -12,6 +12,6 @@ chmod +x ./scripts/start-airflow.sh
 ./scripts/start-airflow.sh
 ```
 
-Add api_key and shared_secret to .env file.  
-[LastFM API Accounts Page](https://www.last.fm/api/accounts).  
+Add api_key and shared_secret to .env file.
+[LastFM API Accounts Page](https://www.last.fm/api/accounts).
 Optionally, add DAG_START_DATE to .env file in YYYY-MM-DD format to set the start date for DAGs. Default is 2025-11-01.

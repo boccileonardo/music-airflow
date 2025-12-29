@@ -11,7 +11,7 @@ Configuration:
 - Saves intermediate results to silver, final unified table to gold
 """
 
-#todo: review outputs
+# todo: review outputs
 
 from typing import Any
 from music_airflow.utils.constants import DAG_START_DATE
@@ -80,7 +80,7 @@ def candidate_generation():
         )
 
         return generate_similar_artist_candidates(
-            username=username,    
+            username=username,
         )
 
     @task(
