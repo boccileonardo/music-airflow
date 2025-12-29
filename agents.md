@@ -27,7 +27,7 @@ The main goal is to avoid positive feedback loops caused by recommending music u
 
 - **Installing dependencies:** `uv add packagename` (add `--dev` for dev dependencies)
 - **Running Python code:** `uv run src/...`
-- **Running tests:** `uv run pytest`
+- **Running tests:** Built-in VsCode MCP test tool
 
 ❌ **Do NOT use:**
 - `pip install`
@@ -120,7 +120,6 @@ def analyze_data(metadata: dict):
 **Test Location:** `tests/`
 
 **Running Tests:**
-- Via pytest: `uv run pytest`
 - Via MCP test tool built into vscode
 
 **Test Structure:**

@@ -44,7 +44,7 @@ class TestTransformPlaysRawToStructured:
         df = pl.LazyFrame(raw_data)
         result = transform_plays_raw_to_structured(df, "testuser").collect()
 
-        # Check columns
+        # Check columns (track_id is added, but artist_id is not added in plays transform)
         expected_cols = [
             "username",
             "scrobbled_at",
@@ -56,7 +56,6 @@ class TestTransformPlaysRawToStructured:
             "album_name",
             "album_mbid",
             "track_id",
-            "artist_id",
         ]
         assert result.columns == expected_cols
 
@@ -163,17 +162,16 @@ class TestTransformPlaysRawToStructured:
             "album_name",
             "album_mbid",
             "track_id",
-            "artist_id",
         ]
 
 
-class TestTransformPlaysToSilver:
-    """Test transform_plays_to_silver integration function."""
+class TestTransformPlaysRawToStructuredIntegration:
+    """Integration tests for transform_plays_raw_to_structured function."""
 
-    def test_successful_transformation(self, test_data_dir, monkeypatch):
-        """Test successful transformation from bronze to silver Delta table."""
-        # Setup: Create bronze data
-        bronze_dir = test_data_dir / "bronze" / "plays" / "testuser"
+    def test_full_pipeline(self, tmp_path):
+        """Test full transformation pipeline."""
+        test_data_dir = tmp_path
+        bronze_dir = test_data_dir / "bronze"
         bronze_dir.mkdir(parents=True, exist_ok=True)
         silver_dir = test_data_dir / "silver"
         silver_dir.mkdir(parents=True, exist_ok=True)
@@ -199,7 +197,9 @@ class TestTransformPlaysToSilver:
             },
         ]
 
-        bronze_file = bronze_dir / "20210101.json"
+        bronze_plays_dir = bronze_dir / "plays" / "testuser"
+        bronze_plays_dir.mkdir(parents=True, exist_ok=True)
+        bronze_file = bronze_plays_dir / "20210101.json"
         with open(bronze_file, "w") as f:
             json.dump(tracks, f)
 

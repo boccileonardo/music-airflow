@@ -19,6 +19,7 @@ from typing import Any
 import polars as pl
 
 from music_airflow.lastfm_client import LastFMClient
+from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
 __all__ = [
     "generate_similar_artist_candidates",
@@ -61,11 +62,14 @@ def generate_similar_artist_candidates(
         Metadata dict with path, rows, table_name
     """
     client = LastFMClient()
+    delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load user's plays
-    plays_lf = pl.scan_delta("data/silver/plays").filter(pl.col("username") == username)
-    tracks_lf = pl.scan_delta("data/silver/tracks")
-    artists_lf = pl.scan_delta("data/silver/artists")
+    plays_lf = delta_mgr_silver.read_delta("plays").filter(
+        pl.col("username") == username
+    )
+    tracks_lf = delta_mgr_silver.read_delta("tracks")
+    artists_lf = delta_mgr_silver.read_delta("artists")
 
     # Get unique artists user has played
     # First join with tracks to get artist id, then join with artists to get artist details
@@ -201,13 +205,17 @@ def generate_similar_artist_candidates(
         )
 
     # Write to silver Delta table
-    output_path = "data/silver/candidate_similar_artist"
-    df.write_delta(output_path, mode="overwrite")
+    write_meta = delta_mgr_silver.write_delta(
+        df,
+        table_name="candidate_similar_artist",
+        mode="overwrite",
+        partition_by="username",
+    )
 
     return {
-        "path": output_path,
-        "rows": len(df),
-        "table_name": "candidate_similar_artist",
+        "path": write_meta["path"],
+        "rows": write_meta["rows"],
+        "table_name": write_meta["table_name"],
     }
 
 
@@ -241,11 +249,14 @@ def generate_similar_tag_candidates(
         Metadata dict with path, rows, table_name
     """
     client = LastFMClient()
+    delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load data
-    plays_lf = pl.scan_delta("data/silver/plays").filter(pl.col("username") == username)
-    tracks_lf = pl.scan_delta("data/silver/tracks")
-    artists_lf = pl.scan_delta("data/silver/artists")
+    plays_lf = delta_mgr_silver.read_delta("plays").filter(
+        pl.col("username") == username
+    )
+    tracks_lf = delta_mgr_silver.read_delta("tracks")
+    artists_lf = delta_mgr_silver.read_delta("artists")
 
     # Get user's played tracks and extract tags
     # First join with tracks to get artist id, then join with artists to get tags
@@ -386,13 +397,17 @@ def generate_similar_tag_candidates(
         )
 
     # Write to silver Delta table
-    output_path = "data/silver/candidate_similar_tag"
-    df.write_delta(output_path, mode="overwrite")
+    write_meta = delta_mgr_silver.write_delta(
+        df,
+        table_name="candidate_similar_tag",
+        mode="overwrite",
+        partition_by="username",
+    )
 
     return {
-        "path": output_path,
-        "rows": len(df),
-        "table_name": "candidate_similar_tag",
+        "path": write_meta["path"],
+        "rows": write_meta["rows"],
+        "table_name": write_meta["table_name"],
     }
 
 
@@ -428,11 +443,14 @@ def generate_deep_cut_candidates(
         Metadata dict with path, rows, table_name
     """
     client = LastFMClient()
+    delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load data
-    plays_lf = pl.scan_delta("data/silver/plays").filter(pl.col("username") == username)
-    tracks_lf = pl.scan_delta("data/silver/tracks")
-    artists_lf = pl.scan_delta("data/silver/artists")
+    plays_lf = delta_mgr_silver.read_delta("plays").filter(
+        pl.col("username") == username
+    )
+    tracks_lf = delta_mgr_silver.read_delta("tracks")
+    artists_lf = delta_mgr_silver.read_delta("artists")
 
     # Get user's top artists by play count
     # First join with tracks to get artist id, then join with artists to get artist name
@@ -575,13 +593,17 @@ def generate_deep_cut_candidates(
         )
 
     # Write to silver Delta table
-    output_path = "data/silver/candidate_deep_cut"
-    df.write_delta(output_path, mode="overwrite")
+    write_meta = delta_mgr_silver.write_delta(
+        df,
+        table_name="candidate_deep_cut",
+        mode="overwrite",
+        partition_by="username",
+    )
 
     return {
-        "path": output_path,
-        "rows": len(df),
-        "table_name": "candidate_deep_cut",
+        "path": write_meta["path"],
+        "rows": write_meta["rows"],
+        "table_name": write_meta["table_name"],
     }
 
 
@@ -604,10 +626,14 @@ def merge_candidate_sources(username: str) -> dict[str, Any]:
     Returns:
         Metadata dict with path, rows, table_name
     """
+    # IO managers for silver and gold layers
+    delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
+    delta_mgr_gold = PolarsDeltaIOManager(medallion_layer="gold")
+
     # Load from silver tables
-    similar_artists_lf = pl.scan_delta("data/silver/candidate_similar_artist")
-    similar_tags_lf = pl.scan_delta("data/silver/candidate_similar_tag")
-    deep_cuts_lf = pl.scan_delta("data/silver/candidate_deep_cut")
+    similar_artists_lf = delta_mgr_silver.read_delta("candidate_similar_artist")
+    similar_tags_lf = delta_mgr_silver.read_delta("candidate_similar_tag")
+    deep_cuts_lf = delta_mgr_silver.read_delta("candidate_deep_cut")
 
     # Normalize schemas - deep_cuts has album_name, others don't
     # Add missing columns with defaults
@@ -664,12 +690,16 @@ def merge_candidate_sources(username: str) -> dict[str, Any]:
     )
 
     # Write to gold Delta table
-    output_path = "data/gold/track_candidates"
     df = merged.collect()
-    df.write_delta(output_path, mode="overwrite")
+    write_meta = delta_mgr_gold.write_delta(
+        df,
+        table_name="track_candidates",
+        mode="overwrite",
+        partition_by="username",
+    )
 
     return {
-        "path": output_path,
-        "rows": len(df),
-        "table_name": "track_candidates",
+        "path": write_meta["path"],
+        "rows": write_meta["rows"],
+        "table_name": write_meta["table_name"],
     }

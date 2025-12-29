@@ -1,404 +1,333 @@
 """
-Tests for candidate track generation logic.
+Tests for candidate track generation (silver + gold consolidation).
 
-Tests the three candidate generation strategies and merging:
-- Similar artist candidates
-- Similar tag candidates
-- Deep cut candidates
-- Merged unified candidates
+All tests are fully isolated: they change CWD to a tmp folder
+and create minimal Delta tables under ./data/* so no real data is touched.
+Last.fm API client is mocked to avoid network calls.
 """
+
+from pathlib import Path
+from unittest.mock import patch
 
 import polars as pl
 import pytest
 
+from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
+
 from music_airflow.transform.candidate_generation import (
-    generate_deep_cut_candidates,
     generate_similar_artist_candidates,
     generate_similar_tag_candidates,
+    generate_deep_cut_candidates,
     merge_candidate_sources,
 )
 
 
 @pytest.fixture
-def setup_test_data(tmp_path):
-    """
-    Create test silver layer data for candidate generation with synthetic IDs.
+def patched_delta_io(test_data_dir):
+    """Provide patched IO managers with base_dir pointing to test_data_dir subfolders."""
+    silver_mgr = PolarsDeltaIOManager(medallion_layer="silver")
+    silver_mgr.base_dir = test_data_dir / "silver"
 
-    Creates:
-    - plays: User play history with track_id
-    - artists: Artist metadata with tags and artist_id
-    - tracks: Track metadata with tags, popularity, track_id, artist_id
-    """
-    # Create test data directories
-    silver_path = tmp_path / "silver"
-    silver_path.mkdir()
+    gold_mgr = PolarsDeltaIOManager(medallion_layer="gold")
+    gold_mgr.base_dir = test_data_dir / "gold"
 
-    # Sample artists with tags and IDs
-    artists_data = pl.DataFrame(
+    def factory(layer: str = "silver"):
+        if layer == "gold":
+            return gold_mgr
+        return silver_mgr
+
+    return factory
+
+
+def _write_silver_base_tables(patched_delta_io):
+    """Create minimal silver tables for plays, tracks, artists."""
+    # Plays: one user with a played track
+    plays_df = pl.DataFrame(
         {
-            "artist_name": [
-                "Artist A",
-                "Artist B",
-                "Artist C",
-                "Artist D",
-                "Artist E",
-            ],
-            "artist_mbid": ["mbid-a", "mbid-b", "", "", "mbid-e"],
-            "listeners": [10000, 8000, 6000, 4000, 2000],
-            "playcount": [50000, 40000, 30000, 20000, 10000],
-            "tags": [
-                "rock,alternative,indie",
-                "rock,indie,pop",
-                "electronic,ambient,chill",
-                "rock,punk,alternative",
-                "jazz,blues,soul",
-            ],
-            "bio_summary": ["Bio A", "Bio B", "Bio C", "Bio D", "Bio E"],
-            "artist_url": ["url-a", "url-b", "url-c", "url-d", "url-e"],
+            "username": ["user1"],
+            "track_id": ["artist a::known"],
         }
-    ).with_columns(
-        # Create artist_id (use MBID or fallback to name)
-        pl.when(pl.col("artist_mbid") != "")
-        .then(pl.col("artist_mbid"))
-        .otherwise(pl.col("artist_name"))
-        .alias("artist_id")
+    )
+    patched_delta_io("silver").write_delta(
+        plays_df, table_name="plays", mode="overwrite"
     )
 
-    # Sample tracks with IDs
-    tracks_data = pl.DataFrame(
+    # Tracks: map track_id -> artist_id and include tags
+    tracks_df = pl.DataFrame(
         {
-            "track_name": [
-                "Track A1",
-                "Track A2",
-                "Track A3 Obscure",
-                "Track B1",
-                "Track B2",
-                "Track C1",
-                "Track C2",
-                "Track D1",
-                "Track D2 Obscure",
-                "Track E1",
+            "track_id": [
+                "artist a::known",
+                "artist b::new track",
+                "artist c::tag track",
             ],
-            "track_mbid": [
-                "track-mbid-0",
-                "track-mbid-1",
-                "",
-                "track-mbid-3",
-                "",
-                "",
-                "",
-                "track-mbid-7",
-                "",
-                "",
-            ],
-            "artist_name": [
-                "Artist A",
-                "Artist A",
-                "Artist A",
-                "Artist B",
-                "Artist B",
-                "Artist C",
-                "Artist C",
-                "Artist D",
-                "Artist D",
-                "Artist E",
-            ],
-            "artist_mbid": [
-                "mbid-a",
-                "mbid-a",
-                "mbid-a",
-                "mbid-b",
-                "mbid-b",
-                "",
-                "",
-                "",
-                "",
-                "mbid-e",
-            ],
-            "album_name": [
-                "Album A",
-                "Album A",
-                "Album A",
-                "Album B",
-                "Album B",
-                "Album C",
-                "Album C",
-                "Album D",
-                "Album D",
-                "Album E",
-            ],
-            "duration_ms": [180000] * 10,
-            "listeners": [10000, 8000, 500, 9000, 7000, 6000, 5000, 8500, 300, 2000],
-            "playcount": [
-                50000,
-                40000,
-                1000,
-                45000,
-                35000,
-                30000,
-                25000,
-                42000,
-                800,
-                10000,
-            ],
-            "tags": [
-                "rock,alternative,indie",
-                "rock,indie",
-                "rock,alternative",
-                "rock,indie,pop",
-                "indie,pop",
-                "electronic,ambient",
-                "chill,ambient",
-                "rock,punk,alternative",
-                "punk,alternative",
-                "jazz,blues",
-            ],
-            "track_url": [f"url-track-{i}" for i in range(10)],
+            "artist_id": ["a1", "b1", "c1"],
+            "tags": ["rock,alt", "indie", "rock"],
         }
-    ).with_columns(
-        # Create artist_id
-        pl.when(pl.col("artist_mbid") != "")
-        .then(pl.col("artist_mbid"))
-        .otherwise(pl.col("artist_name"))
-        .alias("artist_id"),
-        # Create track_id: prefer MBID when available, else synthetic
-        pl.when((pl.col("track_mbid").is_not_null()) & (pl.col("track_mbid") != ""))
-        .then(pl.col("track_mbid"))
-        .otherwise(
-            pl.concat_str([pl.col("track_name"), pl.col("artist_name")], separator="|")
-        )
-        .alias("track_id"),
+    )
+    patched_delta_io("silver").write_delta(
+        tracks_df, table_name="tracks", mode="overwrite"
     )
 
-    # Sample user plays with IDs
-    plays_data = pl.DataFrame(
+    # Artists: map artist_id -> artist_name and optional tags
+    artists_df = pl.DataFrame(
         {
-            "scrobbled_at": [1700000000, 1700000100],
-            "scrobbled_at_utc": pl.Series(
-                [1700000000, 1700000100], dtype=pl.Int64
-            ).cast(pl.Datetime("us", "UTC")),
-            "track_name": ["Track A1", "Track A2"],
-            "track_mbid": ["track-mbid-0", "track-mbid-1"],
-            "track_url": ["url-track-0", "url-track-1"],
-            "artist_name": ["Artist A", "Artist A"],
-            "album_name": ["Album A", "Album A"],
-            "album_mbid": ["album-mbid-a", "album-mbid-a"],
-            "username": ["test_user", "test_user"],
+            "artist_id": ["a1", "b1", "c1"],
+            "artist_name": ["Artist A", "Artist B", "Artist C"],
+            "tags": ["indie,alt", "indie", "rock"],
         }
-    ).with_columns(
-        # Create track_id: prefer MBID when available, else synthetic
-        pl.when((pl.col("track_mbid").is_not_null()) & (pl.col("track_mbid") != ""))
-        .then(pl.col("track_mbid"))
-        .otherwise(
-            pl.concat_str([pl.col("track_name"), pl.col("artist_name")], separator="|")
+    )
+    patched_delta_io("silver").write_delta(
+        artists_df, table_name="artists", mode="overwrite"
+    )
+
+
+class TestSimilarArtistCandidates:
+    def test_generates_and_filters(self, test_data_dir, patched_delta_io):
+        _write_silver_base_tables(patched_delta_io)
+
+        with (
+            patch(
+                "music_airflow.transform.candidate_generation.LastFMClient"
+            ) as MockClient,
+            patch(
+                "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
+            ) as MockDeltaIO,
+        ):
+            client = MockClient.return_value
+            # Similar artists for Artist A: include a clone (match>0.9) which should be filtered
+            client.get_similar_artists.return_value = [
+                {"name": "Artist B", "match": 0.5},
+                {"name": "Artist A", "match": 0.95},  # filtered out
+            ]
+            # Top tracks for Artist B: include one below min_listeners to be filtered
+            client.get_artist_top_tracks.return_value = [
+                {
+                    "name": "New Track",
+                    "mbid": "tmbid",
+                    "artist": {"name": "Artist B", "mbid": "bmbid"},
+                    "listeners": 5000,
+                    "playcount": 10000,
+                },
+                {
+                    "name": "Too Small",
+                    "mbid": "",
+                    "artist": {"name": "Artist B", "mbid": "bmbid"},
+                    "listeners": 10,
+                    "playcount": 20,
+                },
+            ]
+
+            # Patch IO manager construction to use our preconfigured instances
+            MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
+                medallion_layer
+            )
+
+            result = generate_similar_artist_candidates(
+                username="user1",
+                artist_sample_rate=1.0,
+            )
+
+        # Validate metadata and Delta output
+        assert result["table_name"] == "candidate_similar_artist"
+        out_path = Path(result["path"])  # data/silver/candidate_similar_artist
+        assert out_path.exists()
+        df = pl.read_delta(str(out_path))
+        # Only New Track should remain (clone and small filtered)
+        assert df["track_id"].to_list() == ["artist b::new track"]
+        assert df["username"].to_list() == ["user1"]
+
+
+class TestSimilarTagCandidates:
+    def test_excludes_played_and_respects_min_listeners(
+        self, test_data_dir, patched_delta_io
+    ):
+        _write_silver_base_tables(patched_delta_io)
+
+        with (
+            patch(
+                "music_airflow.transform.candidate_generation.LastFMClient"
+            ) as MockClient,
+            patch(
+                "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
+            ) as MockDeltaIO,
+        ):
+            client = MockClient.return_value
+            # Expand tags for user's tags (rock, alt, indie)
+            client.get_similar_tags.side_effect = lambda tag: [
+                {"name": "indie"},
+                {"name": "alternative"},
+            ]
+            # For top tracks per tag, include one already played and one valid
+            client.get_tag_top_tracks.side_effect = lambda tag, limit=10: [
+                {
+                    "name": "Known",
+                    "mbid": "",
+                    "artist": {"name": "Artist A", "mbid": "a_mbid"},
+                    "listeners": 5000,
+                    "playcount": 8000,
+                },
+                {
+                    "name": "Tag Track",
+                    "mbid": "tm2",
+                    "artist": {"name": "Artist C", "mbid": "c_mbid"},
+                    "listeners": 6000,
+                    "playcount": 9000,
+                },
+                {
+                    "name": "Too Small",
+                    "mbid": "",
+                    "artist": {"name": "Artist Z", "mbid": "z_mbid"},
+                    "listeners": 100,  # filtered by min_listeners default 1000
+                    "playcount": 200,
+                },
+            ]
+
+            MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
+                medallion_layer
+            )
+
+            result = generate_similar_tag_candidates(
+                username="user1",
+                tag_sample_rate=1.0,
+            )
+
+        assert result["table_name"] == "candidate_similar_tag"
+        out_path = Path(result["path"])  # data/silver/candidate_similar_tag
+        assert out_path.exists()
+        df = pl.read_delta(str(out_path))
+        # Should exclude already played "artist a::known" and the too-small one
+        assert df["track_id"].to_list() == ["artist c::tag track"]
+        assert df["username"].to_list() == ["user1"]
+
+
+class TestDeepCutCandidates:
+    def test_generation_and_filters(self, test_data_dir, patched_delta_io):
+        _write_silver_base_tables(patched_delta_io)
+
+        with (
+            patch(
+                "music_airflow.transform.candidate_generation.LastFMClient"
+            ) as MockClient,
+            patch(
+                "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
+            ) as MockDeltaIO,
+        ):
+            client = MockClient.return_value
+            # Top albums for Artist A, include one valid album
+            client.get_artist_top_albums.return_value = [
+                {
+                    "name": "Obscure Album",
+                    "playcount": 10000,
+                    "artist": {"mbid": "a_mbid"},
+                },
+                {
+                    "name": "Too Popular",
+                    "playcount": 1000000,
+                    "artist": {"mbid": "a_mbid"},
+                },
+            ]
+            # Album info returns track list including one already played
+            client.get_album_info.side_effect = lambda album_name, artist_name: {
+                "tracks": {
+                    "track": [
+                        {"name": "Hidden Gem", "mbid": "hg_mbid"},
+                        {"name": "Known", "mbid": ""},
+                    ]
+                }
+            }
+
+            MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
+                medallion_layer
+            )
+            result = generate_deep_cut_candidates(username="user1")
+
+        assert result["table_name"] == "candidate_deep_cut"
+        out_path = Path(result["path"])  # data/silver/candidate_deep_cut
+        assert out_path.exists()
+        df = pl.read_delta(str(out_path))
+        # Only Hidden Gem should remain; Too Popular filtered by max_listeners
+        assert df["track_id"].to_list() == ["artist a::hidden gem"]
+        assert df["album_name"].to_list() == ["Obscure Album"]
+
+
+class TestMergeCandidateSources:
+    def test_dedup_and_source_flags(self, test_data_dir, patched_delta_io):
+        # Write synthetic silver candidate tables directly to test merge logic
+        similar_artist_df = pl.DataFrame(
+            {
+                "username": ["user1"],
+                "track_id": ["artist b::new track"],
+                "track_name": ["New Track"],
+                "track_mbid": ["tmbid"],
+                "artist_name": ["Artist B"],
+                "artist_mbid": ["bmbid"],
+                "listeners": [5000],
+                "playcount": [10000],
+                "score": [10000.0],
+            }
         )
-        .alias("track_id")
-    )
-
-    # Write to Delta tables
-    artists_path = str(silver_path / "artists")
-    tracks_path = str(silver_path / "tracks")
-    plays_path = str(silver_path / "plays")
-
-    artists_data.write_delta(artists_path, mode="overwrite")
-    tracks_data.write_delta(tracks_path, mode="overwrite")
-    plays_data.write_delta(plays_path, mode="overwrite")
-
-    return {
-        "silver_path": str(silver_path),
-        "artists_path": artists_path,
-        "tracks_path": tracks_path,
-        "plays_path": plays_path,
-    }
-
-
-def test_generate_similar_artist_candidates(setup_test_data, monkeypatch):
-    """
-    Test similar artist candidate generation with ID-based joins.
-
-    Verifies:
-    - Uses artist_id and track_id for joins
-    - Finds artists with overlapping tags
-    - Excludes already played tracks
-    - Returns LazyFrame
-    """
-    # Store original scan_delta
-    original_scan_delta = pl.scan_delta
-
-    # Patch delta paths to use test data
-    def mock_scan_delta(path):
-        if "artists" in str(path):
-            return original_scan_delta(setup_test_data["artists_path"])
-        elif "tracks" in str(path):
-            return original_scan_delta(setup_test_data["tracks_path"])
-        elif "plays" in str(path):
-            return original_scan_delta(setup_test_data["plays_path"])
-        raise ValueError(f"Unknown path: {path}")
-
-    monkeypatch.setattr("polars.scan_delta", mock_scan_delta)
-
-    # Generate candidates
-    result_lf = generate_similar_artist_candidates(username="test_user")
-
-    # Verify returns LazyFrame
-    assert isinstance(result_lf, pl.LazyFrame)
-
-    # Collect and verify
-    candidates = result_lf.collect()
-
-    # Should have some candidates
-    assert len(candidates) > 0
-
-    # Should have required columns including IDs
-    required_cols = [
-        "username",
-        "track_id",
-        "artist_id",
-        "track_name",
-        "artist_name",
-        "score",
-    ]
-    for col in required_cols:
-        assert col in candidates.columns
-
-    # Should not include played tracks (test data has MBIDs)
-    played_track_ids = ["track-mbid-0", "track-mbid-1"]
-    candidate_track_ids = candidates["track_id"].to_list()
-    for track_id in played_track_ids:
-        assert track_id not in candidate_track_ids
-
-
-def test_generate_similar_tag_candidates(setup_test_data, monkeypatch):
-    """
-    Test similar tag candidate generation.
-
-    Verifies:
-    - Uses track_id for joins
-    - Finds tracks with matching tags
-    - Excludes already played tracks
-    - Returns LazyFrame
-    """
-    original_scan_delta = pl.scan_delta
-
-    def mock_scan_delta(path):
-        if "tracks" in str(path):
-            return original_scan_delta(setup_test_data["tracks_path"])
-        elif "plays" in str(path):
-            return original_scan_delta(setup_test_data["plays_path"])
-        raise ValueError(f"Unknown path: {path}")
-
-    monkeypatch.setattr("polars.scan_delta", mock_scan_delta)
-
-    result_lf = generate_similar_tag_candidates(username="test_user")
-
-    assert isinstance(result_lf, pl.LazyFrame)
-
-    candidates = result_lf.collect()
-    assert len(candidates) > 0
-
-    # Verify IDs present
-    assert "track_id" in candidates.columns
-    assert "artist_id" in candidates.columns
-
-    # Should not include played tracks (test data has MBIDs)
-    played_track_ids = ["track-mbid-0", "track-mbid-1"]
-    candidate_track_ids = candidates["track_id"].to_list()
-    for track_id in played_track_ids:
-        assert track_id not in candidate_track_ids
-
-
-def test_generate_deep_cut_candidates(setup_test_data, monkeypatch):
-    """
-    Test deep cut candidate generation.
-
-    Verifies:
-    - Uses artist_id and track_id for joins
-    - Finds obscure tracks from known artists
-    - Respects listener range
-    - Returns LazyFrame
-    """
-    original_scan_delta = pl.scan_delta
-
-    def mock_scan_delta(path):
-        if "tracks" in str(path):
-            return original_scan_delta(setup_test_data["tracks_path"])
-        elif "plays" in str(path):
-            return original_scan_delta(setup_test_data["plays_path"])
-        elif "artists" in str(path):
-            return original_scan_delta(setup_test_data["artists_path"])
-        raise ValueError(f"Unknown path: {path}")
-
-    monkeypatch.setattr("polars.scan_delta", mock_scan_delta)
-
-    result_lf = generate_deep_cut_candidates(
-        username="test_user", min_listeners=100, max_listeners=1000
-    )
-
-    assert isinstance(result_lf, pl.LazyFrame)
-
-    candidates = result_lf.collect()
-    assert len(candidates) > 0
-
-    # Should find Track A3 Obscure (500 listeners from Artist A)
-    track_names = candidates["track_name"].to_list()
-    assert "Track A3 Obscure" in track_names
-
-    # Should not include played tracks
-    assert "Track A1" not in track_names
-    assert "Track A2" not in track_names
-
-    # Verify obscurity range
-    assert all((candidates["listeners"] >= 100) & (candidates["listeners"] <= 1000))
-
-
-def test_merge_candidate_sources(setup_test_data, monkeypatch):
-    """
-    Test merging of candidate sources with type indicators.
-
-    Verifies:
-    - Creates one-hot encoded type columns
-    - Deduplicates by track_id
-    - Preserves all source flags for duplicates
-    """
-    original_scan_delta = pl.scan_delta
-
-    def mock_scan_delta(path):
-        if "artists" in str(path):
-            return original_scan_delta(setup_test_data["artists_path"])
-        elif "tracks" in str(path):
-            return original_scan_delta(setup_test_data["tracks_path"])
-        elif "plays" in str(path):
-            return original_scan_delta(setup_test_data["plays_path"])
-        raise ValueError(f"Unknown path: {path}")
-
-    monkeypatch.setattr("polars.scan_delta", mock_scan_delta)
-
-    # Generate all three types
-    similar_artists_lf = generate_similar_artist_candidates(username="test_user")
-    similar_tags_lf = generate_similar_tag_candidates(username="test_user")
-    deep_cuts_lf = generate_deep_cut_candidates(username="test_user")
-
-    # Merge
-    merged_lf = merge_candidate_sources(
-        similar_artists_lf, similar_tags_lf, deep_cuts_lf
-    )
-
-    assert isinstance(merged_lf, pl.LazyFrame)
-
-    merged = merged_lf.collect()
-
-    # Should have type indicator columns
-    type_cols = ["similar_artist", "similar_tag", "deep_cut_same_artist"]
-    for col in type_cols:
-        assert col in merged.columns
-
-    # Should have deduplicated by track_id
-    track_ids = merged["track_id"].to_list()
-    assert len(track_ids) == len(set(track_ids))
-
-    # At least one type should be True for each track
-    for i in range(len(merged)):
-        row = merged.row(i, named=True)
-        assert (
-            row["similar_artist"] or row["similar_tag"] or row["deep_cut_same_artist"]
+        patched_delta_io("silver").write_delta(
+            similar_artist_df, table_name="candidate_similar_artist", mode="overwrite"
         )
+
+        similar_tag_df = pl.DataFrame(
+            {
+                "username": ["user1", "user1"],
+                "track_id": ["artist b::new track", "artist c::tag track"],
+                "track_name": ["New Track", "Tag Track"],
+                "track_mbid": ["tmbid", "tm2"],
+                "artist_name": ["Artist B", "Artist C"],
+                "artist_mbid": ["bmbid", "cmbid"],
+                "listeners": [5000, 6000],
+                "playcount": [10000, 9000],
+                "score": [10000.0, 9000.0],
+            }
+        )
+        patched_delta_io("silver").write_delta(
+            similar_tag_df, table_name="candidate_similar_tag", mode="overwrite"
+        )
+
+        # Ensure column order aligns with similar_* tables for concat
+        deep_cut_df = pl.DataFrame(
+            {
+                "username": ["user1"],
+                "track_id": ["artist c::tag track"],
+                "track_name": ["Tag Track"],
+                "track_mbid": ["tm2"],
+                "artist_name": ["Artist C"],
+                "artist_mbid": ["cmbid"],
+                "listeners": [6000],
+                "playcount": [6000],
+                "score": [0.0001],
+                "album_name": ["Album X"],
+            }
+        )
+        patched_delta_io("silver").write_delta(
+            deep_cut_df, table_name="candidate_deep_cut", mode="overwrite"
+        )
+
+        with patch(
+            "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
+        ) as MockDeltaIO:
+            MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
+                medallion_layer
+            )
+            result = merge_candidate_sources(username="user1")
+        assert result["table_name"] == "track_candidates"
+        out_path = Path(result["path"])  # data/gold/track_candidates
+        assert out_path.exists()
+        merged = pl.read_delta(str(out_path)).sort("track_id")
+
+        # Expect two deduped rows with correct flags
+        assert merged.shape[0] == 2
+        rows = {row["track_id"]: row for row in merged.iter_rows(named=True)}
+
+        b_row = rows["artist b::new track"]
+        assert b_row["similar_artist"] is True
+        assert b_row["similar_tag"] is True
+        assert b_row["deep_cut_same_artist"] is False
+
+        c_row = rows["artist c::tag track"]
+        assert c_row["similar_artist"] is False
+        assert c_row["similar_tag"] is True
+        assert c_row["deep_cut_same_artist"] is True

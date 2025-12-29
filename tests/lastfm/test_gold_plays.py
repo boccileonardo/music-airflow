@@ -30,7 +30,6 @@ def sample_plays_df():
                 dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc),
                 dt.datetime(2025, 1, 20, tzinfo=dt.timezone.utc),
             ],
-            "track_name": ["Song A", "Song A", "Song B", "Song A", "Song C", "Song C"],
             "track_id": [
                 "Song A|Artist X",
                 "Song A|Artist X",
@@ -39,15 +38,8 @@ def sample_plays_df():
                 "Song C|Artist Z",
                 "Song C|Artist Z",
             ],
+            "track_name": ["Song A", "Song A", "Song B", "Song A", "Song C", "Song C"],
             "artist_name": [
-                "Artist X",
-                "Artist X",
-                "Artist Y",
-                "Artist X",
-                "Artist Z",
-                "Artist Z",
-            ],
-            "artist_id": [
                 "Artist X",
                 "Artist X",
                 "Artist Y",
@@ -63,6 +55,22 @@ def sample_plays_df():
                 "Album 3",
                 "Album 3",
             ],
+        }
+    )
+
+
+@pytest.fixture
+def sample_tracks_df():
+    """Create sample tracks data for testing."""
+    return pl.LazyFrame(
+        {
+            "track_id": [
+                "Song A|Artist X",
+                "Song B|Artist Y",
+                "Song C|Artist Z",
+            ],
+            "track_name": ["Song A", "Song B", "Song C"],
+            "artist_id": ["Artist X", "Artist Y", "Artist Z"],
         }
     )
 
@@ -94,19 +102,23 @@ def sample_artists_df():
     return pl.LazyFrame(
         {
             "artist_name": ["Artist X", "Artist Y", "Artist Z"],
-            "artist_id": ["mbid-x", "mbid-y", "Artist Z"],  # Artist Z has no MBID
+            "artist_id": ["Artist X", "Artist Y", "Artist Z"],
         }
     )
 
 
 def test_compute_artist_aggregations(
-    sample_plays_df, sample_dim_users_df, sample_artists_df
+    sample_plays_df, sample_dim_users_df, sample_tracks_df, sample_artists_df
 ):
     """Test artist aggregation logic."""
     execution_date = dt.datetime(2025, 1, 21, tzinfo=dt.timezone.utc)
 
     result_df = _compute_artist_aggregations(
-        sample_plays_df, sample_dim_users_df, sample_artists_df, execution_date
+        sample_plays_df,
+        sample_dim_users_df,
+        sample_tracks_df,
+        sample_artists_df,
+        execution_date,
     ).collect()
 
     # Check schema - should have artist_id instead of artist_mbid
@@ -122,8 +134,7 @@ def test_compute_artist_aggregations(
 
     # Check user1 - Artist X (3 plays)
     user1_artist_x = result_df.filter(
-        (pl.col("username") == "user1")
-        & (pl.col("artist_id") == "mbid-x")  # Should be enriched with MBID
+        (pl.col("username") == "user1") & (pl.col("artist_id") == "Artist X")
     )
     assert len(user1_artist_x) == 1
     assert user1_artist_x["play_count"][0] == 3
@@ -135,8 +146,7 @@ def test_compute_artist_aggregations(
 
     # Check user1 - Artist Y (1 play)
     user1_artist_y = result_df.filter(
-        (pl.col("username") == "user1")
-        & (pl.col("artist_id") == "mbid-y")  # Should be enriched with MBID
+        (pl.col("username") == "user1") & (pl.col("artist_id") == "Artist Y")
     )
     assert len(user1_artist_y) == 1
     assert user1_artist_y["play_count"][0] == 1
@@ -243,13 +253,17 @@ def test_aggregations_with_lookback_window(sample_plays_df, sample_dim_users_df)
 
 
 def test_first_and_last_played_dates(
-    sample_plays_df, sample_dim_users_df, sample_artists_df
+    sample_plays_df, sample_dim_users_df, sample_tracks_df, sample_artists_df
 ):
     """Test that first and last played dates are correct."""
     execution_date = dt.datetime(2025, 1, 21, tzinfo=dt.timezone.utc)
 
     result_df = _compute_artist_aggregations(
-        sample_plays_df, sample_dim_users_df, sample_artists_df, execution_date
+        sample_plays_df,
+        sample_dim_users_df,
+        sample_tracks_df,
+        sample_artists_df,
+        execution_date,
     ).collect()
 
     # Artist X: first = Jan 1, last = Jan 15
@@ -320,7 +334,16 @@ class TestComputeArtistPlayCountsIntegration:
         artists_df = pl.DataFrame(
             {
                 "artist_name": ["Artist X", "Artist Y"],
-                "artist_id": ["mbid-artist-x", "mbid-artist-y"],
+                "artist_id": ["Artist X", "Artist Y"],
+            }
+        )
+
+        # Create tracks dimension data
+        tracks_df = pl.DataFrame(
+            {
+                "track_id": ["Song A|Artist X", "Song B|Artist X", "Song C|Artist Y"],
+                "artist_id": ["Artist X", "Artist X", "Artist Y"],
+                "track_name": ["Song A", "Song B", "Song C"],
             }
         )
 
@@ -328,6 +351,7 @@ class TestComputeArtistPlayCountsIntegration:
         plays_df.write_delta(str(silver_dir / "plays"))
         dim_users_df.write_delta(str(silver_dir / "dim_users"))
         artists_df.write_delta(str(silver_dir / "artists"))
+        tracks_df.write_delta(str(silver_dir / "tracks"))
 
         # Patch IO managers to use test directories
         with (
@@ -364,8 +388,8 @@ class TestComputeArtistPlayCountsIntegration:
         assert "recency_score" in gold_df.columns
         assert "days_since_last_play" in gold_df.columns
         assert "artist_id" in gold_df.columns
-        # Verify artist_id is enriched with MBID from artists dimension
-        artist_x_row = gold_df.filter(pl.col("artist_id") == "mbid-artist-x")
+        # Verify artist_id and artist_name are present
+        artist_x_row = gold_df.filter(pl.col("artist_id") == "Artist X")
         assert len(artist_x_row) == 1
         assert artist_x_row["artist_name"][0] == "Artist X"
 

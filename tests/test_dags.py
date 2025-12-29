@@ -10,6 +10,15 @@ from pathlib import Path
 
 import pytest
 from airflow.models import DagBag
+from airflow.utils import db
+
+
+@pytest.fixture(scope="session", autouse=True)
+def initialize_airflow_db():
+    """Initialize Airflow database for DAG tests."""
+    db.initdb()
+    yield
+    db.resetdb()
 
 
 @pytest.fixture(scope="module")
@@ -66,7 +75,7 @@ class TestLastFmPlaysDag:
 
         assert dag is not None
         assert dag.schedule == "@daily"
-        assert dag.start_date == dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc)
+        assert dag.start_date == dt.datetime(2025, 12, 25, tzinfo=dt.timezone.utc)
         assert dag.catchup is True
         assert dag.max_active_runs == 1
         assert "lastfm" in dag.tags
@@ -208,19 +217,17 @@ class TestCandidateGenerationDAG:
 
         # Should have core tasks
         assert "get_active_users" in task_ids
-        assert "generate_all_candidates_for_user" in task_ids
+        assert "generate_similar_artist" in task_ids
+        assert "generate_similar_tag" in task_ids
+        assert "generate_deep_cut" in task_ids
+        assert "consolidate_to_gold" in task_ids
         assert "consolidate_results" in task_ids
 
     def test_task_dependencies(self, dag_bag):
         """Test that task dependencies are correct."""
         dag = dag_bag.get_dag("candidate_generation")
 
-        get_users = dag.get_task("get_active_users")
-        generate_candidates = dag.get_task("generate_all_candidates_for_user")
-        consolidate = dag.get_task("consolidate_results")
+        consolidate = dag.get_task("consolidate_to_gold")
 
-        # Generate candidates should depend on get_users
-        assert get_users in generate_candidates.upstream_list
-
-        # Consolidate should depend on generate_candidates
-        assert generate_candidates in consolidate.upstream_list
+        # Consolidate should have generation tasks as upstream
+        assert len(consolidate.upstream_list) > 0

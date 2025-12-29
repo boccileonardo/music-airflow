@@ -98,7 +98,7 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
     """Test track transformation logic."""
     result = _transform_tracks_raw_to_structured(sample_raw_tracks).collect()
 
-    # Check schema
+    # Check schema (track_id and artist_id added during deduplication, not in raw transform)
     expected_cols = [
         "track_name",
         "track_mbid",
@@ -110,8 +110,6 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
         "playcount",
         "tags",
         "track_url",
-        "track_id",
-        "artist_id",
     ]
     assert result.columns == expected_cols
 
@@ -136,7 +134,7 @@ def test_transform_artists_raw_to_structured(sample_raw_artists):
     """Test artist transformation logic."""
     result = _transform_artists_raw_to_structured(sample_raw_artists).collect()
 
-    # Check schema
+    # Check schema (artist_id added during deduplication, not in raw transform)
     expected_cols = [
         "artist_name",
         "artist_mbid",
@@ -145,7 +143,6 @@ def test_transform_artists_raw_to_structured(sample_raw_artists):
         "tags",
         "bio_summary",
         "artist_url",
-        "artist_id",
     ]
     assert result.columns == expected_cols
 
