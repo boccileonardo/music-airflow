@@ -8,12 +8,11 @@ Generates candidate track lists using Last.fm API similarity:
 
 Returns DataFrames for silver-layer storage; DAG consolidates into single gold table.
 """
+# todo: review and adjust the 2 other functions that have bugs:
+# similar tag error
+# bad id in deep cuts
 
-
-# todo: progress monitoring logs
-# todo: clean artist/track lists before sending requests
-
-import time
+from deltalake.exceptions import TableNotFoundError
 from typing import Any
 
 import polars as pl
@@ -71,114 +70,137 @@ def generate_similar_artist_candidates(
     tracks_lf = delta_mgr_silver.read_delta("tracks")
     artists_lf = delta_mgr_silver.read_delta("artists")
 
-    # Get unique artists user has played
-    # First join with tracks to get artist id, then join with artists to get artist details
-    plays_with_artists = (
+    # Get unique artists user has played (id + name)
+    played_artists = (
         plays_lf.select("track_id")
         .unique()
-        .join(
-            tracks_lf.select("track_id", "artist_id"),
-            on="track_id",
-            how="left",
-        )
+        .join(tracks_lf.select("track_id", "artist_id"), on="track_id", how="left")
         .join(
             artists_lf.select("artist_id", "artist_name"),
             on="artist_id",
             how="left",
         )
-        .select("artist_name")
+        .select(["artist_id", "artist_name"])
         .unique()
-        .collect()
-    )
-    user_artists = plays_with_artists
-
-    # Sample artists to limit API requests
-    user_artists_sampled = user_artists.filter(
-        pl.col("artist_name").hash().mod(100) < int(artist_sample_rate * 100)
+        .filter(pl.col("artist_id").is_not_null() & pl.col("artist_name").is_not_null())
     )
 
-    # Get played track IDs to exclude
-    played_track_ids = plays_lf.select("track_id").unique().collect()
-    played_track_ids_set = set(played_track_ids["track_id"].to_list())
+    # Incremental processing: exclude artists already used as a source for this user
+    try:
+        processed_artists = (
+            delta_mgr_silver.read_delta("candidate_similar_artist")
+            .filter(pl.col("username") == username)
+            .select("source_artist_id")
+            .unique()
+            .rename({"source_artist_id": "artist_id"})
+        )
+        artists_to_process = played_artists.join(
+            processed_artists, on="artist_id", how="anti"
+        )
+    except (TableNotFoundError, FileNotFoundError):
+        # Table may not exist on first run; process all played artists
+        artists_to_process = played_artists
+
+    total_artists = artists_to_process.select(pl.len()).collect().item()
+    print(f"Found {total_artists} source artists to process for {username}")
+
+    # Sampling only if we have more than 50 artists to process
+    if total_artists > 50:
+        print("Sampling from artist list to limit API requests")
+        artists_to_process = artists_to_process.filter(
+            pl.col("artist_name").hash().mod(100) < int(artist_sample_rate * 100)
+        ).collect(engine="streaming")
+        sampled_count = artists_to_process.select(pl.len()).item()
+        # Update total count to reflect sampled set for accurate progress logs
+        total_artists = sampled_count
+        print(f"Remaining artists after sampling: {sampled_count}")
+    else:
+        artists_to_process = artists_to_process.collect(engine="streaming")
+
+    # Prepare set of played track_ids for exclusion
+    played_track_ids_df = (
+        plays_lf.select("track_id").unique().collect(engine="streaming")
+    )
+    played_track_ids_set = set(played_track_ids_df["track_id"].to_list())
 
     # Collect candidate tracks
-    all_candidates = []
+    all_candidates: list[dict[str, Any]] = []
+    processed_count = 0
 
-    for artist_name in user_artists_sampled["artist_name"].to_list():
-        try:
-            # Get similar artists
-            similar_artists = client.get_similar_artists(artist_name, limit=30)
+    for artist_name, artist_id in zip(
+        artists_to_process["artist_name"].to_list(),
+        artists_to_process["artist_id"].to_list(),
+    ):
+        # Get similar artists
+        similar_artists = client.get_similar_artists(artist_name, limit=30)
 
-            # Filter out clones/false positives
-            filtered_similar = [
-                a
-                for a in similar_artists
-                if float(a.get("match", 0)) <= similarity_threshold
-            ]
+        # Filter out clones/false positives
+        filtered_similar = [
+            a
+            for a in similar_artists
+            if float(a.get("match", 0)) <= similarity_threshold
+        ]
 
-            # Get top tracks from each similar artist
-            for similar_artist in filtered_similar[:10]:  # Limit to top 10 similar
-                similar_artist_name = similar_artist.get("name")
-                if not similar_artist_name:
+        # Get top tracks from each similar artist (limit to top 10 similar)
+        for similar_artist in filtered_similar[:10]:
+            similar_artist_name = similar_artist.get("name")
+            if not similar_artist_name:
+                continue
+
+            top_tracks = client.get_artist_top_tracks(
+                similar_artist_name, limit=max_candidates_per_artist
+            )
+
+            for track in top_tracks:
+                track_name = track.get("name")
+                track_mbid = track.get("mbid")
+                if track_mbid == "":
+                    track_mbid = None
+                artist_info = track.get("artist", {})
+                if isinstance(artist_info, dict):
+                    artist_name_track = artist_info.get("name", similar_artist_name)
+                    artist_mbid = artist_info.get("mbid")
+                else:
+                    artist_name_track = similar_artist_name
+                    artist_mbid = None
+
+                listeners = int(track.get("listeners", 0))
+                playcount = int(track.get("playcount", 0))
+
+                # Apply quality filter
+                if listeners < min_listeners:
                     continue
 
-                try:
-                    top_tracks = client.get_artist_top_tracks(
-                        similar_artist_name, limit=max_candidates_per_artist
-                    )
+                # Create track ID consistent with plays: prefer MBID else "track|artist"
+                track_id = (
+                    track_mbid if track_mbid else f"{track_name}|{artist_name_track}"
+                )
 
-                    for track in top_tracks:
-                        track_name = track.get("name")
-                        track_mbid = track.get("mbid", "")
-                        artist_info = track.get("artist", {})
-                        if isinstance(artist_info, dict):
-                            artist_name_track = artist_info.get(
-                                "name", similar_artist_name
-                            )
-                            artist_mbid = artist_info.get("mbid", "")
-                        else:
-                            artist_name_track = similar_artist_name
-                            artist_mbid = ""
-
-                        listeners = int(track.get("listeners", 0))
-                        playcount = int(track.get("playcount", 0))
-
-                        # Apply quality filter
-                        if listeners < min_listeners:
-                            continue
-
-                        # Create track ID for deduplication
-                        track_id = f"{artist_name_track}::{track_name}".lower()
-
-                        # Skip if already played
-                        if track_id in played_track_ids_set:
-                            continue
-
-                        all_candidates.append(
-                            {
-                                "username": username,
-                                "track_id": track_id,
-                                "track_name": track_name,
-                                "track_mbid": track_mbid,
-                                "artist_name": artist_name_track,
-                                "artist_mbid": artist_mbid,
-                                "listeners": listeners,
-                                "playcount": playcount,
-                                "score": playcount,  # Simple score: higher playcount = higher score
-                            }
-                        )
-
-                    time.sleep(0.25)  # Rate limiting
-
-                except Exception as e:
-                    print(f"Error fetching tracks for {similar_artist_name}: {e}")
+                # Skip if already played
+                if track_id in played_track_ids_set:
                     continue
 
-            time.sleep(0.25)  # Rate limiting
+                all_candidates.append(
+                    {
+                        "username": username,
+                        "track_id": track_id,
+                        "track_name": track_name,
+                        "track_mbid": track_mbid,
+                        "artist_name": artist_name_track,
+                        "artist_mbid": artist_mbid,
+                        "listeners": listeners,
+                        "playcount": playcount,
+                        "score": playcount,
+                        "source_artist_name": artist_name,
+                        "source_artist_id": artist_id,
+                    }
+                )
 
-        except Exception as e:
-            print(f"Error fetching similar artists for {artist_name}: {e}")
-            continue
+        processed_count += 1
+        if processed_count % 5 == 0 or processed_count == total_artists:
+            print(
+                f"Processed {processed_count}/{total_artists} similar-artist sources for {username}"
+            )
 
     # Convert to DataFrame and deduplicate
     if not all_candidates:
@@ -194,21 +216,24 @@ def generate_similar_artist_candidates(
                 "listeners": pl.Int64,
                 "playcount": pl.Int64,
                 "score": pl.Int64,
+                "source_artist_name": pl.String,
+                "source_artist_id": pl.String,
             }
         )
     else:
         df = pl.DataFrame(all_candidates)
         df = (
-            df.unique(subset=["track_id"])
+            df.unique(subset=["track_id"])  # dedup by track
             .sort("score", descending=True)
             .limit(max_total_candidates)
         )
 
-    # Write to silver Delta table
+    # Write to silver Delta table with incremental upsert
     write_meta = delta_mgr_silver.write_delta(
         df,
         table_name="candidate_similar_artist",
-        mode="overwrite",
+        mode="merge",
+        predicate="s.track_id = t.track_id AND s.username = t.username",
         partition_by="username",
     )
 
@@ -283,53 +308,80 @@ def generate_similar_tag_candidates(
 
     plays_with_track_tags = plays_with_tracks.select("tags")
 
-    # Combine track and artist tags - collect both first then concat
-    track_tags_df = plays_with_track_tags.collect()
-    artist_tags_df = plays_with_artist_tags.collect()
-    all_tags_df = pl.concat([track_tags_df, artist_tags_df], how="vertical")
-
-    # Extract and sample tags
+    # Combine track and artist tags lazily, explode to individual tags
+    user_tags = pl.concat(
+        [plays_with_track_tags, plays_with_artist_tags], how="vertical"
+    )
     user_tags = (
-        all_tags_df.filter(pl.col("tags").is_not_null() & (pl.col("tags") != ""))
+        user_tags.filter(pl.col("tags").is_not_null() & (pl.col("tags") != ""))
         .with_columns(pl.col("tags").str.split(",").alias("tag_list"))
         .explode("tag_list")
-        .select("tag_list")
+        .select(pl.col("tag_list").str.strip_chars().alias("tag"))
         .unique()
     )
 
-    # Sample tags
-    user_tags_sampled = user_tags.filter(
-        pl.col("tag_list").hash().mod(100) < int(tag_sample_rate * 100)
-    )
+    # Incremental: exclude tags already processed for this user
+    try:
+        existing_tag_lf = delta_mgr_silver.read_delta("candidate_similar_tag").filter(
+            pl.col("username") == username
+        )
+        # Guard against older schema without 'source_tag'
+        existing_schema = existing_tag_lf.collect_schema()
+        if "source_tag" in existing_schema:
+            processed_tags = (
+                existing_tag_lf.select("source_tag")
+                .unique()
+                .rename({"source_tag": "tag"})
+            )
+            tags_to_process = user_tags.join(processed_tags, on="tag", how="anti")
+        else:
+            tags_to_process = user_tags
+    except (TableNotFoundError, FileNotFoundError):
+        tags_to_process = user_tags
 
-    # Expand tags with similar tags
-    expanded_tags = set(user_tags_sampled["tag_list"].to_list())
-    for tag in list(expanded_tags)[:20]:  # Limit to avoid too many API calls
-        try:
-            similar_tags = client.get_similar_tags(tag)
-            for similar_tag in similar_tags[:5]:  # Top 5 similar tags
-                tag_name = similar_tag.get("name")
-                if tag_name:
-                    expanded_tags.add(tag_name)
-            time.sleep(0.25)  # Rate limiting
-        except Exception as e:
-            print(f"Error fetching similar tags for {tag}: {e}")
-            continue
+    # Count tags and optionally sample (>50)
+    total_tags = tags_to_process.select(pl.len()).collect(engine="streaming").item()
+    print(f"Found {total_tags} source tags to process for {username}")
+    if total_tags > 50:
+        print("Sampling from tag list to limit API requests")
+        original_tags = tags_to_process
+        tags_to_process = tags_to_process.filter(
+            pl.col("tag").hash().mod(100) < int(tag_sample_rate * 100)
+        ).collect(engine="streaming")
+        total_tags = tags_to_process.select(pl.len()).item()
+        if total_tags == 0:
+            print("Sampling produced 0 tags; falling back to top 50 unsampled tags")
+            tags_to_process = original_tags.collect(engine="streaming").head(50)
+            total_tags = tags_to_process.select(pl.len()).item()
+        print(f"Remaining tags after sampling: {total_tags}")
+    else:
+        tags_to_process = tags_to_process.collect(engine="streaming")
+
+    # Expand each source tag with its similar tags on the fly
+    all_candidates = []
+    processed_count = 0
 
     # Get played track IDs to exclude
-    played_track_ids = plays_lf.select("track_id").unique().collect()
-    played_track_ids_set = set(played_track_ids["track_id"].to_list())
+    played_track_ids_df = (
+        plays_lf.select("track_id").unique().collect(engine="streaming")
+    )
+    played_track_ids_set = set(played_track_ids_df["track_id"].to_list())
 
-    # Collect candidate tracks
-    all_candidates = []
+    for tag in tags_to_process["tag"].to_list():
+        similar_tags = client.get_similar_tags(tag)
+        expanded = [tag]
+        for similar_tag in similar_tags[:5]:
+            tag_name = similar_tag.get("name")
+            if tag_name:
+                expanded.append(tag_name)
 
-    for tag in list(expanded_tags)[:50]:  # Limit total tags to process
-        try:
-            top_tracks = client.get_tag_top_tracks(tag, limit=max_candidates_per_tag)
-
+        for t in expanded:
+            top_tracks = client.get_tag_top_tracks(t, limit=max_candidates_per_tag)
             for track in top_tracks:
                 track_name = track.get("name")
                 track_mbid = track.get("mbid", "")
+                if track_mbid == "":
+                    track_mbid = None
                 artist_info = track.get("artist", {})
                 if isinstance(artist_info, dict):
                     artist_name = artist_info.get("name", "")
@@ -340,15 +392,10 @@ def generate_similar_tag_candidates(
 
                 listeners = int(track.get("listeners", 0))
                 playcount = int(track.get("playcount", 0))
-
-                # Apply quality filter
                 if listeners < min_listeners:
                     continue
 
-                # Create track ID for deduplication
-                track_id = f"{artist_name}::{track_name}".lower()
-
-                # Skip if already played
+                track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
                 if track_id in played_track_ids_set:
                     continue
 
@@ -363,14 +410,15 @@ def generate_similar_tag_candidates(
                         "listeners": listeners,
                         "playcount": playcount,
                         "score": playcount,
+                        "source_tag": tag,
                     }
                 )
 
-            time.sleep(0.25)  # Rate limiting
-
-        except Exception as e:
-            print(f"Error fetching tracks for tag {tag}: {e}")
-            continue
+        processed_count += 1
+        if processed_count % 5 == 0 or processed_count == total_tags:
+            print(
+                f"Processed {processed_count}/{total_tags} source tags for {username}"
+            )
 
     # Convert to DataFrame and deduplicate
     if not all_candidates:
@@ -386,6 +434,7 @@ def generate_similar_tag_candidates(
                 "listeners": pl.Int64,
                 "playcount": pl.Int64,
                 "score": pl.Int64,
+                "source_tag": pl.String,
             }
         )
     else:
@@ -396,11 +445,26 @@ def generate_similar_tag_candidates(
             .limit(max_total_candidates)
         )
 
-    # Write to silver Delta table
+    # Ensure stable schema types (avoid Null dtypes)
+    df = df.with_columns(
+        pl.col("username").cast(pl.String),
+        pl.col("track_id").cast(pl.String),
+        pl.col("track_name").cast(pl.String),
+        pl.col("track_mbid").cast(pl.String),
+        pl.col("artist_name").cast(pl.String),
+        pl.col("artist_mbid").cast(pl.String),
+        pl.col("listeners").cast(pl.Int64),
+        pl.col("playcount").cast(pl.Int64),
+        pl.col("score").cast(pl.Int64),
+        pl.col("source_tag").cast(pl.String),
+    )
+
+    # Write to silver Delta table (merge for incrementality)
     write_meta = delta_mgr_silver.write_delta(
         df,
         table_name="candidate_similar_tag",
-        mode="overwrite",
+        mode="merge",
+        predicate="s.track_id = t.track_id AND s.username = t.username",
         partition_by="username",
     )
 
@@ -452,120 +516,130 @@ def generate_deep_cut_candidates(
     tracks_lf = delta_mgr_silver.read_delta("tracks")
     artists_lf = delta_mgr_silver.read_delta("artists")
 
-    # Get user's top artists by play count
-    # First join with tracks to get artist id, then join with artists to get artist name
-    top_artists = (
+    # Get user's top artists by play count (id + name)
+    top_artists_lf = (
         plays_lf.select("track_id")
-        .join(
-            tracks_lf.select("track_id", "artist_id"),
-            on="track_id",
-            how="left",
-        )
+        .join(tracks_lf.select("track_id", "artist_id"), on="track_id", how="left")
         .join(
             artists_lf.select("artist_id", "artist_name"),
             on="artist_id",
             how="left",
         )
-        .group_by("artist_name")
+        .filter(pl.col("artist_id").is_not_null() & pl.col("artist_name").is_not_null())
+        .group_by(["artist_id", "artist_name"])
         .agg(pl.len().alias("play_count"))
         .sort("play_count", descending=True)
         .limit(top_artists_count)
-        .collect()
     )
 
+    # Incremental: exclude artists already processed
+    try:
+        processed_deep_lf = (
+            delta_mgr_silver.read_delta("candidate_deep_cut")
+            .filter(pl.col("username") == username)
+            .select("source_artist_id")
+            .unique()
+            .rename({"source_artist_id": "artist_id"})
+        )
+        artists_to_process_df = top_artists_lf.join(
+            processed_deep_lf, on="artist_id", how="anti"
+        ).collect(engine="streaming")
+    except (TableNotFoundError, FileNotFoundError):
+        artists_to_process_df = top_artists_lf.collect(engine="streaming")
+
+    total_artists = len(artists_to_process_df)
+    print(f"Found {total_artists} deep-cut source artists to process for {username}")
+    if total_artists > 50:
+        print("Sampling deep-cut artists to limit API requests")
+        artists_to_process_df = artists_to_process_df.filter(
+            pl.col("artist_name").hash().mod(100) < 50
+        )
+
     # Get played track IDs to exclude
-    played_track_ids = plays_lf.select("track_id").unique().collect()
-    played_track_ids_set = set(played_track_ids["track_id"].to_list())
+    played_track_ids_df = (
+        plays_lf.select("track_id").unique().collect(engine="streaming")
+    )
+    played_track_ids_set = set(played_track_ids_df["track_id"].to_list())
 
     # Collect candidate tracks
     all_candidates = []
 
-    for artist_name in top_artists["artist_name"].to_list():
-        try:
-            # Get top albums for artist
-            top_albums = client.get_artist_top_albums(artist_name, limit=15)
+    processed_count = 0
+    for artist_name, artist_id in zip(
+        artists_to_process_df["artist_name"].to_list(),
+        artists_to_process_df["artist_id"].to_list(),
+    ):
+        # Get top albums for artist
+        top_albums = client.get_artist_top_albums(artist_name, limit=15)
 
-            # Filter albums with reasonable listener counts
-            filtered_albums = [
-                album
-                for album in top_albums
-                if int(album.get("playcount", 0)) >= min_listeners
-            ]
+        # Filter albums with reasonable listener counts
+        filtered_albums = [
+            album
+            for album in top_albums
+            if int(album.get("playcount", 0)) >= min_listeners
+        ]
 
-            # Process each album
-            for album in filtered_albums[:10]:  # Limit to top 10 albums
-                album_name = album.get("name")
-                if not album_name:
+        # Process each album
+        for album in filtered_albums[:10]:  # Limit to top 10 albums
+            album_name = album.get("name")
+            if not album_name:
+                continue
+
+            # Get album info with tracklist
+            album_info = client.get_album_info(album_name, artist_name)
+            tracks = album_info.get("tracks", {})
+
+            # Handle different response formats
+            if isinstance(tracks, dict):
+                track_list = tracks.get("track", [])
+            else:
+                track_list = tracks
+
+            if isinstance(track_list, dict):
+                track_list = [track_list]
+
+            for track in track_list:
+                track_name = track.get("name")
+                track_mbid = track.get("mbid", "")
+                if track_mbid == "":
+                    track_mbid = None
+
+                album_listeners = int(album.get("playcount", 0))
+                if not (min_listeners <= album_listeners <= max_listeners):
                     continue
 
-                try:
-                    # Get album info with tracklist
-                    album_info = client.get_album_info(album_name, artist_name)
-                    tracks = album_info.get("tracks", {})
-
-                    # Handle different response formats
-                    if isinstance(tracks, dict):
-                        track_list = tracks.get("track", [])
-                    else:
-                        track_list = tracks
-
-                    if isinstance(track_list, dict):
-                        track_list = [track_list]
-
-                    for track in track_list:
-                        track_name = track.get("name")
-                        track_mbid = track.get("mbid", "")
-
-                        # Get track listeners/playcount from album-level info or defaults
-                        # Note: album.getInfo tracks don't always have individual stats
-                        # Use album stats as proxy
-                        album_listeners = int(album.get("playcount", 0))
-
-                        # Apply obscurity filter (using album stats as proxy)
-                        if not (min_listeners <= album_listeners <= max_listeners):
-                            continue
-
-                        # Create track ID for deduplication
-                        track_id = f"{artist_name}::{track_name}".lower()
-
-                        # Skip if already played
-                        if track_id in played_track_ids_set:
-                            continue
-
-                        artist_mbid = (
-                            album.get("artist", {}).get("mbid", "")
-                            if isinstance(album.get("artist"), dict)
-                            else ""
-                        )
-
-                        all_candidates.append(
-                            {
-                                "username": username,
-                                "track_id": track_id,
-                                "track_name": track_name,
-                                "track_mbid": track_mbid,
-                                "artist_name": artist_name,
-                                "artist_mbid": artist_mbid,
-                                "album_name": album_name,
-                                "listeners": album_listeners,  # Using album stats
-                                "playcount": album_listeners,
-                                "score": 1.0 / (album_listeners + 1),  # Obscurity score
-                            }
-                        )
-
-                    time.sleep(0.25)  # Rate limiting
-
-                except Exception as e:
-                    print(
-                        f"Error fetching album info for {album_name} by {artist_name}: {e}"
-                    )
+                track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
+                if track_id in played_track_ids_set:
                     continue
 
-            time.sleep(0.25)  # Rate limiting
+                artist_mbid = (
+                    album.get("artist", {}).get("mbid", "")
+                    if isinstance(album.get("artist"), dict)
+                    else ""
+                )
 
-        except Exception as e:
-            print(f"Error fetching albums for {artist_name}: {e}")
-            continue
+                all_candidates.append(
+                    {
+                        "username": username,
+                        "track_id": track_id,
+                        "track_name": track_name,
+                        "track_mbid": track_mbid,
+                        "artist_name": artist_name,
+                        "artist_mbid": artist_mbid,
+                        "album_name": album_name,
+                        "listeners": album_listeners,
+                        "playcount": album_listeners,
+                        "score": 1.0 / (album_listeners + 1),
+                        "source_artist_name": artist_name,
+                        "source_artist_id": artist_id,
+                    }
+                )
+
+        processed_count += 1
+        if processed_count % 5 == 0 or processed_count == total_artists:
+            print(
+                f"Processed {processed_count}/{total_artists} deep-cut artists for {username}"
+            )
 
     # Convert to DataFrame and deduplicate
     if not all_candidates:
@@ -582,6 +656,8 @@ def generate_deep_cut_candidates(
                 "listeners": pl.Int64,
                 "playcount": pl.Int64,
                 "score": pl.Float64,
+                "source_artist_name": pl.String,
+                "source_artist_id": pl.String,
             }
         )
     else:
@@ -592,11 +668,28 @@ def generate_deep_cut_candidates(
             .limit(max_candidates)
         )
 
-    # Write to silver Delta table
+    # Ensure stable schema types (avoid Null dtypes)
+    df = df.with_columns(
+        pl.col("username").cast(pl.String),
+        pl.col("track_id").cast(pl.String),
+        pl.col("track_name").cast(pl.String),
+        pl.col("track_mbid").cast(pl.String),
+        pl.col("artist_name").cast(pl.String),
+        pl.col("artist_mbid").cast(pl.String),
+        pl.col("album_name").cast(pl.String),
+        pl.col("listeners").cast(pl.Int64),
+        pl.col("playcount").cast(pl.Int64),
+        pl.col("score").cast(pl.Float64),
+        pl.col("source_artist_name").cast(pl.String),
+        pl.col("source_artist_id").cast(pl.String),
+    )
+
+    # Write to silver Delta table (merge for incrementality)
     write_meta = delta_mgr_silver.write_delta(
         df,
         table_name="candidate_deep_cut",
-        mode="overwrite",
+        mode="merge",
+        predicate="s.track_id = t.track_id AND s.username = t.username",
         partition_by="username",
     )
 

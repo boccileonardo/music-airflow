@@ -11,8 +11,6 @@ Configuration:
 - Saves intermediate results to silver, final unified table to gold
 """
 
-# todo: review outputs
-
 from typing import Any
 from music_airflow.utils.constants import DAG_START_DATE
 from airflow.sdk import Asset, dag, task
@@ -83,6 +81,7 @@ def candidate_generation():
             username=username,
         )
 
+    # Similar tag candidates per user
     @task(
         multiple_outputs=False,
         inlets=[plays_asset, tracks_asset],
@@ -105,6 +104,7 @@ def candidate_generation():
             username=username,
         )
 
+    # Deep cut candidates per user
     @task(
         multiple_outputs=False,
         inlets=[plays_asset, artists_asset, tracks_asset],
@@ -127,6 +127,7 @@ def candidate_generation():
             username=username,
         )
 
+    # Consolidate per user into gold
     @task(
         multiple_outputs=False,
         outlets=[candidates_asset],
@@ -147,6 +148,7 @@ def candidate_generation():
 
         return merge_candidate_sources(username=username)
 
+    # Final summary across users
     @task(
         multiple_outputs=False,
     )

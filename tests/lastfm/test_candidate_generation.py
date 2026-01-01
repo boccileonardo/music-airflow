@@ -41,11 +41,11 @@ def patched_delta_io(test_data_dir):
 
 def _write_silver_base_tables(patched_delta_io):
     """Create minimal silver tables for plays, tracks, artists."""
-    # Plays: one user with a played track
+    # Plays: one user with a played track (track_id format: "track|artist")
     plays_df = pl.DataFrame(
         {
             "username": ["user1"],
-            "track_id": ["artist a::known"],
+            "track_id": ["Known|Artist A"],
         }
     )
     patched_delta_io("silver").write_delta(
@@ -56,9 +56,9 @@ def _write_silver_base_tables(patched_delta_io):
     tracks_df = pl.DataFrame(
         {
             "track_id": [
-                "artist a::known",
-                "artist b::new track",
-                "artist c::tag track",
+                "Known|Artist A",
+                "New Track|Artist B",
+                "Tag Track|Artist C",
             ],
             "artist_id": ["a1", "b1", "c1"],
             "tags": ["rock,alt", "indie", "rock"],
@@ -132,8 +132,8 @@ class TestSimilarArtistCandidates:
         out_path = Path(result["path"])  # data/silver/candidate_similar_artist
         assert out_path.exists()
         df = pl.read_delta(str(out_path))
-        # Only New Track should remain (clone and small filtered)
-        assert df["track_id"].to_list() == ["artist b::new track"]
+        # Only New Track should remain (clone and small filtered); prefer MBID when present
+        assert df["track_id"].to_list() == ["tmbid"]
         assert df["username"].to_list() == ["user1"]
 
 
@@ -195,8 +195,8 @@ class TestSimilarTagCandidates:
         out_path = Path(result["path"])  # data/silver/candidate_similar_tag
         assert out_path.exists()
         df = pl.read_delta(str(out_path))
-        # Should exclude already played "artist a::known" and the too-small one
-        assert df["track_id"].to_list() == ["artist c::tag track"]
+        # Should exclude already played "Known|Artist A" and the too-small one; prefer MBID when present
+        assert df["track_id"].to_list() == ["tm2"]
         assert df["username"].to_list() == ["user1"]
 
 
@@ -245,8 +245,8 @@ class TestDeepCutCandidates:
         out_path = Path(result["path"])  # data/silver/candidate_deep_cut
         assert out_path.exists()
         df = pl.read_delta(str(out_path))
-        # Only Hidden Gem should remain; Too Popular filtered by max_listeners
-        assert df["track_id"].to_list() == ["artist a::hidden gem"]
+        # Only Hidden Gem should remain; Too Popular filtered by max_listeners; prefer MBID when present
+        assert df["track_id"].to_list() == ["hg_mbid"]
         assert df["album_name"].to_list() == ["Obscure Album"]
 
 
