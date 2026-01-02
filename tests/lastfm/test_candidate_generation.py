@@ -151,6 +151,7 @@ class TestSimilarTagCandidates:
             ) as MockDeltaIO,
         ):
             client = MockClient.return_value
+
             # Return top tracks for each tag (rock, indie, alt)
             # Track A appears in multiple tags (meets min_tag_matches=3)
             # Track B appears in only 1 tag (filtered out)
@@ -207,7 +208,7 @@ class TestSimilarTagCandidates:
         out_path = Path(result["path"])
         assert out_path.exists()
         df = pl.read_delta(str(out_path))
-        
+
         # Only Rock Track A should be in results (appears in 3 tags)
         # Rock Track B only appears in 1 tag, filtered out
         assert len(df) == 1

@@ -282,9 +282,7 @@ def generate_similar_tag_candidates(
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load data
-    plays = delta_mgr_silver.read_delta("plays").filter(
-        pl.col("username") == username
-    )
+    plays = delta_mgr_silver.read_delta("plays").filter(pl.col("username") == username)
     tracks = delta_mgr_silver.read_delta("tracks")
     artists = delta_mgr_silver.read_delta("artists")
 
@@ -326,11 +324,11 @@ def generate_similar_tag_candidates(
         for row in processed_tags_df.iter_rows():
             if row[0]:
                 processed_tags_set.update(row[0].split(","))
-        
+
         # Get current tag profile as set
         current_tags_df = tag_profile.collect()
         current_tags_set = set(current_tags_df["tag"].to_list())
-        
+
         # Only reprocess if tag profile has changed significantly (>20% new tags)
         new_tags = current_tags_set - processed_tags_set
         if len(new_tags) / len(current_tags_set) < 0.2:
@@ -346,29 +344,27 @@ def generate_similar_tag_candidates(
 
     tag_profile_collected = tag_profile.collect()
     top_tags = tag_profile_collected["tag"].to_list()
-    
+
     print(f"Using top {len(top_tags)} tags for {username}: {top_tags[:10]}...")
 
     # Get played track IDs to exclude
-    played_track_ids = (
-        plays.select("track_id").unique().collect(engine="streaming")
-    )
+    played_track_ids = plays.select("track_id").unique().collect(engine="streaming")
     played_track_ids_set = set(played_track_ids["track_id"].to_list())
 
     # Collect tracks with tag associations
     # track_id -> {track_info, tags: [tag1, tag2, ...], ranks: [rank1, rank2, ...]}
     track_tag_map: dict[str, dict[str, Any]] = {}
-    
+
     processed_count = 0
     for tag in top_tags:
         top_tracks = client.get_tag_top_tracks(tag, limit=tracks_per_tag)
-        
+
         for track in top_tracks:
             track_name = track.get("name")
             track_mbid = track.get("mbid", "")
             if track_mbid == "":
                 track_mbid = None
-            
+
             artist_info = track.get("artist", {})
             if isinstance(artist_info, dict):
                 artist_name = artist_info.get("name", "")
@@ -378,18 +374,18 @@ def generate_similar_tag_candidates(
             else:
                 artist_name = str(artist_info) if artist_info else ""
                 artist_mbid = None
-            
+
             # Get rank from @attr
             rank = int(track.get("@attr", {}).get("rank", 999))
             if rank > max_rank:
                 continue
-            
+
             track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
-            
+
             # Skip if already played
             if track_id in played_track_ids_set:
                 continue
-            
+
             # Add or update track in map
             if track_id not in track_tag_map:
                 track_tag_map[track_id] = {
@@ -402,10 +398,10 @@ def generate_similar_tag_candidates(
                     "tags": [],
                     "ranks": [],
                 }
-            
+
             track_tag_map[track_id]["tags"].append(tag)
             track_tag_map[track_id]["ranks"].append(rank)
-        
+
         processed_count += 1
         if processed_count % 5 == 0 or processed_count == len(top_tags):
             print(
@@ -417,14 +413,14 @@ def generate_similar_tag_candidates(
     all_candidates = []
     for track_id, track_data in track_tag_map.items():
         tag_match_count = len(track_data["tags"])
-        
+
         if tag_match_count < min_tag_matches:
             continue
-        
+
         # Score: tag matches (primary) + inverse average rank (secondary)
         avg_rank = sum(track_data["ranks"]) / len(track_data["ranks"])
         score = tag_match_count * 1000 + (100 - avg_rank)
-        
+
         all_candidates.append(
             {
                 "username": track_data["username"],
@@ -439,7 +435,7 @@ def generate_similar_tag_candidates(
                 "source_tags": ",".join(track_data["tags"]),
             }
         )
-    
+
     print(
         f"After filtering for min {min_tag_matches} tag matches: "
         f"{len(all_candidates)} candidates"
@@ -751,10 +747,9 @@ def merge_candidate_sources(username: str) -> dict[str, Any]:
     # similar_artists: has listeners, playcount, score (int)
     # similar_tags: has tag_match_count, avg_rank, score (float)
     # deep_cuts: has album_name, listeners, playcount, score (float)
-    
+
     similar_artists_typed = (
-        similar_artists_lf
-        .filter(pl.col("username") == username)
+        similar_artists_lf.filter(pl.col("username") == username)
         .with_columns(
             pl.lit(None).cast(pl.String).alias("album_name"),
             pl.lit(True).alias("similar_artist"),
@@ -762,17 +757,27 @@ def merge_candidate_sources(username: str) -> dict[str, Any]:
             pl.lit(False).alias("deep_cut_same_artist"),
             pl.col("score").cast(pl.Float64),
         )
-        .select([
-            "username", "track_id", "track_name", "track_mbid",
-            "artist_name", "artist_mbid", "album_name",
-            "listeners", "playcount", "score",
-            "similar_artist", "similar_tag", "deep_cut_same_artist",
-        ])
+        .select(
+            [
+                "username",
+                "track_id",
+                "track_name",
+                "track_mbid",
+                "artist_name",
+                "artist_mbid",
+                "album_name",
+                "listeners",
+                "playcount",
+                "score",
+                "similar_artist",
+                "similar_tag",
+                "deep_cut_same_artist",
+            ]
+        )
     )
 
     similar_tags_typed = (
-        similar_tags_lf
-        .filter(pl.col("username") == username)
+        similar_tags_lf.filter(pl.col("username") == username)
         .with_columns(
             pl.lit(None).cast(pl.String).alias("album_name"),
             pl.lit(None).cast(pl.Int64).alias("listeners"),
@@ -781,28 +786,49 @@ def merge_candidate_sources(username: str) -> dict[str, Any]:
             pl.lit(True).alias("similar_tag"),
             pl.lit(False).alias("deep_cut_same_artist"),
         )
-        .select([
-            "username", "track_id", "track_name", "track_mbid",
-            "artist_name", "artist_mbid", "album_name",
-            "listeners", "playcount", "score",
-            "similar_artist", "similar_tag", "deep_cut_same_artist",
-        ])
+        .select(
+            [
+                "username",
+                "track_id",
+                "track_name",
+                "track_mbid",
+                "artist_name",
+                "artist_mbid",
+                "album_name",
+                "listeners",
+                "playcount",
+                "score",
+                "similar_artist",
+                "similar_tag",
+                "deep_cut_same_artist",
+            ]
+        )
     )
 
     deep_cuts_typed = (
-        deep_cuts_lf
-        .filter(pl.col("username") == username)
+        deep_cuts_lf.filter(pl.col("username") == username)
         .with_columns(
             pl.lit(False).alias("similar_artist"),
             pl.lit(False).alias("similar_tag"),
             pl.lit(True).alias("deep_cut_same_artist"),
         )
-        .select([
-            "username", "track_id", "track_name", "track_mbid",
-            "artist_name", "artist_mbid", "album_name",
-            "listeners", "playcount", "score",
-            "similar_artist", "similar_tag", "deep_cut_same_artist",
-        ])
+        .select(
+            [
+                "username",
+                "track_id",
+                "track_name",
+                "track_mbid",
+                "artist_name",
+                "artist_mbid",
+                "album_name",
+                "listeners",
+                "playcount",
+                "score",
+                "similar_artist",
+                "similar_tag",
+                "deep_cut_same_artist",
+            ]
+        )
     )
 
     # Concatenate all sources
