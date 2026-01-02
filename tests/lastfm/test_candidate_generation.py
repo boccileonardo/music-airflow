@@ -61,19 +61,18 @@ def _write_silver_base_tables(patched_delta_io):
                 "Tag Track|Artist C",
             ],
             "artist_id": ["a1", "b1", "c1"],
-            "tags": ["rock,alt", "indie", "rock"],
         }
     )
     patched_delta_io("silver").write_delta(
         tracks_df, table_name="tracks", mode="overwrite"
     )
 
-    # Artists: map artist_id -> artist_name and optional tags
+    # Artists: map artist_id -> artist_name and tags
     artists_df = pl.DataFrame(
         {
             "artist_id": ["a1", "b1", "c1"],
             "artist_name": ["Artist A", "Artist B", "Artist C"],
-            "tags": ["indie,alt", "indie", "rock"],
+            "tags": ["rock,indie,alt", "indie", "rock"],
         }
     )
     patched_delta_io("silver").write_delta(
@@ -138,7 +137,7 @@ class TestSimilarArtistCandidates:
 
 
 class TestSimilarTagCandidates:
-    def test_excludes_played_and_respects_min_listeners(
+    def test_tag_profile_matching_with_min_matches(
         self, test_data_dir, patched_delta_io
     ):
         _write_silver_base_tables(patched_delta_io)
@@ -152,35 +151,46 @@ class TestSimilarTagCandidates:
             ) as MockDeltaIO,
         ):
             client = MockClient.return_value
-            # Expand tags for user's tags (rock, alt, indie)
-            client.get_similar_tags.side_effect = lambda tag: [
-                {"name": "indie"},
-                {"name": "alternative"},
-            ]
-            # For top tracks per tag, include one already played and one valid
-            client.get_tag_top_tracks.side_effect = lambda tag, limit=10: [
-                {
-                    "name": "Known",
-                    "mbid": "",
-                    "artist": {"name": "Artist A", "mbid": "a_mbid"},
-                    "listeners": 5000,
-                    "playcount": 8000,
-                },
-                {
-                    "name": "Tag Track",
-                    "mbid": "tm2",
-                    "artist": {"name": "Artist C", "mbid": "c_mbid"},
-                    "listeners": 6000,
-                    "playcount": 9000,
-                },
-                {
-                    "name": "Too Small",
-                    "mbid": "",
-                    "artist": {"name": "Artist Z", "mbid": "z_mbid"},
-                    "listeners": 100,  # filtered by min_listeners default 1000
-                    "playcount": 200,
-                },
-            ]
+            # Return top tracks for each tag (rock, indie, alt)
+            # Track A appears in multiple tags (meets min_tag_matches=3)
+            # Track B appears in only 1 tag (filtered out)
+            def mock_get_tag_top_tracks(tag, limit=30):
+                if tag == "rock":
+                    return [
+                        {
+                            "name": "Rock Track A",
+                            "mbid": "rta_mbid",
+                            "artist": {"name": "Artist D", "mbid": "d_mbid"},
+                            "@attr": {"rank": "1"},
+                        },
+                        {
+                            "name": "Rock Track B",
+                            "mbid": "rtb_mbid",
+                            "artist": {"name": "Artist E", "mbid": "e_mbid"},
+                            "@attr": {"rank": "2"},
+                        },
+                    ]
+                elif tag == "indie":
+                    return [
+                        {
+                            "name": "Rock Track A",  # Same track, different tag
+                            "mbid": "rta_mbid",
+                            "artist": {"name": "Artist D", "mbid": "d_mbid"},
+                            "@attr": {"rank": "3"},
+                        },
+                    ]
+                elif tag == "alt":
+                    return [
+                        {
+                            "name": "Rock Track A",  # Same track, third tag
+                            "mbid": "rta_mbid",
+                            "artist": {"name": "Artist D", "mbid": "d_mbid"},
+                            "@attr": {"rank": "5"},
+                        },
+                    ]
+                return []
+
+            client.get_tag_top_tracks.side_effect = mock_get_tag_top_tracks
 
             MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
                 medallion_layer
@@ -188,16 +198,27 @@ class TestSimilarTagCandidates:
 
             result = generate_similar_tag_candidates(
                 username="user1",
-                tag_sample_rate=1.0,
+                top_tags_count=3,
+                min_tag_matches=3,  # explicitly test with 3 matches
+                max_rank=20,
             )
 
         assert result["table_name"] == "candidate_similar_tag"
-        out_path = Path(result["path"])  # data/silver/candidate_similar_tag
+        out_path = Path(result["path"])
         assert out_path.exists()
         df = pl.read_delta(str(out_path))
-        # Should exclude already played "Known|Artist A" and the too-small one; prefer MBID when present
-        assert df["track_id"].to_list() == ["tm2"]
-        assert df["username"].to_list() == ["user1"]
+        
+        # Only Rock Track A should be in results (appears in 3 tags)
+        # Rock Track B only appears in 1 tag, filtered out
+        assert len(df) == 1
+        assert df["track_id"][0] == "rta_mbid"
+        assert df["tag_match_count"][0] == 3
+        # Tags are sorted alphabetically when collected
+        assert set(df["source_tags"][0].split(",")) == {"rock", "indie", "alt"}
+        # Score = tag_match_count * 1000 + (100 - avg_rank)
+        # avg_rank = (1 + 3 + 5) / 3 = 3
+        # score = 3000 + (100 - 3) = 3097
+        assert df["score"][0] == pytest.approx(3097.0, abs=0.1)
 
 
 class TestDeepCutCandidates:
@@ -278,9 +299,10 @@ class TestMergeCandidateSources:
                 "track_mbid": ["tmbid", "tm2"],
                 "artist_name": ["Artist B", "Artist C"],
                 "artist_mbid": ["bmbid", "cmbid"],
-                "listeners": [5000, 6000],
-                "playcount": [10000, 9000],
-                "score": [10000.0, 9000.0],
+                "tag_match_count": [3, 4],
+                "avg_rank": [5.0, 3.0],
+                "score": [3095.0, 4097.0],
+                "source_tags": ["rock,indie,alt", "rock,indie,alt,pop"],
             }
         )
         patched_delta_io("silver").write_delta(

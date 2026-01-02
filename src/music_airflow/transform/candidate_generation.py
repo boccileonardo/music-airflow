@@ -3,14 +3,15 @@ Candidate track generation for music recommendation system.
 
 Generates candidate track lists using Last.fm API similarity:
 - Similar artist tracks: Top tracks from artists similar to user's plays (via artist.getSimilar)
-- Similar tag tracks: Top tracks with tags matching/similar to user's library (via tag.getSimilar)
+- Similar tag tracks: Tracks appearing under multiple tags from user's tag profile (via tag.getTopTracks)
 - Deep cut tracks: Obscure tracks from top albums by user's favorite artists (via artist.getTopAlbums)
 
 Returns DataFrames for silver-layer storage; DAG consolidates into single gold table.
 """
-# todo: review and adjust the 2 other functions that have bugs:
-# similar tag error
-# bad id in deep cuts
+# todo: fix deep cuts
+# todo: add old favorites (from previous play history)
+# todo: fix unnecessary collects and sets
+# todo: handle artist not found error in generate artists
 
 from deltalake.exceptions import TableNotFoundError
 from typing import Any
@@ -246,29 +247,33 @@ def generate_similar_artist_candidates(
 
 def generate_similar_tag_candidates(
     username: str,
-    min_listeners: int = 1000,
-    max_candidates_per_tag: int = 10,
+    top_tags_count: int = 30,
+    tracks_per_tag: int = 30,
+    min_tag_matches: int = 2,
     max_total_candidates: int = 500,
-    tag_sample_rate: float = 0.5,
+    max_rank: int = 20,
 ) -> dict[str, Any]:
     """
-    Generate candidate tracks with tags similar to user's library (via Last.fm API).
+    Generate candidate tracks matching user's tag profile (via Last.fm API).
 
     Strategy:
-    1. Extract tags from user's played tracks/artists
-    2. Sample tags for diversity
-    3. For each tag, call tag.getSimilar to expand tag set
-    4. For each tag (user + similar), call tag.getTopTracks
-    5. Exclude tracks user has already played
+    1. Build user's tag profile: count tag frequency across played artists
+    2. Select top N most frequent tags (represents core taste)
+    3. For each tag, get top tracks from Last.fm
+    4. Track which tags each track appears under
+    5. Score by: number of matching tags + average rank
+    6. Keep only tracks appearing under min_tag_matches or more tags
+    7. Exclude tracks user has already played
 
     Saves results to data/silver/candidate_similar_tag/ Delta table.
 
     Args:
         username: Target user
-        min_listeners: Minimum listeners for candidate tracks
-        max_candidates_per_tag: Max tracks per tag
-        max_total_candidates: Maximum number of candidates
-        tag_sample_rate: Fraction of tags to sample (0.5 = 50%)
+        top_tags_count: Number of most frequent tags to use (default 30)
+        tracks_per_tag: Max tracks to fetch per tag (default 30)
+        min_tag_matches: Minimum tags a track must appear under (default 2)
+        max_total_candidates: Maximum number of candidates to return
+        max_rank: Maximum rank to consider (tracks ranked beyond this are filtered)
 
     Returns:
         Metadata dict with path, rows, table_name
@@ -277,152 +282,171 @@ def generate_similar_tag_candidates(
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load data
-    plays_lf = delta_mgr_silver.read_delta("plays").filter(
+    plays = delta_mgr_silver.read_delta("plays").filter(
         pl.col("username") == username
     )
-    tracks_lf = delta_mgr_silver.read_delta("tracks")
-    artists_lf = delta_mgr_silver.read_delta("artists")
+    tracks = delta_mgr_silver.read_delta("tracks")
+    artists = delta_mgr_silver.read_delta("artists")
 
-    # Get user's played tracks and extract tags
-    # First join with tracks to get artist id, then join with artists to get tags
-    plays_with_tracks = (
-        plays_lf.select("track_id")
+    # Build user's tag profile with frequency counts
+    tag_profile = (
+        plays.select("track_id")
         .unique()
         .join(
-            tracks_lf.select("track_id", "artist_id", "tags"),
+            tracks.select("track_id", "artist_id"),
             on="track_id",
             how="left",
         )
-    )
-
-    plays_with_artist_tags = (
-        plays_with_tracks.select("artist_id")
-        .unique()
         .join(
-            artists_lf.select("artist_id", "tags"),
+            artists.select("artist_id", "tags"),
             on="artist_id",
             how="left",
         )
-        .select("tags")
-    )
-
-    plays_with_track_tags = plays_with_tracks.select("tags")
-
-    # Combine track and artist tags lazily, explode to individual tags
-    user_tags = pl.concat(
-        [plays_with_track_tags, plays_with_artist_tags], how="vertical"
-    )
-    user_tags = (
-        user_tags.filter(pl.col("tags").is_not_null() & (pl.col("tags") != ""))
+        .filter(pl.col("tags").is_not_null() & (pl.col("tags") != ""))
         .with_columns(pl.col("tags").str.split(",").alias("tag_list"))
         .explode("tag_list")
-        .select(pl.col("tag_list").str.strip_chars().alias("tag"))
-        .unique()
+        .with_columns(pl.col("tag_list").str.strip_chars().alias("tag"))
+        .group_by("tag")
+        .agg(pl.len().alias("tag_count"))
+        .sort("tag_count", descending=True)
+        .limit(top_tags_count)
     )
 
-    # Incremental: exclude tags already processed for this user
+    # Incremental: check which tags have been processed
     try:
-        existing_tag_lf = delta_mgr_silver.read_delta("candidate_similar_tag").filter(
-            pl.col("username") == username
+        processed_tags_df = (
+            delta_mgr_silver.read_delta("candidate_similar_tag")
+            .filter(pl.col("username") == username)
+            .select("source_tags")
+            .unique()
+            .collect()
         )
-        # Guard against older schema without 'source_tag'
-        existing_schema = existing_tag_lf.collect_schema()
-        if "source_tag" in existing_schema:
-            processed_tags = (
-                existing_tag_lf.select("source_tag")
-                .unique()
-                .rename({"source_tag": "tag"})
-            )
-            tags_to_process = user_tags.join(processed_tags, on="tag", how="anti")
-        else:
-            tags_to_process = user_tags
+        # source_tags is a comma-separated string, need to parse it
+        processed_tags_set = set()
+        for row in processed_tags_df.iter_rows():
+            if row[0]:
+                processed_tags_set.update(row[0].split(","))
+        
+        # Get current tag profile as set
+        current_tags_df = tag_profile.collect()
+        current_tags_set = set(current_tags_df["tag"].to_list())
+        
+        # Only reprocess if tag profile has changed significantly (>20% new tags)
+        new_tags = current_tags_set - processed_tags_set
+        if len(new_tags) / len(current_tags_set) < 0.2:
+            print(f"Tag profile mostly unchanged for {username}, skipping")
+            return {
+                "path": "data/silver/candidate_similar_tag",
+                "rows": 0,
+                "table_name": "candidate_similar_tag",
+            }
     except (TableNotFoundError, FileNotFoundError):
-        tags_to_process = user_tags
+        # First run, process all
+        pass
 
-    # Count tags and optionally sample (>50)
-    total_tags = tags_to_process.select(pl.len()).collect(engine="streaming").item()
-    print(f"Found {total_tags} source tags to process for {username}")
-    if total_tags > 50:
-        print("Sampling from tag list to limit API requests")
-        original_tags = tags_to_process
-        tags_to_process = tags_to_process.filter(
-            pl.col("tag").hash().mod(100) < int(tag_sample_rate * 100)
-        ).collect(engine="streaming")
-        total_tags = tags_to_process.select(pl.len()).item()
-        if total_tags == 0:
-            print("Sampling produced 0 tags; falling back to top 50 unsampled tags")
-            tags_to_process = original_tags.collect(engine="streaming").head(50)
-            total_tags = tags_to_process.select(pl.len()).item()
-        print(f"Remaining tags after sampling: {total_tags}")
-    else:
-        tags_to_process = tags_to_process.collect(engine="streaming")
-
-    # Expand each source tag with its similar tags on the fly
-    all_candidates = []
-    processed_count = 0
+    tag_profile_collected = tag_profile.collect()
+    top_tags = tag_profile_collected["tag"].to_list()
+    
+    print(f"Using top {len(top_tags)} tags for {username}: {top_tags[:10]}...")
 
     # Get played track IDs to exclude
-    played_track_ids_df = (
-        plays_lf.select("track_id").unique().collect(engine="streaming")
+    played_track_ids = (
+        plays.select("track_id").unique().collect(engine="streaming")
     )
-    played_track_ids_set = set(played_track_ids_df["track_id"].to_list())
+    played_track_ids_set = set(played_track_ids["track_id"].to_list())
 
-    for tag in tags_to_process["tag"].to_list():
-        similar_tags = client.get_similar_tags(tag)
-        expanded = [tag]
-        for similar_tag in similar_tags[:5]:
-            tag_name = similar_tag.get("name")
-            if tag_name:
-                expanded.append(tag_name)
-
-        for t in expanded:
-            top_tracks = client.get_tag_top_tracks(t, limit=max_candidates_per_tag)
-            for track in top_tracks:
-                track_name = track.get("name")
-                track_mbid = track.get("mbid", "")
-                if track_mbid == "":
-                    track_mbid = None
-                artist_info = track.get("artist", {})
-                if isinstance(artist_info, dict):
-                    artist_name = artist_info.get("name", "")
-                    artist_mbid = artist_info.get("mbid", "")
-                else:
-                    artist_name = str(artist_info) if artist_info else ""
-                    artist_mbid = ""
-
-                listeners = int(track.get("listeners", 0))
-                playcount = int(track.get("playcount", 0))
-                if listeners < min_listeners:
-                    continue
-
-                track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
-                if track_id in played_track_ids_set:
-                    continue
-
-                all_candidates.append(
-                    {
-                        "username": username,
-                        "track_id": track_id,
-                        "track_name": track_name,
-                        "track_mbid": track_mbid,
-                        "artist_name": artist_name,
-                        "artist_mbid": artist_mbid,
-                        "listeners": listeners,
-                        "playcount": playcount,
-                        "score": playcount,
-                        "source_tag": tag,
-                    }
-                )
-
+    # Collect tracks with tag associations
+    # track_id -> {track_info, tags: [tag1, tag2, ...], ranks: [rank1, rank2, ...]}
+    track_tag_map: dict[str, dict[str, Any]] = {}
+    
+    processed_count = 0
+    for tag in top_tags:
+        top_tracks = client.get_tag_top_tracks(tag, limit=tracks_per_tag)
+        
+        for track in top_tracks:
+            track_name = track.get("name")
+            track_mbid = track.get("mbid", "")
+            if track_mbid == "":
+                track_mbid = None
+            
+            artist_info = track.get("artist", {})
+            if isinstance(artist_info, dict):
+                artist_name = artist_info.get("name", "")
+                artist_mbid = artist_info.get("mbid", "")
+                if artist_mbid == "":
+                    artist_mbid = None
+            else:
+                artist_name = str(artist_info) if artist_info else ""
+                artist_mbid = None
+            
+            # Get rank from @attr
+            rank = int(track.get("@attr", {}).get("rank", 999))
+            if rank > max_rank:
+                continue
+            
+            track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
+            
+            # Skip if already played
+            if track_id in played_track_ids_set:
+                continue
+            
+            # Add or update track in map
+            if track_id not in track_tag_map:
+                track_tag_map[track_id] = {
+                    "username": username,
+                    "track_id": track_id,
+                    "track_name": track_name,
+                    "track_mbid": track_mbid,
+                    "artist_name": artist_name,
+                    "artist_mbid": artist_mbid,
+                    "tags": [],
+                    "ranks": [],
+                }
+            
+            track_tag_map[track_id]["tags"].append(tag)
+            track_tag_map[track_id]["ranks"].append(rank)
+        
         processed_count += 1
-        if processed_count % 5 == 0 or processed_count == total_tags:
+        if processed_count % 5 == 0 or processed_count == len(top_tags):
             print(
-                f"Processed {processed_count}/{total_tags} source tags for {username}"
+                f"Processed {processed_count}/{len(top_tags)} tags for {username}, "
+                f"found {len(track_tag_map)} unique tracks"
             )
 
-    # Convert to DataFrame and deduplicate
+    # Filter tracks by minimum tag matches and calculate scores
+    all_candidates = []
+    for track_id, track_data in track_tag_map.items():
+        tag_match_count = len(track_data["tags"])
+        
+        if tag_match_count < min_tag_matches:
+            continue
+        
+        # Score: tag matches (primary) + inverse average rank (secondary)
+        avg_rank = sum(track_data["ranks"]) / len(track_data["ranks"])
+        score = tag_match_count * 1000 + (100 - avg_rank)
+        
+        all_candidates.append(
+            {
+                "username": track_data["username"],
+                "track_id": track_data["track_id"],
+                "track_name": track_data["track_name"],
+                "track_mbid": track_data["track_mbid"],
+                "artist_name": track_data["artist_name"],
+                "artist_mbid": track_data["artist_mbid"],
+                "tag_match_count": tag_match_count,
+                "avg_rank": avg_rank,
+                "score": score,
+                "source_tags": ",".join(track_data["tags"]),
+            }
+        )
+    
+    print(
+        f"After filtering for min {min_tag_matches} tag matches: "
+        f"{len(all_candidates)} candidates"
+    )
+
+    # Convert to DataFrame and limit
     if not all_candidates:
-        # Create empty DataFrame with correct schema
         df = pl.DataFrame(
             schema={
                 "username": pl.String,
@@ -431,40 +455,35 @@ def generate_similar_tag_candidates(
                 "track_mbid": pl.String,
                 "artist_name": pl.String,
                 "artist_mbid": pl.String,
-                "listeners": pl.Int64,
-                "playcount": pl.Int64,
-                "score": pl.Int64,
-                "source_tag": pl.String,
+                "tag_match_count": pl.Int64,
+                "avg_rank": pl.Float64,
+                "score": pl.Float64,
+                "source_tags": pl.String,
             }
         )
     else:
         df = pl.DataFrame(all_candidates)
-        df = (
-            df.unique(subset=["track_id"])
-            .sort("score", descending=True)
-            .limit(max_total_candidates)
+        # Ensure proper types to avoid Null dtype issues
+        df = df.with_columns(
+            pl.col("username").cast(pl.String),
+            pl.col("track_id").cast(pl.String),
+            pl.col("track_name").cast(pl.String),
+            pl.col("track_mbid").cast(pl.String),
+            pl.col("artist_name").cast(pl.String),
+            pl.col("artist_mbid").cast(pl.String),
+            pl.col("tag_match_count").cast(pl.Int64),
+            pl.col("avg_rank").cast(pl.Float64),
+            pl.col("score").cast(pl.Float64),
+            pl.col("source_tags").cast(pl.String),
         )
+        df = df.sort("score", descending=True).limit(max_total_candidates)
 
-    # Ensure stable schema types (avoid Null dtypes)
-    df = df.with_columns(
-        pl.col("username").cast(pl.String),
-        pl.col("track_id").cast(pl.String),
-        pl.col("track_name").cast(pl.String),
-        pl.col("track_mbid").cast(pl.String),
-        pl.col("artist_name").cast(pl.String),
-        pl.col("artist_mbid").cast(pl.String),
-        pl.col("listeners").cast(pl.Int64),
-        pl.col("playcount").cast(pl.Int64),
-        pl.col("score").cast(pl.Int64),
-        pl.col("source_tag").cast(pl.String),
-    )
-
-    # Write to silver Delta table (merge for incrementality)
+    # Write to silver Delta table (overwrite for this user since we process full tag profile)
     write_meta = delta_mgr_silver.write_delta(
         df,
         table_name="candidate_similar_tag",
         mode="merge",
-        predicate="s.track_id = t.track_id AND s.username = t.username",
+        predicate="s.username = t.username",
         partition_by="username",
     )
 
@@ -728,30 +747,62 @@ def merge_candidate_sources(username: str) -> dict[str, Any]:
     similar_tags_lf = delta_mgr_silver.read_delta("candidate_similar_tag")
     deep_cuts_lf = delta_mgr_silver.read_delta("candidate_deep_cut")
 
-    # Normalize schemas - deep_cuts has album_name, others don't
-    # Add missing columns with defaults
-    similar_artists_typed = similar_artists_lf.with_columns(
-        pl.lit(None).cast(pl.String).alias("album_name")
-        if "album_name" not in similar_artists_lf.collect_schema().names()
-        else pl.col("album_name"),
-        pl.lit(True).alias("similar_artist"),
-        pl.lit(False).alias("similar_tag"),
-        pl.lit(False).alias("deep_cut_same_artist"),
+    # Normalize schemas across different sources
+    # similar_artists: has listeners, playcount, score (int)
+    # similar_tags: has tag_match_count, avg_rank, score (float)
+    # deep_cuts: has album_name, listeners, playcount, score (float)
+    
+    similar_artists_typed = (
+        similar_artists_lf
+        .filter(pl.col("username") == username)
+        .with_columns(
+            pl.lit(None).cast(pl.String).alias("album_name"),
+            pl.lit(True).alias("similar_artist"),
+            pl.lit(False).alias("similar_tag"),
+            pl.lit(False).alias("deep_cut_same_artist"),
+            pl.col("score").cast(pl.Float64),
+        )
+        .select([
+            "username", "track_id", "track_name", "track_mbid",
+            "artist_name", "artist_mbid", "album_name",
+            "listeners", "playcount", "score",
+            "similar_artist", "similar_tag", "deep_cut_same_artist",
+        ])
     )
 
-    similar_tags_typed = similar_tags_lf.with_columns(
-        pl.lit(None).cast(pl.String).alias("album_name")
-        if "album_name" not in similar_tags_lf.collect_schema().names()
-        else pl.col("album_name"),
-        pl.lit(False).alias("similar_artist"),
-        pl.lit(True).alias("similar_tag"),
-        pl.lit(False).alias("deep_cut_same_artist"),
+    similar_tags_typed = (
+        similar_tags_lf
+        .filter(pl.col("username") == username)
+        .with_columns(
+            pl.lit(None).cast(pl.String).alias("album_name"),
+            pl.lit(None).cast(pl.Int64).alias("listeners"),
+            pl.lit(None).cast(pl.Int64).alias("playcount"),
+            pl.lit(False).alias("similar_artist"),
+            pl.lit(True).alias("similar_tag"),
+            pl.lit(False).alias("deep_cut_same_artist"),
+        )
+        .select([
+            "username", "track_id", "track_name", "track_mbid",
+            "artist_name", "artist_mbid", "album_name",
+            "listeners", "playcount", "score",
+            "similar_artist", "similar_tag", "deep_cut_same_artist",
+        ])
     )
 
-    deep_cuts_typed = deep_cuts_lf.with_columns(
-        pl.lit(False).alias("similar_artist"),
-        pl.lit(False).alias("similar_tag"),
-        pl.lit(True).alias("deep_cut_same_artist"),
+    deep_cuts_typed = (
+        deep_cuts_lf
+        .filter(pl.col("username") == username)
+        .with_columns(
+            pl.lit(False).alias("similar_artist"),
+            pl.lit(False).alias("similar_tag"),
+            pl.lit(True).alias("deep_cut_same_artist"),
+        )
+        .select([
+            "username", "track_id", "track_name", "track_mbid",
+            "artist_name", "artist_mbid", "album_name",
+            "listeners", "playcount", "score",
+            "similar_artist", "similar_tag", "deep_cut_same_artist",
+        ])
     )
 
     # Concatenate all sources
