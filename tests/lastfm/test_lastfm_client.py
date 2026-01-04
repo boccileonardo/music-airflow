@@ -5,14 +5,11 @@ Tests API client methods including pagination, error handling,
 filtering, and retry logic.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from music_airflow.lastfm_client import LastFMClient
-
-
-pytestmark = pytest.mark.asyncio
 
 
 class TestLastFMClientInit:
@@ -47,6 +44,7 @@ class TestGetRecentTracks:
     """Test get_recent_tracks method."""
 
     @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
     async def test_basic_fetch(self, mock_request, sample_tracks_response):
         """Test basic track fetching."""
         mock_request.return_value = sample_tracks_response
@@ -61,6 +59,7 @@ class TestGetRecentTracks:
         assert tracks[2]["name"] == "Paint It Black"
 
     @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
     async def test_single_track_response(
         self, mock_request, sample_single_track_response
     ):
@@ -74,6 +73,7 @@ class TestGetRecentTracks:
         assert tracks[0]["name"] == "Creep"
 
     @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
     async def test_filters_now_playing(self, mock_request, sample_now_playing_response):
         """Test that now-playing tracks are filtered out."""
         mock_request.return_value = sample_now_playing_response
@@ -87,6 +87,7 @@ class TestGetRecentTracks:
         assert "date" in tracks[0]
 
     @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
     async def test_empty_response(self, mock_request, sample_empty_response):
         """Test handling empty response."""
         mock_request.return_value = sample_empty_response
@@ -97,6 +98,7 @@ class TestGetRecentTracks:
         assert len(tracks) == 0
 
     @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
     async def test_pagination(
         self,
         mock_request,
@@ -120,6 +122,7 @@ class TestGetRecentTracks:
         assert tracks[2]["name"] == "Track 3"
 
     @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
     async def test_with_time_range(self, mock_request, sample_tracks_response):
         """Test fetching with from/to timestamps."""
         mock_request.return_value = sample_tracks_response
@@ -135,19 +138,21 @@ class TestGetRecentTracks:
         assert call_args["to"] == 1609545600
         assert len(tracks) == 3
 
-    def test_no_username_raises(self):
+    @pytest.mark.asyncio
+    async def test_no_username_raises(self):
         """Test that missing username raises error."""
         client = LastFMClient(api_key="test_key")
         with pytest.raises(ValueError, match="Username must be provided"):
-            client.get_recent_tracks()
+            await client.get_recent_tracks()
 
-    def test_uses_instance_username(self):
+    @pytest.mark.asyncio
+    async def test_uses_instance_username(self):
         """Test that instance username is used when not provided."""
         with patch.object(LastFMClient, "_make_request") as mock_request:
             mock_request.return_value = {"recenttracks": {"track": []}}
 
             client = LastFMClient(api_key="test_key", username="default_user")
-            client.get_recent_tracks()
+            await client.get_recent_tracks()
 
             call_args = mock_request.call_args[0][0]
             assert call_args["user"] == "default_user"
@@ -156,117 +161,147 @@ class TestGetRecentTracks:
 class TestArtistErrorHandling:
     """Test error code 6 (artist not found) handling."""
 
-    @patch("requests.get")
-    def test_get_similar_artists_handles_error_6(self, mock_get):
+    @pytest.mark.asyncio
+    async def test_get_similar_artists_handles_error_6(self):
         """Test that error code 6 returns empty list for get_similar_artists."""
-        mock_response = MagicMock()
+        mock_response = AsyncMock()
         mock_response.json.return_value = {
             "error": 6,
             "message": "The artist you supplied could not be found",
         }
-        mock_get.return_value = mock_response
+        mock_response.raise_for_status = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_response
 
         client = LastFMClient(api_key="test_key")
-        result = client.get_similar_artists("NonExistentArtist")
+        client._session = mock_session
 
+        result = await client.get_similar_artists("NonExistentArtist")
         assert result == []
 
-    @patch("requests.get")
-    def test_get_artist_top_tracks_handles_error_6(self, mock_get):
+    @pytest.mark.asyncio
+    async def test_get_artist_top_tracks_handles_error_6(self):
         """Test that error code 6 returns empty list for get_artist_top_tracks."""
-        mock_response = MagicMock()
+        mock_response = AsyncMock()
         mock_response.json.return_value = {
             "error": 6,
             "message": "The artist you supplied could not be found",
         }
-        mock_get.return_value = mock_response
+        mock_response.raise_for_status = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_response
 
         client = LastFMClient(api_key="test_key")
-        result = client.get_artist_top_tracks("NonExistentArtist")
+        client._session = mock_session
 
+        result = await client.get_artist_top_tracks("NonExistentArtist")
         assert result == []
 
-    @patch("requests.get")
-    def test_get_artist_top_albums_handles_error_6(self, mock_get):
+    @pytest.mark.asyncio
+    async def test_get_artist_top_albums_handles_error_6(self):
         """Test that error code 6 returns empty list for get_artist_top_albums."""
-        mock_response = MagicMock()
+        mock_response = AsyncMock()
         mock_response.json.return_value = {
             "error": 6,
             "message": "The artist you supplied could not be found",
         }
-        mock_get.return_value = mock_response
+        mock_response.raise_for_status = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_response
 
         client = LastFMClient(api_key="test_key")
-        result = client.get_artist_top_albums("NonExistentArtist")
+        client._session = mock_session
 
+        result = await client.get_artist_top_albums("NonExistentArtist")
         assert result == []
 
-    @patch("requests.get")
-    def test_get_artist_info_handles_error_6(self, mock_get):
+    @pytest.mark.asyncio
+    async def test_get_artist_info_handles_error_6(self):
         """Test that error code 6 returns empty dict for get_artist_info."""
-        mock_response = MagicMock()
+        mock_response = AsyncMock()
         mock_response.json.return_value = {
             "error": 6,
             "message": "The artist you supplied could not be found",
         }
-        mock_get.return_value = mock_response
+        mock_response.raise_for_status = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_response
 
         client = LastFMClient(api_key="test_key")
-        result = client.get_artist_info("NonExistentArtist")
+        client._session = mock_session
 
+        result = await client.get_artist_info("NonExistentArtist")
         assert result == {}
 
-    @patch("requests.get")
-    def test_artist_methods_reraise_other_errors(self, mock_get):
+    @pytest.mark.asyncio
+    async def test_artist_methods_reraise_other_errors(self):
         """Test that non-error-6 exceptions are still raised."""
-        mock_response = MagicMock()
+        mock_response = AsyncMock()
         mock_response.json.return_value = {
             "error": 10,
             "message": "Invalid API key",
         }
-        mock_get.return_value = mock_response
+        mock_response.raise_for_status = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_response
 
         client = LastFMClient(api_key="test_key")
+        client._session = mock_session
 
         with pytest.raises(ValueError, match="Last.fm API error 10"):
-            client.get_similar_artists("TestArtist")
+            await client.get_similar_artists("TestArtist")
 
         with pytest.raises(ValueError, match="Last.fm API error 10"):
-            client.get_artist_top_tracks("TestArtist")
+            await client.get_artist_top_tracks("TestArtist")
 
         with pytest.raises(ValueError, match="Last.fm API error 10"):
-            client.get_artist_top_albums("TestArtist")
+            await client.get_artist_top_albums("TestArtist")
 
         with pytest.raises(ValueError, match="Last.fm API error 10"):
-            client.get_artist_info("TestArtist")
+            await client.get_artist_info("TestArtist")
 
 
 class TestMakeRequest:
     """Test _make_request method and retry logic."""
 
-    @patch("requests.get")
-    def test_successful_request(self, mock_get, sample_tracks_response):
+    @pytest.mark.asyncio
+    async def test_successful_request(self, sample_tracks_response):
         """Test successful API request."""
-        mock_response = MagicMock()
+        mock_response = AsyncMock()
         mock_response.json.return_value = sample_tracks_response
-        mock_get.return_value = mock_response
+        mock_response.raise_for_status = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_response
 
         client = LastFMClient(api_key="test_key")
-        result = client._make_request({"method": "user.getrecenttracks"})
+        client._session = mock_session
+
+        result = await client._make_request({"method": "user.getrecenttracks"})
 
         assert result == sample_tracks_response
         mock_response.raise_for_status.assert_called_once()
 
-    @patch("requests.get")
-    def test_api_error_response(self, mock_get, sample_error_response):
+    @pytest.mark.asyncio
+    async def test_api_error_response(self, sample_error_response):
         """Test Last.fm API error response."""
-        mock_response = MagicMock()
+        mock_response = AsyncMock()
         mock_response.json.return_value = sample_error_response
-        mock_get.return_value = mock_response
+        mock_response.raise_for_status = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_response
 
         client = LastFMClient(api_key="test_key")
+        client._session = mock_session
+
         with pytest.raises(ValueError, match="Last.fm API error 6: User not found"):
-            client._make_request({"method": "user.getinfo"})
+            await client._make_request({"method": "user.getinfo"})
 
     # Note: HTTP error retry tests removed - we now use aiohttp with async/await
     # Retry logic is still present via tenacity decorator but testing it requires
@@ -277,6 +312,7 @@ class TestGetUserInfo:
     """Test get_user_info method."""
 
     @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
     async def test_get_user_info(self, mock_request, sample_user_info):
         """Test fetching user information."""
         mock_request.return_value = sample_user_info
@@ -287,19 +323,21 @@ class TestGetUserInfo:
         assert user["name"] == "testuser"
         assert user["playcount"] == "12345"
 
-    def test_no_username_raises(self):
+    @pytest.mark.asyncio
+    async def test_no_username_raises(self):
         """Test that missing username raises error."""
         client = LastFMClient(api_key="test_key")
         with pytest.raises(ValueError, match="Username must be provided"):
-            client.get_user_info()
+            await client.get_user_info()
 
-    def test_uses_instance_username(self):
+    @pytest.mark.asyncio
+    async def test_uses_instance_username(self):
         """Test that instance username is used when not provided."""
         with patch.object(LastFMClient, "_make_request") as mock_request:
             mock_request.return_value = {"user": {}}
 
             client = LastFMClient(api_key="test_key", username="default_user")
-            client.get_user_info()
+            await client.get_user_info()
 
             call_args = mock_request.call_args[0][0]
             assert call_args["user"] == "default_user"

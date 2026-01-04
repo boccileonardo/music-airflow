@@ -541,28 +541,26 @@ async def generate_similar_tag_candidates(
 async def generate_deep_cut_candidates(
     username: str,
     min_listeners: int = 100,
-    max_listeners: int = 50000,
     max_candidates: int = 300,
     top_artists_count: int = 30,
 ) -> dict[str, Any]:
     """
-    Generate deep cut (obscure) track candidates from user's top artists (via Last.fm API).
+    Generate track candidates from user's top artists that they haven't played (via Last.fm API).
 
     Strategy:
     1. Get artists user has played, ranked by play count
     2. Take top N artists (highest play count)
     3. For each artist, call artist.getTopAlbums
-    4. Filter albums with reasonable listener counts (exclude bad editions)
+    4. Filter albums with minimum listener threshold (quality filter)
     5. For each album, call album.getInfo to get tracklist
-    6. Find lesser-played tracks from these albums
+    6. Collect all tracks from these albums
     7. Exclude tracks user has already played
 
     Saves results to data/silver/candidate_deep_cut/ Delta table.
 
     Args:
         username: Target user
-        min_listeners: Minimum listeners (quality threshold)
-        max_listeners: Maximum listeners (obscurity threshold)
+        min_listeners: Minimum album listeners (quality threshold)
         max_candidates: Maximum number of candidates
         top_artists_count: Number of top artists to process
 
@@ -579,15 +577,21 @@ async def generate_deep_cut_candidates(
     artists_lf = delta_mgr_silver.read_delta("artists")
 
     # Get user's top artists by play count (id + name)
+    # Filter to only artists with valid MBID (excludes compilation channels, etc.)
     top_artists_lf = (
         plays_lf.select("track_id")
         .join(tracks_lf.select("track_id", "artist_id"), on="track_id", how="left")
         .join(
-            artists_lf.select("artist_id", "artist_name"),
+            artists_lf.select("artist_id", "artist_name", "artist_mbid"),
             on="artist_id",
             how="left",
         )
-        .filter(pl.col("artist_id").is_not_null() & pl.col("artist_name").is_not_null())
+        .filter(
+            pl.col("artist_id").is_not_null()
+            & pl.col("artist_name").is_not_null()
+            & pl.col("artist_mbid").is_not_null()
+            & (pl.col("artist_mbid") != "")
+        )
         .group_by(["artist_id", "artist_name"])
         .agg(pl.len().alias("play_count"))
         .sort("play_count", descending=True)
@@ -641,6 +645,8 @@ async def generate_deep_cut_candidates(
         # Prepare album info requests
         album_info_tasks = []
         album_metadata = []  # Store context for each album request
+        total_albums_received = 0
+        albums_filtered_by_min_listeners = 0
 
         for idx, top_albums in enumerate(all_artist_albums):
             if isinstance(top_albums, Exception):
@@ -652,12 +658,14 @@ async def generate_deep_cut_candidates(
                 print(f"Unexpected type for albums: {type(top_albums)}")
                 continue
 
+            total_albums_received += len(top_albums)
             # Filter albums with reasonable listener counts
             filtered_albums = [
                 album
                 for album in top_albums
                 if int(album.get("playcount", 0)) >= min_listeners
             ]
+            albums_filtered_by_min_listeners += len(top_albums) - len(filtered_albums)
 
             # Queue album info requests (limit to top 10 albums)
             for album in filtered_albums[:10]:
@@ -681,15 +689,21 @@ async def generate_deep_cut_candidates(
                 )
 
         # Fetch all album info concurrently
-        print(f"Fetching track info for {len(album_info_tasks)} albums...")
+        print(
+            f"Fetching track info for {len(album_info_tasks)} albums "
+            f"(received {total_albums_received} total, filtered {albums_filtered_by_min_listeners} by min_listeners={min_listeners})..."
+        )
         all_album_info = await asyncio.gather(*album_info_tasks, return_exceptions=True)
 
         # Process all results
+        total_tracks_examined = 0
+        tracks_filtered_by_album_listeners = 0
+        tracks_filtered_by_already_played = 0
+        album_info_failures = 0
+
         for album_info, metadata in zip(all_album_info, album_metadata):
             if isinstance(album_info, Exception):
-                print(
-                    f"Failed to fetch info for album '{metadata['album_name']}': {album_info}"
-                )
+                album_info_failures += 1
                 continue
 
             tracks = album_info.get("tracks", {})
@@ -703,6 +717,8 @@ async def generate_deep_cut_candidates(
             if isinstance(track_list, dict):
                 track_list = [track_list]
 
+            total_tracks_examined += len(track_list)
+
             for track in track_list:
                 track_name = track.get("name")
                 track_mbid = track.get("mbid", "")
@@ -710,7 +726,8 @@ async def generate_deep_cut_candidates(
                     track_mbid = None
 
                 album_listeners = metadata["album_playcount"]
-                if not (min_listeners <= album_listeners <= max_listeners):
+                if album_listeners < min_listeners:
+                    tracks_filtered_by_album_listeners += 1
                     continue
 
                 track_id = (
@@ -719,6 +736,7 @@ async def generate_deep_cut_candidates(
                     else f"{track_name}|{metadata['artist_name']}"
                 )
                 if track_id in played_track_ids_set:
+                    tracks_filtered_by_already_played += 1
                     continue
 
                 all_candidates.append(
@@ -732,14 +750,19 @@ async def generate_deep_cut_candidates(
                         "album_name": metadata["album_name"],
                         "listeners": album_listeners,
                         "playcount": album_listeners,
-                        "score": 1.0 / (album_listeners + 1),
+                        "score": float(album_listeners),
                         "source_artist_name": metadata["artist_name"],
                         "source_artist_id": metadata["artist_id"],
                     }
                 )
 
         print(
-            f"Processed all {total_artists} deep-cut artists for {username}, found {len(all_candidates)} candidates"
+            f"Deep-cut generation for {username}: "
+            f"examined {total_tracks_examined} tracks from {len(album_info_tasks)} albums, "
+            f"filtered {tracks_filtered_by_album_listeners} by min_listeners ({min_listeners}), "
+            f"filtered {tracks_filtered_by_already_played} already played, "
+            f"{album_info_failures} album info failures, "
+            f"result: {len(all_candidates)} candidates"
         )
 
     # Convert to DataFrame and deduplicate

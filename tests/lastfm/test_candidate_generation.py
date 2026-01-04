@@ -68,10 +68,12 @@ def _write_silver_base_tables(patched_delta_io):
     )
 
     # Artists: map artist_id -> artist_name and tags
+    # Include artist_mbid for deep cut filtering
     artists_df = pl.DataFrame(
         {
             "artist_id": ["a1", "b1", "c1"],
             "artist_name": ["Artist A", "Artist B", "Artist C"],
+            "artist_mbid": ["a_mbid", "b_mbid", "c_mbid"],
             "tags": ["rock,indie,alt", "indie", "rock"],
         }
     )
@@ -254,16 +256,16 @@ class TestDeepCutCandidates:
             client = MockClient.return_value
             client.__aenter__ = AsyncMock(return_value=client)
             client.__aexit__ = AsyncMock(return_value=None)
-            # Top albums for Artist A, include one valid album
+            # Top albums for Artist A, include both albums (no upper limit now)
             client.get_artist_top_albums = AsyncMock(
                 return_value=[
                     {
-                        "name": "Obscure Album",
+                        "name": "Album One",
                         "playcount": 10000,
                         "artist": {"mbid": "a_mbid"},
                     },
                     {
-                        "name": "Too Popular",
+                        "name": "Album Two",
                         "playcount": 1000000,
                         "artist": {"mbid": "a_mbid"},
                     },
@@ -272,14 +274,23 @@ class TestDeepCutCandidates:
 
             # Album info returns track list including one already played
             async def mock_album_info(album_name, artist_name):
-                return {
-                    "tracks": {
-                        "track": [
-                            {"name": "Hidden Gem", "mbid": "hg_mbid"},
-                            {"name": "Known", "mbid": ""},
-                        ]
+                if album_name == "Album One":
+                    return {
+                        "tracks": {
+                            "track": [
+                                {"name": "Hidden Gem", "mbid": "hg_mbid"},
+                                {"name": "Known", "mbid": ""},
+                            ]
+                        }
                     }
-                }
+                else:  # Album Two
+                    return {
+                        "tracks": {
+                            "track": [
+                                {"name": "Popular Track", "mbid": "pt_mbid"},
+                            ]
+                        }
+                    }
 
             client.get_album_info = mock_album_info
 
@@ -291,10 +302,11 @@ class TestDeepCutCandidates:
         assert result["table_name"] == "candidate_deep_cut"
         out_path = Path(result["path"])  # data/silver/candidate_deep_cut
         assert out_path.exists()
-        df = pl.read_delta(str(out_path))
-        # Only Hidden Gem should remain; Too Popular filtered by max_listeners; prefer MBID when present
-        assert df["track_id"].to_list() == ["hg_mbid"]
-        assert df["album_name"].to_list() == ["Obscure Album"]
+        df = pl.read_delta(str(out_path)).sort("track_id")
+        # Both Hidden Gem and Popular Track should be included (no max_listeners filter)
+        # Known|Artist A is filtered because already played
+        assert df["track_id"].to_list() == ["hg_mbid", "pt_mbid"]
+        assert set(df["album_name"].to_list()) == {"Album One", "Album Two"}
 
 
 class TestMergeCandidateSources:

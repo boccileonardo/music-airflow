@@ -290,8 +290,9 @@ class TestExtractTracksToBronze:
         assert "tracks/" in result["filename"]
         assert mock_client.get_track_info.call_count == 2
 
+    @pytest.mark.asyncio
     @patch("music_airflow.extract.dimensions.PolarsDeltaIOManager")
-    def test_extract_no_new_tracks_raises_skip(self, mock_delta_io):
+    async def test_extract_no_new_tracks_raises_skip(self, mock_delta_io):
         """Test that no new tracks raises AirflowSkipException."""
         # Setup: plays and existing tracks are the same
         plays_df = pl.LazyFrame(
@@ -325,7 +326,7 @@ class TestExtractTracksToBronze:
 
         # Execute and verify
         with pytest.raises(AirflowSkipException, match="No new tracks to fetch"):
-            extract_tracks_to_bronze()
+            await extract_tracks_to_bronze()
 
 
 class TestExtractArtistsToBronze:
@@ -589,12 +590,16 @@ class TestTransformArtistsToSilver:
         # Mock LastFMClient.search_artist to return an MBID for "Likely Valid"
         mock_client = MagicMock()
 
-        def _search_artist(name, limit=1):  # type: ignore[unused-argument]
+        async def _search_artist(name, limit=1):  # type: ignore[unused-argument]
             if name == "Likely Valid":
                 return [{"name": name, "mbid": "mbid-123"}]
             return []
 
         mock_client.search_artist.side_effect = _search_artist
+
+        # Mock the async context manager
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client_class.return_value = mock_client
 
         # Patch IO managers
@@ -699,8 +704,9 @@ class TestTransformArtistsToSilver:
 class TestExtractWithoutPlaysData:
     """Test extraction functions when plays data doesn't exist yet."""
 
+    @pytest.mark.asyncio
     @patch("music_airflow.extract.dimensions.PolarsDeltaIOManager")
-    def test_extract_tracks_skips_without_plays(self, mock_delta_io):
+    async def test_extract_tracks_skips_without_plays(self, mock_delta_io):
         """Test that extract_tracks_to_bronze skips when no plays data exists."""
         # Mock IO manager to raise FileNotFoundError when reading plays
         mock_plays_io = MagicMock()
@@ -711,12 +717,13 @@ class TestExtractWithoutPlaysData:
 
         # Should raise AirflowSkipException
         with pytest.raises(AirflowSkipException) as exc_info:
-            extract_tracks_to_bronze()
+            await extract_tracks_to_bronze()
 
         assert "No plays data available yet" in str(exc_info.value)
 
+    @pytest.mark.asyncio
     @patch("music_airflow.extract.dimensions.PolarsDeltaIOManager")
-    def test_extract_artists_skips_without_plays(self, mock_delta_io):
+    async def test_extract_artists_skips_without_plays(self, mock_delta_io):
         """Test that extract_artists_to_bronze skips when no plays data exists."""
         # Mock IO manager to raise FileNotFoundError when reading plays
         mock_plays_io = MagicMock()
@@ -727,7 +734,7 @@ class TestExtractWithoutPlaysData:
 
         # Should raise AirflowSkipException
         with pytest.raises(AirflowSkipException) as exc_info:
-            extract_artists_to_bronze()
+            await extract_artists_to_bronze()
 
         assert "No plays data available yet" in str(exc_info.value)
 
