@@ -169,6 +169,8 @@ def _enrich_missing_artist_mbids(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
     Enrich missing artist MBIDs by consulting Last.fm artist.search and
     falling back to MusicBrainz search. Then recompute artist_id.
     """
+    import asyncio
+
     artist_names = (
         artists_lf.select("artist_name")
         .unique()
@@ -180,23 +182,46 @@ def _enrich_missing_artist_mbids(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
     if not artist_names:
         return artists_lf
 
-    client = LastFMClient(api_key=None)
-    mapping_df = pl.DataFrame(
-        schema={"artist_name": pl.Utf8, "enriched_artist_mbid": pl.Utf8}
-    )
-    for name in artist_names:
-        print("Enriching MBID for artist:", name)
-        mbid: str | None = None
-        last_fm_search_result = client.search_artist(name, limit=1)
-        if last_fm_search_result:
-            mbid = last_fm_search_result[0].get("mbid")
-        if not mbid:
-            print("Falling back to MusicBrainz search for artist:", name)
-            mbid = _search_musicbrainz_artist_mbid(name)
-        if mbid:
-            mapping_df = mapping_df.vstack(
-                pl.DataFrame([{"artist_name": name, "enriched_artist_mbid": mbid}])
+    async def _enrich_artist_names():
+        async with LastFMClient(api_key=None) as client:
+            # Fetch all Last.fm searches concurrently
+            search_tasks = [
+                client.search_artist(name, limit=1) for name in artist_names
+            ]
+
+            print(
+                f"Searching for MBIDs for {len(artist_names)} artists concurrently..."
             )
+            all_search_results = await asyncio.gather(
+                *search_tasks, return_exceptions=True
+            )
+
+            # Process results and build mapping
+            mapping_data = []
+            for name, search_result in zip(artist_names, all_search_results):
+                mbid: str | None = None
+
+                if isinstance(search_result, Exception):
+                    print(f"Last.fm search failed for artist '{name}': {search_result}")
+                elif search_result and len(search_result) > 0:
+                    mbid = search_result[0].get("mbid")
+
+                # Fallback to MusicBrainz if Last.fm didn't return MBID
+                if not mbid:
+                    print("Falling back to MusicBrainz search for artist:", name)
+                    mbid = _search_musicbrainz_artist_mbid(name)
+
+                if mbid:
+                    mapping_data.append(
+                        {"artist_name": name, "enriched_artist_mbid": mbid}
+                    )
+
+            return pl.DataFrame(
+                mapping_data,
+                schema={"artist_name": pl.Utf8, "enriched_artist_mbid": pl.Utf8},
+            )
+
+    mapping_df = asyncio.run(_enrich_artist_names())
 
     if mapping_df.is_empty():
         return artists_lf

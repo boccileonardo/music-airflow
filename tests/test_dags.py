@@ -75,7 +75,7 @@ class TestLastFmPlaysDag:
 
         assert dag is not None
         assert dag.schedule == "@daily"
-        assert dag.start_date == dt.datetime(2025, 12, 25, tzinfo=dt.timezone.utc)
+        assert dag.start_date == dt.datetime(2025, 11, 1, tzinfo=dt.timezone.utc)
         assert dag.catchup is True
         assert dag.max_active_runs == 1
         assert "lastfm" in dag.tags

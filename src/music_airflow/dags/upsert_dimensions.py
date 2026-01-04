@@ -58,9 +58,10 @@ def lastfm_dimensions():
         Returns:
             Metadata dict with filename, path, rows, tracks_fetched
         """
+        import asyncio
         from music_airflow.extract import extract_tracks_to_bronze
 
-        return extract_tracks_to_bronze()
+        return asyncio.run(extract_tracks_to_bronze())
 
     @task(multiple_outputs=False)
     def fetch_artists() -> dict[str, Any]:
@@ -73,9 +74,10 @@ def lastfm_dimensions():
         Returns:
             Metadata dict with filename, path, rows, artists_fetched
         """
+        import asyncio
         from music_airflow.extract import extract_artists_to_bronze
 
-        return extract_artists_to_bronze()
+        return asyncio.run(extract_artists_to_bronze())
 
     @task(multiple_outputs=False, outlets=[tracks_asset])
     def transform_tracks(fetch_metadata: dict[str, Any]) -> dict[str, Any]:

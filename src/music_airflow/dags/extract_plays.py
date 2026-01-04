@@ -67,6 +67,7 @@ def lastfm_plays():
         Raises:
             AirflowSkipException: If no plays found for the date range
         """
+        import asyncio
         from airflow.sdk import get_current_context
 
         # Get data_interval_start from Airflow context
@@ -82,7 +83,7 @@ def lastfm_plays():
         from_dt = interval_start - dt.timedelta(days=1)
         to_dt = interval_start
 
-        return extract_plays_to_bronze(username, from_dt, to_dt)
+        return asyncio.run(extract_plays_to_bronze(username, from_dt, to_dt))
 
     @task(multiple_outputs=False, outlets=[plays_asset])
     def transform_and_save(fetch_metadata: dict[str, Any]) -> dict[str, Any]:

@@ -11,11 +11,11 @@ Returns DataFrames for silver-layer storage; DAG consolidates into single gold t
 # todo: fix deep cuts
 # todo: add old favorites (from previous play history)
 # todo: fix unnecessary collects and sets
-# todo: handle artist not found error in generate artists
 
 from deltalake.exceptions import TableNotFoundError
 from typing import Any
 
+import asyncio
 import polars as pl
 
 from music_airflow.lastfm_client import LastFMClient
@@ -29,7 +29,7 @@ __all__ = [
 ]
 
 
-def generate_similar_artist_candidates(
+async def generate_similar_artist_candidates(
     username: str,
     min_listeners: int = 1000,
     max_candidates_per_artist: int = 10,
@@ -61,7 +61,6 @@ def generate_similar_artist_candidates(
     Returns:
         Metadata dict with path, rows, table_name
     """
-    client = LastFMClient()
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load user's plays
@@ -126,31 +125,73 @@ def generate_similar_artist_candidates(
 
     # Collect candidate tracks
     all_candidates: list[dict[str, Any]] = []
-    processed_count = 0
 
-    for artist_name, artist_id in zip(
-        artists_to_process["artist_name"].to_list(),
-        artists_to_process["artist_id"].to_list(),
-    ):
-        # Get similar artists
-        similar_artists = client.get_similar_artists(artist_name, limit=30)
+    async with LastFMClient() as client:
+        # Fetch all similar artists concurrently
+        artist_names = artists_to_process["artist_name"].to_list()
+        artist_ids = artists_to_process["artist_id"].to_list()
 
-        # Filter out clones/false positives
-        filtered_similar = [
-            a
-            for a in similar_artists
-            if float(a.get("match", 0)) <= similarity_threshold
+        similar_artist_tasks = [
+            client.get_similar_artists(artist_name, limit=30)
+            for artist_name in artist_names
         ]
+        all_similar_artists = await asyncio.gather(
+            *similar_artist_tasks, return_exceptions=True
+        )
 
-        # Get top tracks from each similar artist (limit to top 10 similar)
-        for similar_artist in filtered_similar[:10]:
-            similar_artist_name = similar_artist.get("name")
-            if not similar_artist_name:
+        # Process results and gather top track requests
+        top_track_tasks = []
+        task_metadata = []  # Store (source_artist_name, source_artist_id) for each task
+
+        for idx, similar_artists in enumerate(all_similar_artists):
+            if isinstance(similar_artists, Exception):
+                print(
+                    f"Failed to fetch similar artists for {artist_names[idx]}: {similar_artists}"
+                )
                 continue
 
-            top_tracks = client.get_artist_top_tracks(
-                similar_artist_name, limit=max_candidates_per_artist
-            )
+            # Type guard: similar_artists is list here
+            if not isinstance(similar_artists, list):
+                print(f"Unexpected type for similar artists: {type(similar_artists)}")
+                continue
+
+            # Filter out clones/false positives
+            filtered_similar = [
+                a
+                for a in similar_artists
+                if float(a.get("match", 0)) <= similarity_threshold
+            ]
+
+            # Queue top track requests for each similar artist (limit to top 10)
+            for similar_artist in filtered_similar[:10]:
+                similar_artist_name = similar_artist.get("name")
+                if not similar_artist_name:
+                    continue
+
+                top_track_tasks.append(
+                    client.get_artist_top_tracks(
+                        similar_artist_name, limit=max_candidates_per_artist
+                    )
+                )
+                task_metadata.append(
+                    {
+                        "source_artist_name": artist_names[idx],
+                        "source_artist_id": artist_ids[idx],
+                        "similar_artist_name": similar_artist_name,
+                    }
+                )
+
+        # Fetch all top tracks concurrently
+        print(f"Fetching top tracks for {len(top_track_tasks)} similar artists...")
+        all_top_tracks = await asyncio.gather(*top_track_tasks, return_exceptions=True)
+
+        # Process all results
+        for top_tracks, metadata in zip(all_top_tracks, task_metadata):
+            if isinstance(top_tracks, Exception):
+                print(
+                    f"Failed to fetch top tracks for {metadata['similar_artist_name']}: {top_tracks}"
+                )
+                continue
 
             for track in top_tracks:
                 track_name = track.get("name")
@@ -159,10 +200,12 @@ def generate_similar_artist_candidates(
                     track_mbid = None
                 artist_info = track.get("artist", {})
                 if isinstance(artist_info, dict):
-                    artist_name_track = artist_info.get("name", similar_artist_name)
+                    artist_name_track = artist_info.get(
+                        "name", metadata["similar_artist_name"]
+                    )
                     artist_mbid = artist_info.get("mbid")
                 else:
-                    artist_name_track = similar_artist_name
+                    artist_name_track = metadata["similar_artist_name"]
                     artist_mbid = None
 
                 listeners = int(track.get("listeners", 0))
@@ -192,16 +235,14 @@ def generate_similar_artist_candidates(
                         "listeners": listeners,
                         "playcount": playcount,
                         "score": playcount,
-                        "source_artist_name": artist_name,
-                        "source_artist_id": artist_id,
+                        "source_artist_name": metadata["source_artist_name"],
+                        "source_artist_id": metadata["source_artist_id"],
                     }
                 )
 
-        processed_count += 1
-        if processed_count % 5 == 0 or processed_count == total_artists:
-            print(
-                f"Processed {processed_count}/{total_artists} similar-artist sources for {username}"
-            )
+        print(
+            f"Processed all {total_artists} similar-artist sources for {username}, found {len(all_candidates)} candidates"
+        )
 
     # Convert to DataFrame and deduplicate
     if not all_candidates:
@@ -245,7 +286,7 @@ def generate_similar_artist_candidates(
     }
 
 
-def generate_similar_tag_candidates(
+async def generate_similar_tag_candidates(
     username: str,
     top_tags_count: int = 30,
     tracks_per_tag: int = 30,
@@ -278,7 +319,6 @@ def generate_similar_tag_candidates(
     Returns:
         Metadata dict with path, rows, table_name
     """
-    client = LastFMClient()
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load data
@@ -355,59 +395,67 @@ def generate_similar_tag_candidates(
     # track_id -> {track_info, tags: [tag1, tag2, ...], ranks: [rank1, rank2, ...]}
     track_tag_map: dict[str, dict[str, Any]] = {}
 
-    processed_count = 0
-    for tag in top_tags:
-        top_tracks = client.get_tag_top_tracks(tag, limit=tracks_per_tag)
+    async with LastFMClient() as client:
+        # Fetch all tag top tracks concurrently
+        tag_tasks = [
+            client.get_tag_top_tracks(tag, limit=tracks_per_tag) for tag in top_tags
+        ]
+        print(f"Fetching top tracks for {len(top_tags)} tags...")
+        all_tag_tracks = await asyncio.gather(*tag_tasks, return_exceptions=True)
 
-        for track in top_tracks:
-            track_name = track.get("name")
-            track_mbid = track.get("mbid", "")
-            if track_mbid == "":
-                track_mbid = None
+        # Process all results
+        for tag, top_tracks in zip(top_tags, all_tag_tracks):
+            if isinstance(top_tracks, Exception):
+                print(f"Failed to fetch top tracks for tag '{tag}': {top_tracks}")
+                continue
 
-            artist_info = track.get("artist", {})
-            if isinstance(artist_info, dict):
-                artist_name = artist_info.get("name", "")
-                artist_mbid = artist_info.get("mbid", "")
-                if artist_mbid == "":
+            for track in top_tracks:
+                track_name = track.get("name")
+                track_mbid = track.get("mbid", "")
+                if track_mbid == "":
+                    track_mbid = None
+
+                artist_info = track.get("artist", {})
+                if isinstance(artist_info, dict):
+                    artist_name = artist_info.get("name", "")
+                    artist_mbid = artist_info.get("mbid", "")
+                    if artist_mbid == "":
+                        artist_mbid = None
+                else:
+                    artist_name = str(artist_info) if artist_info else ""
                     artist_mbid = None
-            else:
-                artist_name = str(artist_info) if artist_info else ""
-                artist_mbid = None
 
-            # Get rank from @attr
-            rank = int(track.get("@attr", {}).get("rank", 999))
-            if rank > max_rank:
-                continue
+                # Get rank from @attr
+                rank = int(track.get("@attr", {}).get("rank", 999))
+                if rank > max_rank:
+                    continue
 
-            track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
+                track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
 
-            # Skip if already played
-            if track_id in played_track_ids_set:
-                continue
+                # Skip if already played
+                if track_id in played_track_ids_set:
+                    continue
 
-            # Add or update track in map
-            if track_id not in track_tag_map:
-                track_tag_map[track_id] = {
-                    "username": username,
-                    "track_id": track_id,
-                    "track_name": track_name,
-                    "track_mbid": track_mbid,
-                    "artist_name": artist_name,
-                    "artist_mbid": artist_mbid,
-                    "tags": [],
-                    "ranks": [],
-                }
+                # Add or update track in map
+                if track_id not in track_tag_map:
+                    track_tag_map[track_id] = {
+                        "username": username,
+                        "track_id": track_id,
+                        "track_name": track_name,
+                        "track_mbid": track_mbid,
+                        "artist_name": artist_name,
+                        "artist_mbid": artist_mbid,
+                        "tags": [],
+                        "ranks": [],
+                    }
 
-            track_tag_map[track_id]["tags"].append(tag)
-            track_tag_map[track_id]["ranks"].append(rank)
+                track_tag_map[track_id]["tags"].append(tag)
+                track_tag_map[track_id]["ranks"].append(rank)
 
-        processed_count += 1
-        if processed_count % 5 == 0 or processed_count == len(top_tags):
-            print(
-                f"Processed {processed_count}/{len(top_tags)} tags for {username}, "
-                f"found {len(track_tag_map)} unique tracks"
-            )
+        print(
+            f"Processed all {len(top_tags)} tags for {username}, "
+            f"found {len(track_tag_map)} unique tracks"
+        )
 
     # Filter tracks by minimum tag matches and calculate scores
     all_candidates = []
@@ -490,7 +538,7 @@ def generate_similar_tag_candidates(
     }
 
 
-def generate_deep_cut_candidates(
+async def generate_deep_cut_candidates(
     username: str,
     min_listeners: int = 100,
     max_listeners: int = 50000,
@@ -521,7 +569,6 @@ def generate_deep_cut_candidates(
     Returns:
         Metadata dict with path, rows, table_name
     """
-    client = LastFMClient()
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load data
@@ -579,29 +626,72 @@ def generate_deep_cut_candidates(
     # Collect candidate tracks
     all_candidates = []
 
-    processed_count = 0
-    for artist_name, artist_id in zip(
-        artists_to_process_df["artist_name"].to_list(),
-        artists_to_process_df["artist_id"].to_list(),
-    ):
-        # Get top albums for artist
-        top_albums = client.get_artist_top_albums(artist_name, limit=15)
+    async with LastFMClient() as client:
+        # Fetch all artist top albums concurrently
+        artist_names = artists_to_process_df["artist_name"].to_list()
+        artist_ids = artists_to_process_df["artist_id"].to_list()
 
-        # Filter albums with reasonable listener counts
-        filtered_albums = [
-            album
-            for album in top_albums
-            if int(album.get("playcount", 0)) >= min_listeners
+        album_tasks = [
+            client.get_artist_top_albums(artist_name, limit=15)
+            for artist_name in artist_names
         ]
+        print(f"Fetching top albums for {len(artist_names)} artists...")
+        all_artist_albums = await asyncio.gather(*album_tasks, return_exceptions=True)
 
-        # Process each album
-        for album in filtered_albums[:10]:  # Limit to top 10 albums
-            album_name = album.get("name")
-            if not album_name:
+        # Prepare album info requests
+        album_info_tasks = []
+        album_metadata = []  # Store context for each album request
+
+        for idx, top_albums in enumerate(all_artist_albums):
+            if isinstance(top_albums, Exception):
+                print(f"Failed to fetch albums for {artist_names[idx]}: {top_albums}")
                 continue
 
-            # Get album info with tracklist
-            album_info = client.get_album_info(album_name, artist_name)
+            # Type guard: top_albums is list here
+            if not isinstance(top_albums, list):
+                print(f"Unexpected type for albums: {type(top_albums)}")
+                continue
+
+            # Filter albums with reasonable listener counts
+            filtered_albums = [
+                album
+                for album in top_albums
+                if int(album.get("playcount", 0)) >= min_listeners
+            ]
+
+            # Queue album info requests (limit to top 10 albums)
+            for album in filtered_albums[:10]:
+                album_name = album.get("name")
+                if not album_name:
+                    continue
+
+                album_info_tasks.append(
+                    client.get_album_info(album_name, artist_names[idx])
+                )
+                album_metadata.append(
+                    {
+                        "artist_name": artist_names[idx],
+                        "artist_id": artist_ids[idx],
+                        "album_name": album_name,
+                        "album_playcount": int(album.get("playcount", 0)),
+                        "album_artist_mbid": album.get("artist", {}).get("mbid", "")
+                        if isinstance(album.get("artist"), dict)
+                        else "",
+                    }
+                )
+
+        # Fetch all album info concurrently
+        print(f"Fetching track info for {len(album_info_tasks)} albums...")
+        all_album_info = await asyncio.gather(*album_info_tasks, return_exceptions=True)
+
+        # Process all results
+        for album_info, metadata in zip(all_album_info, album_metadata):
+            if isinstance(album_info, Exception):
+                print(
+                    f"Failed to fetch info for album '{metadata['album_name']}': {album_info}"
+                )
+                continue
+
             tracks = album_info.get("tracks", {})
 
             # Handle different response formats
@@ -619,19 +709,17 @@ def generate_deep_cut_candidates(
                 if track_mbid == "":
                     track_mbid = None
 
-                album_listeners = int(album.get("playcount", 0))
+                album_listeners = metadata["album_playcount"]
                 if not (min_listeners <= album_listeners <= max_listeners):
                     continue
 
-                track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
+                track_id = (
+                    track_mbid
+                    if track_mbid
+                    else f"{track_name}|{metadata['artist_name']}"
+                )
                 if track_id in played_track_ids_set:
                     continue
-
-                artist_mbid = (
-                    album.get("artist", {}).get("mbid", "")
-                    if isinstance(album.get("artist"), dict)
-                    else ""
-                )
 
                 all_candidates.append(
                     {
@@ -639,22 +727,20 @@ def generate_deep_cut_candidates(
                         "track_id": track_id,
                         "track_name": track_name,
                         "track_mbid": track_mbid,
-                        "artist_name": artist_name,
-                        "artist_mbid": artist_mbid,
-                        "album_name": album_name,
+                        "artist_name": metadata["artist_name"],
+                        "artist_mbid": metadata["album_artist_mbid"],
+                        "album_name": metadata["album_name"],
                         "listeners": album_listeners,
                         "playcount": album_listeners,
                         "score": 1.0 / (album_listeners + 1),
-                        "source_artist_name": artist_name,
-                        "source_artist_id": artist_id,
+                        "source_artist_name": metadata["artist_name"],
+                        "source_artist_id": metadata["artist_id"],
                     }
                 )
 
-        processed_count += 1
-        if processed_count % 5 == 0 or processed_count == total_artists:
-            print(
-                f"Processed {processed_count}/{total_artists} deep-cut artists for {username}"
-            )
+        print(
+            f"Processed all {total_artists} deep-cut artists for {username}, found {len(all_candidates)} candidates"
+        )
 
     # Convert to DataFrame and deduplicate
     if not all_candidates:

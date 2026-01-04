@@ -73,12 +73,15 @@ def candidate_generation():
         Returns:
             Metadata dict with path, rows, table_name
         """
+        import asyncio
         from music_airflow.transform.candidate_generation import (
             generate_similar_artist_candidates,
         )
 
-        return generate_similar_artist_candidates(
-            username=username,
+        return asyncio.run(
+            generate_similar_artist_candidates(
+                username=username,
+            )
         )
 
     # Similar tag candidates per user
@@ -96,12 +99,15 @@ def candidate_generation():
         Returns:
             Metadata dict with path, rows, table_name
         """
+        import asyncio
         from music_airflow.transform.candidate_generation import (
             generate_similar_tag_candidates,
         )
 
-        return generate_similar_tag_candidates(
-            username=username,
+        return asyncio.run(
+            generate_similar_tag_candidates(
+                username=username,
+            )
         )
 
     # Deep cut candidates per user
@@ -119,12 +125,15 @@ def candidate_generation():
         Returns:
             Metadata dict with path, rows, table_name
         """
+        import asyncio
         from music_airflow.transform.candidate_generation import (
             generate_deep_cut_candidates,
         )
 
-        return generate_deep_cut_candidates(
-            username=username,
+        return asyncio.run(
+            generate_deep_cut_candidates(
+                username=username,
+            )
         )
 
     # Consolidate per user into gold

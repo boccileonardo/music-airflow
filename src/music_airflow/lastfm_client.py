@@ -5,12 +5,13 @@ Handles API requests, pagination, rate limiting, and error handling.
 Credentials are loaded from environment variables.
 """
 
+import asyncio
 import os
 import time
 from pathlib import Path
 from typing import Any
 
-import requests
+import aiohttp
 from dotenv import load_dotenv
 from tenacity import (
     retry,
@@ -19,14 +20,17 @@ from tenacity import (
     wait_random_exponential,
 )
 
-# todo: You will not make more than 5 requests per originating IP address per second, averaged over a 5 minute period
-# refactor to async
-
 
 class LastFMClient:
-    """Client for interacting with the Last.fm API."""
+    """
+    Async client for interacting with the Last.fm API.
+
+    Implements rate limiting (5 requests per second) and automatic retries.
+    Use as async context manager for proper session management.
+    """
 
     BASE_URL = "http://ws.audioscrobbler.com/2.0/"
+    RATE_LIMIT_DELAY = 0.2  # 200ms = 5 requests per second
 
     def __init__(self, api_key: str | None = None, username: str | None = None):
         """
@@ -42,13 +46,38 @@ class LastFMClient:
 
         self.api_key = api_key or os.getenv("api_key")
         self.username = username
+        self._session: aiohttp.ClientSession | None = None
+        self._last_request_time = 0.0
+        self._rate_limit_lock = asyncio.Lock()
 
         if not self.api_key:
             raise ValueError(
                 "Last.fm API key not found. Set 'api_key' in .env or pass to constructor."
             )
 
-    def get_recent_tracks(
+    async def __aenter__(self):
+        """Create aiohttp session on context manager entry."""
+        self._session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Close aiohttp session on context manager exit."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    async def _ensure_session(self):
+        """Ensure session exists, create if needed."""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+
+    async def close(self):
+        """Close the client session."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    async def get_recent_tracks(
         self,
         username: str | None = None,
         from_timestamp: int | None = None,
@@ -77,7 +106,7 @@ class LastFMClient:
 
         Raises:
             ValueError: If no username provided
-            requests.HTTPError: If API request fails after retries
+            aiohttp.ClientError: If API request fails after retries
         """
         username = username or self.username
         if not username:
@@ -104,7 +133,7 @@ class LastFMClient:
                 params["to"] = to_timestamp
 
             # Make request with retry logic
-            response_data = self._make_request(params)
+            response_data = await self._make_request(params)
 
             # Extract tracks from response
             if "recenttracks" not in response_data:
@@ -131,23 +160,20 @@ class LastFMClient:
 
             page += 1
 
-            # Small delay to avoid rate limiting
-            time.sleep(0.2)
-
         return all_tracks
 
     @retry(
-        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        retry=retry_if_exception_type(aiohttp.ClientError),
         stop=stop_after_attempt(3),
         wait=wait_random_exponential(multiplier=2, min=2, max=60),
         reraise=True,
     )
-    def _make_request(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def _make_request(self, params: dict[str, Any]) -> dict[str, Any]:
         """
-        Make API request with retry logic using tenacity.
+        Make API request with retry logic and rate limiting.
 
         Retries up to 3 times with exponential backoff (2s, 4s, 8s, ...).
-        Only retries on requests.exceptions.RequestException.
+        Enforces rate limit of 5 requests per second (200ms between requests).
 
         Args:
             params: API request parameters
@@ -156,12 +182,25 @@ class LastFMClient:
             JSON response as dictionary
 
         Raises:
-            requests.HTTPError: If request fails after all retries
+            aiohttp.ClientError: If request fails after all retries
             ValueError: If Last.fm API returns an error
         """
-        response = requests.get(self.BASE_URL, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        await self._ensure_session()
+        assert self._session is not None
+
+        # Enforce rate limiting
+        async with self._rate_limit_lock:
+            current_time = time.time()
+            time_since_last = current_time - self._last_request_time
+            if time_since_last < self.RATE_LIMIT_DELAY:
+                await asyncio.sleep(self.RATE_LIMIT_DELAY - time_since_last)
+            self._last_request_time = time.time()
+
+        async with self._session.get(
+            self.BASE_URL, params=params, timeout=aiohttp.ClientTimeout(total=30)
+        ) as response:
+            response.raise_for_status()
+            data = await response.json()
 
         # Check for Last.fm API errors
         if "error" in data:
@@ -171,7 +210,7 @@ class LastFMClient:
 
         return data
 
-    def get_user_info(self, username: str | None = None) -> dict[str, Any]:
+    async def get_user_info(self, username: str | None = None) -> dict[str, Any]:
         """
         Get basic user information.
 
@@ -195,10 +234,10 @@ class LastFMClient:
             "format": "json",
         }
 
-        response_data = self._make_request(params)
+        response_data = await self._make_request(params)
         return response_data.get("user", {})
 
-    def get_track_info(
+    async def get_track_info(
         self, track: str, artist: str, mbid: str | None = None, autocorrect: bool = True
     ) -> dict[str, Any]:
         """
@@ -229,10 +268,10 @@ class LastFMClient:
             params["track"] = track
             params["artist"] = artist
 
-        response_data = self._make_request(params)
+        response_data = await self._make_request(params)
         return response_data.get("track", {})
 
-    def get_artist_info(
+    async def get_artist_info(
         self, artist: str, mbid: str | None = None, autocorrect: bool = True
     ) -> dict[str, Any]:
         """
@@ -244,10 +283,11 @@ class LastFMClient:
             autocorrect: Transform misspelled names into correct versions (default: True)
 
         Returns:
-            Artist information dictionary including tags, listeners, playcount, bio
+            Artist information dictionary including tags, listeners, playcount, bio.
+            Returns empty dict if artist not found (error code 6).
 
         Raises:
-            ValueError: If artist not found or API error
+            ValueError: If API error other than "artist not found" (code 6)
         """
         params = {
             "method": "artist.getinfo",
@@ -261,10 +301,17 @@ class LastFMClient:
         else:
             params["artist"] = artist
 
-        response_data = self._make_request(params)
+        try:
+            response_data = await self._make_request(params)
+        except ValueError as e:
+            # Error code 6 = artist not found, return empty dict instead of failing
+            if "error 6" in str(e).lower():
+                return {}
+            raise
+
         return response_data.get("artist", {})
 
-    def get_similar_artists(
+    async def get_similar_artists(
         self,
         artist: str,
         mbid: str | None = None,
@@ -281,10 +328,11 @@ class LastFMClient:
             autocorrect: Transform misspelled names into correct versions (default: True)
 
         Returns:
-            List of similar artists with match scores and metadata
+            List of similar artists with match scores and metadata.
+            Returns empty list if artist not found (error code 6).
 
         Raises:
-            ValueError: If artist not found or API error
+            ValueError: If API error other than "artist not found" (code 6)
         """
         params = {
             "method": "artist.getSimilar",
@@ -299,7 +347,14 @@ class LastFMClient:
         else:
             params["artist"] = artist
 
-        response_data = self._make_request(params)
+        try:
+            response_data = await self._make_request(params)
+        except ValueError as e:
+            # Error code 6 = artist not found, return empty list instead of failing
+            if "error 6" in str(e).lower():
+                return []
+            raise
+
         similar_artists = response_data.get("similarartists", {})
         artists = similar_artists.get("artist", [])
 
@@ -309,7 +364,7 @@ class LastFMClient:
 
         return artists
 
-    def get_artist_top_tracks(
+    async def get_artist_top_tracks(
         self,
         artist: str,
         mbid: str | None = None,
@@ -326,10 +381,11 @@ class LastFMClient:
             autocorrect: Transform misspelled names into correct versions (default: True)
 
         Returns:
-            List of top tracks with playcount, listeners, and metadata
+            List of top tracks with playcount, listeners, and metadata.
+            Returns empty list if artist not found (error code 6).
 
         Raises:
-            ValueError: If artist not found or API error
+            ValueError: If API error other than "artist not found" (code 6)
         """
         params = {
             "method": "artist.getTopTracks",
@@ -344,7 +400,14 @@ class LastFMClient:
         else:
             params["artist"] = artist
 
-        response_data = self._make_request(params)
+        try:
+            response_data = await self._make_request(params)
+        except ValueError as e:
+            # Error code 6 = artist not found, return empty list instead of failing
+            if "error 6" in str(e).lower():
+                return []
+            raise
+
         top_tracks = response_data.get("toptracks", {})
         tracks = top_tracks.get("track", [])
 
@@ -354,7 +417,7 @@ class LastFMClient:
 
         return tracks
 
-    def get_artist_top_albums(
+    async def get_artist_top_albums(
         self,
         artist: str,
         mbid: str | None = None,
@@ -371,10 +434,11 @@ class LastFMClient:
             autocorrect: Transform misspelled names into correct versions (default: True)
 
         Returns:
-            List of top albums with playcount and metadata
+            List of top albums with playcount and metadata.
+            Returns empty list if artist not found (error code 6).
 
         Raises:
-            ValueError: If artist not found or API error
+            ValueError: If API error other than "artist not found" (code 6)
         """
         params = {
             "method": "artist.getTopAlbums",
@@ -389,7 +453,14 @@ class LastFMClient:
         else:
             params["artist"] = artist
 
-        response_data = self._make_request(params)
+        try:
+            response_data = await self._make_request(params)
+        except ValueError as e:
+            # Error code 6 = artist not found, return empty list instead of failing
+            if "error 6" in str(e).lower():
+                return []
+            raise
+
         top_albums = response_data.get("topalbums", {})
         albums = top_albums.get("album", [])
 
@@ -399,7 +470,7 @@ class LastFMClient:
 
         return albums
 
-    def search_artist(self, artist: str, limit: int = 1) -> list[dict[str, Any]]:
+    async def search_artist(self, artist: str, limit: int = 1) -> list[dict[str, Any]]:
         """
         Search for artists on Last.fm and return matches.
 
@@ -418,7 +489,7 @@ class LastFMClient:
             "limit": limit,
         }
 
-        response_data = self._make_request(params)
+        response_data = await self._make_request(params)
         results = response_data.get("results", {})
         matches = results.get("artistmatches", {}).get("artist", [])
 
@@ -427,7 +498,7 @@ class LastFMClient:
 
         return matches
 
-    def get_similar_tags(self, tag: str) -> list[dict[str, Any]]:
+    async def get_similar_tags(self, tag: str) -> list[dict[str, Any]]:
         """
         Get similar tags to a given tag.
 
@@ -447,7 +518,7 @@ class LastFMClient:
             "format": "json",
         }
 
-        response_data = self._make_request(params)
+        response_data = await self._make_request(params)
         similar_tags = response_data.get("similartags", {})
         tags = similar_tags.get("tag", [])
 
@@ -457,7 +528,9 @@ class LastFMClient:
 
         return tags
 
-    def get_tag_top_tracks(self, tag: str, limit: int = 50) -> list[dict[str, Any]]:
+    async def get_tag_top_tracks(
+        self, tag: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
         """
         Get top tracks for a tag.
 
@@ -479,7 +552,7 @@ class LastFMClient:
             "limit": limit,
         }
 
-        response_data = self._make_request(params)
+        response_data = await self._make_request(params)
         top_tracks = response_data.get("tracks", {})
         tracks = top_tracks.get("track", [])
 
@@ -489,7 +562,7 @@ class LastFMClient:
 
         return tracks
 
-    def get_album_info(
+    async def get_album_info(
         self,
         album: str,
         artist: str,
@@ -524,5 +597,5 @@ class LastFMClient:
             params["album"] = album
             params["artist"] = artist
 
-        response_data = self._make_request(params)
+        response_data = await self._make_request(params)
         return response_data.get("album", {})

@@ -81,7 +81,8 @@ def _write_silver_base_tables(patched_delta_io):
 
 
 class TestSimilarArtistCandidates:
-    def test_generates_and_filters(self, test_data_dir, patched_delta_io):
+    @pytest.mark.asyncio
+    async def test_generates_and_filters(self, test_data_dir, patched_delta_io):
         _write_silver_base_tables(patched_delta_io)
 
         with (
@@ -92,36 +93,44 @@ class TestSimilarArtistCandidates:
                 "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
             ) as MockDeltaIO,
         ):
+            from unittest.mock import AsyncMock
+
             client = MockClient.return_value
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
             # Similar artists for Artist A: include a clone (match>0.9) which should be filtered
-            client.get_similar_artists.return_value = [
-                {"name": "Artist B", "match": 0.5},
-                {"name": "Artist A", "match": 0.95},  # filtered out
-            ]
+            client.get_similar_artists = AsyncMock(
+                return_value=[
+                    {"name": "Artist B", "match": 0.5},
+                    {"name": "Artist A", "match": 0.95},  # filtered out
+                ]
+            )
             # Top tracks for Artist B: include one below min_listeners to be filtered
-            client.get_artist_top_tracks.return_value = [
-                {
-                    "name": "New Track",
-                    "mbid": "tmbid",
-                    "artist": {"name": "Artist B", "mbid": "bmbid"},
-                    "listeners": 5000,
-                    "playcount": 10000,
-                },
-                {
-                    "name": "Too Small",
-                    "mbid": "",
-                    "artist": {"name": "Artist B", "mbid": "bmbid"},
-                    "listeners": 10,
-                    "playcount": 20,
-                },
-            ]
+            client.get_artist_top_tracks = AsyncMock(
+                return_value=[
+                    {
+                        "name": "New Track",
+                        "mbid": "tmbid",
+                        "artist": {"name": "Artist B", "mbid": "bmbid"},
+                        "listeners": 5000,
+                        "playcount": 10000,
+                    },
+                    {
+                        "name": "Too Small",
+                        "mbid": "",
+                        "artist": {"name": "Artist B", "mbid": "bmbid"},
+                        "listeners": 10,
+                        "playcount": 20,
+                    },
+                ]
+            )
 
             # Patch IO manager construction to use our preconfigured instances
             MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
                 medallion_layer
             )
 
-            result = generate_similar_artist_candidates(
+            result = await generate_similar_artist_candidates(
                 username="user1",
                 artist_sample_rate=1.0,
             )
@@ -137,7 +146,8 @@ class TestSimilarArtistCandidates:
 
 
 class TestSimilarTagCandidates:
-    def test_tag_profile_matching_with_min_matches(
+    @pytest.mark.asyncio
+    async def test_tag_profile_matching_with_min_matches(
         self, test_data_dir, patched_delta_io
     ):
         _write_silver_base_tables(patched_delta_io)
@@ -150,12 +160,16 @@ class TestSimilarTagCandidates:
                 "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
             ) as MockDeltaIO,
         ):
+            from unittest.mock import AsyncMock
+
             client = MockClient.return_value
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
 
             # Return top tracks for each tag (rock, indie, alt)
             # Track A appears in multiple tags (meets min_tag_matches=3)
             # Track B appears in only 1 tag (filtered out)
-            def mock_get_tag_top_tracks(tag, limit=30):
+            async def mock_get_tag_top_tracks(tag, limit=30):
                 if tag == "rock":
                     return [
                         {
@@ -191,13 +205,13 @@ class TestSimilarTagCandidates:
                     ]
                 return []
 
-            client.get_tag_top_tracks.side_effect = mock_get_tag_top_tracks
+            client.get_tag_top_tracks = mock_get_tag_top_tracks
 
             MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
                 medallion_layer
             )
 
-            result = generate_similar_tag_candidates(
+            result = await generate_similar_tag_candidates(
                 username="user1",
                 top_tags_count=3,
                 min_tag_matches=3,  # explicitly test with 3 matches
@@ -223,7 +237,8 @@ class TestSimilarTagCandidates:
 
 
 class TestDeepCutCandidates:
-    def test_generation_and_filters(self, test_data_dir, patched_delta_io):
+    @pytest.mark.asyncio
+    async def test_generation_and_filters(self, test_data_dir, patched_delta_io):
         _write_silver_base_tables(patched_delta_io)
 
         with (
@@ -234,34 +249,44 @@ class TestDeepCutCandidates:
                 "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
             ) as MockDeltaIO,
         ):
+            from unittest.mock import AsyncMock
+
             client = MockClient.return_value
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
             # Top albums for Artist A, include one valid album
-            client.get_artist_top_albums.return_value = [
-                {
-                    "name": "Obscure Album",
-                    "playcount": 10000,
-                    "artist": {"mbid": "a_mbid"},
-                },
-                {
-                    "name": "Too Popular",
-                    "playcount": 1000000,
-                    "artist": {"mbid": "a_mbid"},
-                },
-            ]
+            client.get_artist_top_albums = AsyncMock(
+                return_value=[
+                    {
+                        "name": "Obscure Album",
+                        "playcount": 10000,
+                        "artist": {"mbid": "a_mbid"},
+                    },
+                    {
+                        "name": "Too Popular",
+                        "playcount": 1000000,
+                        "artist": {"mbid": "a_mbid"},
+                    },
+                ]
+            )
+
             # Album info returns track list including one already played
-            client.get_album_info.side_effect = lambda album_name, artist_name: {
-                "tracks": {
-                    "track": [
-                        {"name": "Hidden Gem", "mbid": "hg_mbid"},
-                        {"name": "Known", "mbid": ""},
-                    ]
+            async def mock_album_info(album_name, artist_name):
+                return {
+                    "tracks": {
+                        "track": [
+                            {"name": "Hidden Gem", "mbid": "hg_mbid"},
+                            {"name": "Known", "mbid": ""},
+                        ]
+                    }
                 }
-            }
+
+            client.get_album_info = mock_album_info
 
             MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
                 medallion_layer
             )
-            result = generate_deep_cut_candidates(username="user1")
+            result = await generate_deep_cut_candidates(username="user1")
 
         assert result["table_name"] == "candidate_deep_cut"
         out_path = Path(result["path"])  # data/silver/candidate_deep_cut

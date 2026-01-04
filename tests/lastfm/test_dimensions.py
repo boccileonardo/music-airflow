@@ -2,7 +2,7 @@
 Tests for dimension table transformations and extraction.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import polars as pl
 import pytest
@@ -200,10 +200,11 @@ def test_tracks_tags_truncation():
 class TestExtractTracksToBronze:
     """Test extract_tracks_to_bronze function."""
 
+    @pytest.mark.asyncio
     @patch("music_airflow.extract.dimensions.LastFMClient")
     @patch("music_airflow.extract.dimensions.PolarsDeltaIOManager")
     @patch("music_airflow.extract.dimensions.JSONIOManager")
-    def test_extract_new_tracks(
+    async def test_extract_new_tracks(
         self, mock_json_io, mock_delta_io, mock_client_class, test_data_dir
     ):
         """Test extracting metadata for new tracks."""
@@ -240,32 +241,36 @@ class TestExtractTracksToBronze:
 
         mock_delta_io.side_effect = get_io_manager
 
-        # Mock LastFM client
+        # Mock LastFM client with AsyncMock for async methods
         mock_client = MagicMock()
-        mock_client.get_track_info.side_effect = [
-            {
-                "name": "Track A",
-                "artist": {"name": "Artist X", "mbid": "artist1"},
-                "album": {"title": "Album 1", "mbid": "album1"},
-                "mbid": "mbid1",
-                "url": "url1",
-                "duration": 180000,
-                "listeners": 5000,
-                "playcount": 10000,
-                "toptags": {"tag": [{"name": "rock"}, {"name": "indie"}]},
-            },
-            {
-                "name": "Track B",
-                "artist": {"name": "Artist Y", "mbid": "artist2"},
-                "album": {"title": "Album 2", "mbid": "album2"},
-                "mbid": "",
-                "url": "url2",
-                "duration": 200000,
-                "listeners": 3000,
-                "playcount": 7000,
-                "toptags": {"tag": [{"name": "pop"}]},
-            },
-        ]
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get_track_info = AsyncMock(
+            side_effect=[
+                {
+                    "name": "Track A",
+                    "artist": {"name": "Artist X", "mbid": "artist1"},
+                    "album": {"title": "Album 1", "mbid": "album1"},
+                    "mbid": "mbid1",
+                    "url": "url1",
+                    "duration": 180000,
+                    "listeners": 5000,
+                    "playcount": 10000,
+                    "toptags": {"tag": [{"name": "rock"}, {"name": "indie"}]},
+                },
+                {
+                    "name": "Track B",
+                    "artist": {"name": "Artist Y", "mbid": "artist2"},
+                    "album": {"title": "Album 2", "mbid": "album2"},
+                    "mbid": "",
+                    "url": "url2",
+                    "duration": 200000,
+                    "listeners": 3000,
+                    "playcount": 7000,
+                    "toptags": {"tag": [{"name": "pop"}]},
+                },
+            ]
+        )
         mock_client_class.return_value = mock_client
 
         # Mock JSON IO
@@ -276,8 +281,7 @@ class TestExtractTracksToBronze:
         mock_json_io.return_value = json_mgr
 
         # Execute
-        with patch("music_airflow.extract.dimensions.time.sleep"):  # Skip delays
-            result = extract_tracks_to_bronze()
+        result = await extract_tracks_to_bronze()
 
         # Verify
         assert result["rows"] == 2
@@ -327,10 +331,11 @@ class TestExtractTracksToBronze:
 class TestExtractArtistsToBronze:
     """Test extract_artists_to_bronze function."""
 
+    @pytest.mark.asyncio
     @patch("music_airflow.extract.dimensions.LastFMClient")
     @patch("music_airflow.extract.dimensions.PolarsDeltaIOManager")
     @patch("music_airflow.extract.dimensions.JSONIOManager")
-    def test_extract_new_artists(
+    async def test_extract_new_artists(
         self, mock_json_io, mock_delta_io, mock_client_class, test_data_dir
     ):
         """Test extracting metadata for new artists."""
@@ -364,26 +369,30 @@ class TestExtractArtistsToBronze:
 
         mock_delta_io.side_effect = get_io_manager
 
-        # Mock LastFM client
+        # Mock LastFM client with AsyncMock for async methods
         mock_client = MagicMock()
-        mock_client.get_artist_info.side_effect = [
-            {
-                "name": "Artist X",
-                "mbid": "artist1",
-                "url": "url1",
-                "stats": {"listeners": 50000, "playcount": 100000},
-                "tags": {"tag": [{"name": "rock"}, {"name": "indie"}]},
-                "bio": {"summary": "Bio for Artist X"},
-            },
-            {
-                "name": "Artist Y",
-                "mbid": "",
-                "url": "url2",
-                "stats": {"listeners": 30000, "playcount": 70000},
-                "tags": {"tag": [{"name": "pop"}]},
-                "bio": {"summary": "Bio for Artist Y"},
-            },
-        ]
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get_artist_info = AsyncMock(
+            side_effect=[
+                {
+                    "name": "Artist X",
+                    "mbid": "artist1",
+                    "url": "url1",
+                    "stats": {"listeners": 50000, "playcount": 100000},
+                    "tags": {"tag": [{"name": "rock"}, {"name": "indie"}]},
+                    "bio": {"summary": "Bio for Artist X"},
+                },
+                {
+                    "name": "Artist Y",
+                    "mbid": "",
+                    "url": "url2",
+                    "stats": {"listeners": 30000, "playcount": 70000},
+                    "tags": {"tag": [{"name": "pop"}]},
+                    "bio": {"summary": "Bio for Artist Y"},
+                },
+            ]
+        )
         mock_client_class.return_value = mock_client
 
         # Mock JSON IO
@@ -394,8 +403,7 @@ class TestExtractArtistsToBronze:
         mock_json_io.return_value = json_mgr
 
         # Execute
-        with patch("music_airflow.extract.dimensions.time.sleep"):
-            result = extract_artists_to_bronze()
+        result = await extract_artists_to_bronze()
 
         # Verify
         assert result["rows"] == 2
