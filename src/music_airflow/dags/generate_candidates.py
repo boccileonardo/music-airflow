@@ -1,7 +1,7 @@
 """
 Candidate Generation DAG - Generate track candidates for recommender system.
 
-Generates three types of candidates (similar artists, similar tags, deep cuts),
+Generates four types of candidates (similar artists, similar tags, deep cuts, old favorites),
 saves each to silver tables, then consolidates into a single gold table with
 type indicators and deduplication.
 
@@ -36,11 +36,12 @@ def candidate_generation():
     """
     Generate recommendation candidate tracks from silver layer data.
 
-    Produces three silver candidate tables (similar_artist, similar_tag, deep_cut),
+    Produces four silver candidate tables (similar_artist, similar_tag, deep_cut, old_favorites),
     then consolidates into single unified gold table with type indicators:
     - similar_artist: Tracks from artists similar to user's played artists
     - similar_tag: Tracks with tags matching user's library
     - deep_cut_same_artist: Obscure tracks from known artists
+    - old_favorite: Tracks user played in past but not recently
 
     Each candidate can belong to multiple types (one-hot encoded).
     """
@@ -136,6 +137,29 @@ def candidate_generation():
             )
         )
 
+    # Old favorites candidates per user
+    @task(
+        multiple_outputs=False,
+        inlets=[plays_asset],
+    )
+    def generate_old_favorites(username: str) -> dict[str, Any]:
+        """
+        Generate old favorites candidates and save to silver.
+
+        Args:
+            username: Target user
+
+        Returns:
+            Metadata dict with path, rows, table_name
+        """
+        from music_airflow.transform.candidate_generation import (
+            generate_old_favorites_candidates,
+        )
+
+        return generate_old_favorites_candidates(
+            username=username,
+        )
+
     # Consolidate per user into gold
     @task(
         multiple_outputs=False,
@@ -186,12 +210,18 @@ def candidate_generation():
     similar_artist_results = generate_similar_artist.expand(username=users)
     similar_tag_results = generate_similar_tag.expand(username=users)
     deep_cut_results = generate_deep_cut.expand(username=users)
+    old_favorites_results = generate_old_favorites.expand(username=users)
 
     # Consolidate silver tables to gold for each user
-    # Wait for all three silver tables to be ready before consolidating
+    # Wait for all four silver tables to be ready before consolidating
     gold_results = consolidate_to_gold.expand(username=users)
     gold_results.set_upstream(
-        [similar_artist_results, similar_tag_results, deep_cut_results]
+        [
+            similar_artist_results,
+            similar_tag_results,
+            deep_cut_results,
+            old_favorites_results,
+        ]
     )
 
     # Final summary

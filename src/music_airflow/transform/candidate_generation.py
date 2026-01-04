@@ -5,15 +5,16 @@ Generates candidate track lists using Last.fm API similarity:
 - Similar artist tracks: Top tracks from artists similar to user's plays (via artist.getSimilar)
 - Similar tag tracks: Tracks appearing under multiple tags from user's tag profile (via tag.getTopTracks)
 - Deep cut tracks: Obscure tracks from top albums by user's favorite artists (via artist.getTopAlbums)
+- Old favorites: Tracks user played in past but not recently (based on half_life from dim tables)
 
 Returns DataFrames for silver-layer storage; DAG consolidates into single gold table.
+All candidates are saved (no limits), relying on incremental processing to avoid reprocessing.
 """
-# todo: fix deep cuts
-# todo: add old favorites (from previous play history)
-# todo: fix unnecessary collects and sets
 
 from deltalake.exceptions import TableNotFoundError
+from datetime import datetime
 from typing import Any
+import logging
 
 import asyncio
 import polars as pl
@@ -21,21 +22,162 @@ import polars as pl
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "generate_similar_artist_candidates",
     "generate_similar_tag_candidates",
     "generate_deep_cut_candidates",
+    "generate_old_favorites_candidates",
     "merge_candidate_sources",
 ]
+
+
+async def _gather_with_progress(
+    tasks: list,
+    description: str,
+    progress_interval: int = 60,
+) -> list:
+    """
+    Execute async tasks with periodic progress logging.
+
+    Args:
+        tasks: List of coroutines to execute
+        description: Description for log messages
+        progress_interval: Seconds between progress updates
+
+    Returns:
+        List of results from asyncio.gather
+    """
+    total = len(tasks)
+    done_event = asyncio.Event()
+
+    async def log_progress():
+        elapsed = 0
+        while not done_event.is_set():
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=progress_interval)
+                break  # Event was set, exit immediately
+            except asyncio.TimeoutError:
+                # Timeout reached, log progress and continue
+                elapsed += progress_interval
+                logger.info(
+                    f"{description}: {elapsed}s elapsed, waiting for {total} tasks..."
+                )
+
+    # Start progress logger
+    progress_task = asyncio.create_task(log_progress())
+
+    try:
+        # Execute all tasks
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    finally:
+        # Stop progress logger
+        done_event.set()
+        await progress_task
+
+
+def _resolve_track_ids(
+    track_data: list[dict[str, Any]],
+    delta_mgr: PolarsDeltaIOManager,
+) -> pl.DataFrame:
+    """
+    Resolve track IDs by looking up existing dimension table entries.
+
+    Strategy:
+    1. If track has MBID from API, use it as track_id
+    2. If no MBID, create temporary synthetic ID (track_name|artist_name)
+    3. Look up in tracks dimension table to find canonical track_id
+    4. This ensures we match existing plays even when API doesn't return MBIDs
+
+    Args:
+        track_data: List of dicts with track_mbid, track_name, artist_name
+        delta_mgr: IO manager for reading dimension tables
+
+    Returns:
+        DataFrame with track_id resolved from dimension table
+    """
+    if not track_data:
+        return pl.DataFrame()
+
+    # Create DataFrame with explicit schema to handle optional MBIDs
+    # Note: Other fields vary by caller, so we let those infer naturally
+    df = pl.DataFrame(
+        track_data,
+        schema_overrides={
+            "track_mbid": pl.String,
+            "artist_mbid": pl.String,
+        },
+    )
+
+    # Create preliminary track_id using same logic as dimension table
+    df = df.with_columns(
+        pl.when(pl.col("track_mbid").is_not_null() & (pl.col("track_mbid") != ""))
+        .then(pl.col("track_mbid"))
+        .otherwise(
+            pl.concat_str([pl.col("track_name"), pl.col("artist_name")], separator="|")
+        )
+        .alias("track_id_temp")
+    )
+
+    # Look up in dimension table to get canonical track_id
+    # This handles case where:
+    # - User played a track WITH mbid (stored as mbid in dimensions)
+    # - We get same track from album.getInfo WITHOUT mbid (would create synthetic)
+    # - We need to match them as the same track
+    try:
+        tracks_dim_lf = delta_mgr.read_delta("tracks")
+        # Check if dimension table has the columns we need for lookup
+        if "track_name" in tracks_dim_lf.collect_schema().names():
+            tracks_dim_df = (
+                tracks_dim_lf.select(["track_id", "track_name", "artist_name"])
+                .with_columns(
+                    pl.col("track_name").str.to_lowercase().alias("track_name_lower"),
+                    pl.col("artist_name").str.to_lowercase().alias("artist_name_lower"),
+                )
+                .select(["track_id", "track_name_lower", "artist_name_lower"])
+                .collect()
+            )
+
+            # Try to match by track_name + artist_name (case-insensitive)
+            df = (
+                df.with_columns(
+                    pl.col("track_name").str.to_lowercase().alias("track_name_lower"),
+                    pl.col("artist_name").str.to_lowercase().alias("artist_name_lower"),
+                )
+                .join(
+                    tracks_dim_df,
+                    on=["track_name_lower", "artist_name_lower"],
+                    how="left",
+                )
+                # Use dimension track_id if found, otherwise use our temporary ID
+                .with_columns(
+                    pl.coalesce([pl.col("track_id"), pl.col("track_id_temp")]).alias(
+                        "track_id"
+                    )
+                )
+                .drop("track_id_temp", "track_name_lower", "artist_name_lower")
+            )
+        else:
+            # Dimension table doesn't have track_name - just use our synthetic IDs
+            df = df.with_columns(pl.col("track_id_temp").alias("track_id")).drop(
+                "track_id_temp"
+            )
+    except Exception:
+        # If dimension lookup fails, fall back to synthetic IDs
+        df = df.with_columns(pl.col("track_id_temp").alias("track_id")).drop(
+            "track_id_temp"
+        )
+
+    return df
 
 
 async def generate_similar_artist_candidates(
     username: str,
     min_listeners: int = 1000,
-    max_candidates_per_artist: int = 10,
-    max_total_candidates: int = 500,
     similarity_threshold: float = 0.9,
-    artist_sample_rate: float = 0.3,
+    artist_sample_rate: float = 0.2,
 ) -> dict[str, Any]:
     """
     Generate candidate tracks from artists similar to user's played artists (via Last.fm API).
@@ -47,21 +189,21 @@ async def generate_similar_artist_candidates(
     4. Filter out clones/false positives (match > similarity_threshold)
     5. For each similar artist, call artist.getTopTracks
     6. Exclude tracks user has already played
+    7. Save all candidates (incremental processing avoids reprocessing)
 
     Saves results to data/silver/candidate_similar_artist/ Delta table.
 
     Args:
         username: Target user
         min_listeners: Minimum listeners for candidate tracks (quality filter)
-        max_candidates_per_artist: Max tracks per similar artist
-        max_total_candidates: Maximum total candidates to return
         similarity_threshold: Exclude artists with match > this (likely duplicates)
-        artist_sample_rate: Fraction of user's artists to sample (0.3 = 30%)
+        artist_sample_rate: Fraction of user's artists to sample (0.2 = 20%)
 
     Returns:
         Metadata dict with path, rows, table_name
     """
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
+    delta_mgr_gold = PolarsDeltaIOManager(medallion_layer="gold")
 
     # Load user's plays
     plays_lf = delta_mgr_silver.read_delta("plays").filter(
@@ -70,7 +212,15 @@ async def generate_similar_artist_candidates(
     tracks_lf = delta_mgr_silver.read_delta("tracks")
     artists_lf = delta_mgr_silver.read_delta("artists")
 
-    # Get unique artists user has played (id + name)
+    # Load user's artist play counts for scoring
+    artist_play_counts_lf = (
+        delta_mgr_gold.read_delta("artist_play_count")
+        .filter(pl.col("username") == username)
+        .select(["artist_id", "play_count"])
+        .rename({"play_count": "user_artist_play_count"})
+    )
+
+    # Get unique artists user has played (id + name + play count)
     played_artists = (
         plays_lf.select("track_id")
         .unique()
@@ -80,9 +230,18 @@ async def generate_similar_artist_candidates(
             on="artist_id",
             how="left",
         )
-        .select(["artist_id", "artist_name"])
+        .join(
+            artist_play_counts_lf,
+            on="artist_id",
+            how="left",
+        )
+        .select(["artist_id", "artist_name", "user_artist_play_count"])
         .unique()
-        .filter(pl.col("artist_id").is_not_null() & pl.col("artist_name").is_not_null())
+        .filter(
+            pl.col("artist_id").is_not_null()
+            & pl.col("artist_name").is_not_null()
+            & pl.col("user_artist_play_count").is_not_null()
+        )
     )
 
     # Incremental processing: exclude artists already used as a source for this user
@@ -101,21 +260,21 @@ async def generate_similar_artist_candidates(
         # Table may not exist on first run; process all played artists
         artists_to_process = played_artists
 
-    total_artists = artists_to_process.select(pl.len()).collect().item()
-    print(f"Found {total_artists} source artists to process for {username}")
+    # Collect first to enable sampling
+    total_artists_lf = artists_to_process.select(pl.len())
+    total_artists = total_artists_lf.collect().item()
+    logger.info(f"Found {total_artists} source artists to process for {username}")
 
-    # Sampling only if we have more than 50 artists to process
-    if total_artists > 50:
-        print("Sampling from artist list to limit API requests")
-        artists_to_process = artists_to_process.filter(
-            pl.col("artist_name").hash().mod(100) < int(artist_sample_rate * 100)
-        ).collect(engine="streaming")
-        sampled_count = artists_to_process.select(pl.len()).item()
-        # Update total count to reflect sampled set for accurate progress logs
-        total_artists = sampled_count
-        print(f"Remaining artists after sampling: {sampled_count}")
-    else:
-        artists_to_process = artists_to_process.collect(engine="streaming")
+    artists_to_process = artists_to_process.collect(engine="streaming")
+
+    # Apply sampling if we have many artists (reduces API load)
+    if total_artists > 30:
+        logger.info(
+            f"Sampling from artist list to limit API requests (rate={artist_sample_rate})"
+        )
+        artists_to_process = artists_to_process.sample(fraction=artist_sample_rate)
+        total_artists = len(artists_to_process)
+        logger.info(f"Remaining artists after sampling: {total_artists}")
 
     # Prepare set of played track_ids for exclusion
     played_track_ids_df = (
@@ -132,12 +291,17 @@ async def generate_similar_artist_candidates(
         artist_ids = artists_to_process["artist_id"].to_list()
 
         similar_artist_tasks = [
-            client.get_similar_artists(artist_name, limit=30)
+            client.get_similar_artists(artist_name, limit=20)
             for artist_name in artist_names
         ]
-        all_similar_artists = await asyncio.gather(
-            *similar_artist_tasks, return_exceptions=True
+        logger.info(
+            f"Fetching similar artists for {len(similar_artist_tasks)} artists..."
         )
+        all_similar_artists = await _gather_with_progress(
+            similar_artist_tasks,
+            description="Fetching similar artists",
+        )
+        logger.info("Completed fetching similar artists")
 
         # Process results and gather top track requests
         top_track_tasks = []
@@ -145,14 +309,9 @@ async def generate_similar_artist_candidates(
 
         for idx, similar_artists in enumerate(all_similar_artists):
             if isinstance(similar_artists, Exception):
-                print(
+                logger.warning(
                     f"Failed to fetch similar artists for {artist_names[idx]}: {similar_artists}"
                 )
-                continue
-
-            # Type guard: similar_artists is list here
-            if not isinstance(similar_artists, list):
-                print(f"Unexpected type for similar artists: {type(similar_artists)}")
                 continue
 
             # Filter out clones/false positives
@@ -162,36 +321,53 @@ async def generate_similar_artist_candidates(
                 if float(a.get("match", 0)) <= similarity_threshold
             ]
 
-            # Queue top track requests for each similar artist (limit to top 10)
-            for similar_artist in filtered_similar[:10]:
+            # Queue top track requests for each similar artist
+            for similar_artist in filtered_similar:
                 similar_artist_name = similar_artist.get("name")
+                similarity_score = float(similar_artist.get("match", 0))
                 if not similar_artist_name:
                     continue
 
                 top_track_tasks.append(
-                    client.get_artist_top_tracks(
-                        similar_artist_name, limit=max_candidates_per_artist
-                    )
+                    client.get_artist_top_tracks(similar_artist_name, limit=50)
                 )
                 task_metadata.append(
                     {
                         "source_artist_name": artist_names[idx],
                         "source_artist_id": artist_ids[idx],
                         "similar_artist_name": similar_artist_name,
+                        "similarity_score": similarity_score,
+                        "user_artist_play_count": artists_to_process[
+                            "user_artist_play_count"
+                        ][idx],
                     }
                 )
 
         # Fetch all top tracks concurrently
-        print(f"Fetching top tracks for {len(top_track_tasks)} similar artists...")
-        all_top_tracks = await asyncio.gather(*top_track_tasks, return_exceptions=True)
+        logger.info(
+            f"Fetching top tracks for {len(top_track_tasks)} similar artists..."
+        )
+        all_top_tracks = await _gather_with_progress(
+            top_track_tasks,
+            description="Fetching top tracks",
+        )
+        logger.info("Completed fetching top tracks")
 
         # Process all results
+        total_tracks_examined = 0
+        tracks_filtered_by_min_listeners = 0
+        tracks_filtered_by_already_played = 0
+        top_tracks_failures = 0
+
         for top_tracks, metadata in zip(all_top_tracks, task_metadata):
             if isinstance(top_tracks, Exception):
-                print(
+                top_tracks_failures += 1
+                logger.warning(
                     f"Failed to fetch top tracks for {metadata['similar_artist_name']}: {top_tracks}"
                 )
                 continue
+
+            total_tracks_examined += len(top_tracks)
 
             for track in top_tracks:
                 track_name = track.get("name")
@@ -213,6 +389,7 @@ async def generate_similar_artist_candidates(
 
                 # Apply quality filter
                 if listeners < min_listeners:
+                    tracks_filtered_by_min_listeners += 1
                     continue
 
                 # Create track ID consistent with plays: prefer MBID else "track|artist"
@@ -222,26 +399,37 @@ async def generate_similar_artist_candidates(
 
                 # Skip if already played
                 if track_id in played_track_ids_set:
+                    tracks_filtered_by_already_played += 1
                     continue
+
+                # Score = similarity * user's play count of source artist * track global playcount
+                # This prioritizes: tracks from similar artists to heavily played artists
+                score = (
+                    metadata["similarity_score"]
+                    * metadata["user_artist_play_count"]
+                    * playcount
+                )
 
                 all_candidates.append(
                     {
                         "username": username,
-                        "track_id": track_id,
-                        "track_name": track_name,
                         "track_mbid": track_mbid,
+                        "track_name": track_name,
                         "artist_name": artist_name_track,
                         "artist_mbid": artist_mbid,
-                        "listeners": listeners,
-                        "playcount": playcount,
-                        "score": playcount,
-                        "source_artist_name": metadata["source_artist_name"],
+                        "similarity": metadata["similarity_score"],
+                        "score": score,
                         "source_artist_id": metadata["source_artist_id"],
                     }
                 )
 
-        print(
-            f"Processed all {total_artists} similar-artist sources for {username}, found {len(all_candidates)} candidates"
+        logger.info(
+            f"Similar-artist generation for {username}: "
+            f"examined {total_tracks_examined} tracks from {len(top_track_tasks)} similar artists, "
+            f"filtered {tracks_filtered_by_min_listeners} by min_listeners ({min_listeners}), "
+            f"filtered {tracks_filtered_by_already_played} already played, "
+            f"{top_tracks_failures} top tracks failures, "
+            f"result: {len(all_candidates)} candidates"
         )
 
     # Convert to DataFrame and deduplicate
@@ -251,23 +439,30 @@ async def generate_similar_artist_candidates(
             schema={
                 "username": pl.String,
                 "track_id": pl.String,
-                "track_name": pl.String,
                 "track_mbid": pl.String,
-                "artist_name": pl.String,
                 "artist_mbid": pl.String,
-                "listeners": pl.Int64,
-                "playcount": pl.Int64,
-                "score": pl.Int64,
-                "source_artist_name": pl.String,
+                "similarity": pl.Float64,
+                "score": pl.Float64,
                 "source_artist_id": pl.String,
             }
         )
     else:
-        df = pl.DataFrame(all_candidates)
+        # Resolve track IDs from dimension table
+        df = _resolve_track_ids(all_candidates, delta_mgr_silver)
         df = (
             df.unique(subset=["track_id"])  # dedup by track
             .sort("score", descending=True)
-            .limit(max_total_candidates)
+            .select(
+                [
+                    "username",
+                    "track_id",
+                    "track_mbid",
+                    "artist_mbid",
+                    "similarity",
+                    "score",
+                    "source_artist_id",
+                ]
+            )
         )
 
     # Write to silver Delta table with incremental upsert
@@ -288,11 +483,9 @@ async def generate_similar_artist_candidates(
 
 async def generate_similar_tag_candidates(
     username: str,
-    top_tags_count: int = 30,
-    tracks_per_tag: int = 30,
+    top_tags_count: int = 100,
+    tracks_per_tag: int = 500,
     min_tag_matches: int = 2,
-    max_total_candidates: int = 500,
-    max_rank: int = 20,
 ) -> dict[str, Any]:
     """
     Generate candidate tracks matching user's tag profile (via Last.fm API).
@@ -305,16 +498,15 @@ async def generate_similar_tag_candidates(
     5. Score by: number of matching tags + average rank
     6. Keep only tracks appearing under min_tag_matches or more tags
     7. Exclude tracks user has already played
+    8. Save all candidates (incremental processing avoids reprocessing)
 
     Saves results to data/silver/candidate_similar_tag/ Delta table.
 
     Args:
         username: Target user
         top_tags_count: Number of most frequent tags to use (default 30)
-        tracks_per_tag: Max tracks to fetch per tag (default 30)
+        tracks_per_tag: Max tracks to fetch per tag (default 50)
         min_tag_matches: Minimum tags a track must appear under (default 2)
-        max_total_candidates: Maximum number of candidates to return
-        max_rank: Maximum rank to consider (tracks ranked beyond this are filtered)
 
     Returns:
         Metadata dict with path, rows, table_name
@@ -372,7 +564,7 @@ async def generate_similar_tag_candidates(
         # Only reprocess if tag profile has changed significantly (>20% new tags)
         new_tags = current_tags_set - processed_tags_set
         if len(new_tags) / len(current_tags_set) < 0.2:
-            print(f"Tag profile mostly unchanged for {username}, skipping")
+            logger.info(f"Tag profile mostly unchanged for {username}, skipping")
             return {
                 "path": "data/silver/candidate_similar_tag",
                 "rows": 0,
@@ -382,10 +574,10 @@ async def generate_similar_tag_candidates(
         # First run, process all
         pass
 
-    tag_profile_collected = tag_profile.collect()
-    top_tags = tag_profile_collected["tag"].to_list()
+    tag_profile_df = tag_profile.collect()
+    top_tags = tag_profile_df["tag"].to_list()
 
-    print(f"Using top {len(top_tags)} tags for {username}: {top_tags[:10]}...")
+    logger.info(f"Using top {len(top_tags)} tags for {username}: {top_tags[:10]}...")
 
     # Get played track IDs to exclude
     played_track_ids = plays.select("track_id").unique().collect(engine="streaming")
@@ -400,14 +592,27 @@ async def generate_similar_tag_candidates(
         tag_tasks = [
             client.get_tag_top_tracks(tag, limit=tracks_per_tag) for tag in top_tags
         ]
-        print(f"Fetching top tracks for {len(top_tags)} tags...")
-        all_tag_tracks = await asyncio.gather(*tag_tasks, return_exceptions=True)
+        logger.info(f"Fetching top tracks for {len(top_tags)} tags...")
+        all_tag_tracks = await _gather_with_progress(
+            tag_tasks,
+            description="Fetching tag top tracks",
+        )
+        logger.info("Completed fetching tag top tracks")
 
         # Process all results
+        total_tracks_examined = 0
+        tracks_filtered_by_already_played = 0
+        tag_fetch_failures = 0
+
         for tag, top_tracks in zip(top_tags, all_tag_tracks):
             if isinstance(top_tracks, Exception):
-                print(f"Failed to fetch top tracks for tag '{tag}': {top_tracks}")
+                tag_fetch_failures += 1
+                logger.warning(
+                    f"Failed to fetch top tracks for tag '{tag}': {top_tracks}"
+                )
                 continue
+
+            total_tracks_examined += len(top_tracks)
 
             for track in top_tracks:
                 track_name = track.get("name")
@@ -425,102 +630,105 @@ async def generate_similar_tag_candidates(
                     artist_name = str(artist_info) if artist_info else ""
                     artist_mbid = None
 
-                # Get rank from @attr
-                rank = int(track.get("@attr", {}).get("rank", 999))
-                if rank > max_rank:
-                    continue
-
                 track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
 
                 # Skip if already played
                 if track_id in played_track_ids_set:
+                    tracks_filtered_by_already_played += 1
                     continue
 
                 # Add or update track in map
                 if track_id not in track_tag_map:
                     track_tag_map[track_id] = {
                         "username": username,
-                        "track_id": track_id,
-                        "track_name": track_name,
                         "track_mbid": track_mbid,
+                        "track_name": track_name,
                         "artist_name": artist_name,
                         "artist_mbid": artist_mbid,
                         "tags": [],
-                        "ranks": [],
                     }
 
                 track_tag_map[track_id]["tags"].append(tag)
-                track_tag_map[track_id]["ranks"].append(rank)
 
-        print(
-            f"Processed all {len(top_tags)} tags for {username}, "
-            f"found {len(track_tag_map)} unique tracks"
+        logger.info(
+            f"Tag generation for {username}: "
+            f"examined {total_tracks_examined} tracks from {len(top_tags)} tags, "
+            f"filtered {tracks_filtered_by_already_played} already played, "
+            f"{tag_fetch_failures} tag fetch failures, "
+            f"result: {len(track_tag_map)} unique tracks before min_tag_matches filter"
         )
 
     # Filter tracks by minimum tag matches and calculate scores
     all_candidates = []
+    tracks_filtered_by_min_tag_matches = 0
+
     for track_id, track_data in track_tag_map.items():
         tag_match_count = len(track_data["tags"])
 
         if tag_match_count < min_tag_matches:
+            tracks_filtered_by_min_tag_matches += 1
             continue
 
-        # Score: tag matches (primary) + inverse average rank (secondary)
-        avg_rank = sum(track_data["ranks"]) / len(track_data["ranks"])
-        score = tag_match_count * 1000 + (100 - avg_rank)
+        # Score: tag matches
+        score = tag_match_count
 
         all_candidates.append(
             {
                 "username": track_data["username"],
-                "track_id": track_data["track_id"],
-                "track_name": track_data["track_name"],
                 "track_mbid": track_data["track_mbid"],
+                "track_name": track_data["track_name"],
                 "artist_name": track_data["artist_name"],
                 "artist_mbid": track_data["artist_mbid"],
                 "tag_match_count": tag_match_count,
-                "avg_rank": avg_rank,
                 "score": score,
                 "source_tags": ",".join(track_data["tags"]),
             }
         )
 
-    print(
-        f"After filtering for min {min_tag_matches} tag matches: "
-        f"{len(all_candidates)} candidates"
+    logger.info(
+        f"Filtered {tracks_filtered_by_min_tag_matches} by min_tag_matches ({min_tag_matches}), "
+        f"final result: {len(all_candidates)} candidates"
     )
 
-    # Convert to DataFrame and limit
+    # Convert to DataFrame
     if not all_candidates:
         df = pl.DataFrame(
             schema={
                 "username": pl.String,
                 "track_id": pl.String,
-                "track_name": pl.String,
                 "track_mbid": pl.String,
-                "artist_name": pl.String,
                 "artist_mbid": pl.String,
                 "tag_match_count": pl.Int64,
-                "avg_rank": pl.Float64,
                 "score": pl.Float64,
                 "source_tags": pl.String,
             }
         )
     else:
-        df = pl.DataFrame(all_candidates)
-        # Ensure proper types to avoid Null dtype issues
-        df = df.with_columns(
-            pl.col("username").cast(pl.String),
-            pl.col("track_id").cast(pl.String),
-            pl.col("track_name").cast(pl.String),
-            pl.col("track_mbid").cast(pl.String),
-            pl.col("artist_name").cast(pl.String),
-            pl.col("artist_mbid").cast(pl.String),
-            pl.col("tag_match_count").cast(pl.Int64),
-            pl.col("avg_rank").cast(pl.Float64),
-            pl.col("score").cast(pl.Float64),
-            pl.col("source_tags").cast(pl.String),
+        # Resolve track IDs from dimension table
+        df = _resolve_track_ids(all_candidates, delta_mgr_silver)
+        df = (
+            df.with_columns(
+                pl.col("username").cast(pl.String),
+                pl.col("track_id").cast(pl.String),
+                pl.col("track_mbid").cast(pl.String),
+                pl.col("artist_mbid").cast(pl.String),
+                pl.col("tag_match_count").cast(pl.Int64),
+                pl.col("score").cast(pl.Float64),
+                pl.col("source_tags").cast(pl.String),
+            )
+            .sort("score", descending=True)
+            .select(
+                [
+                    "username",
+                    "track_id",
+                    "track_mbid",
+                    "artist_mbid",
+                    "tag_match_count",
+                    "score",
+                    "source_tags",
+                ]
+            )
         )
-        df = df.sort("score", descending=True).limit(max_total_candidates)
 
     # Write to silver Delta table (overwrite for this user since we process full tag profile)
     write_meta = delta_mgr_silver.write_delta(
@@ -541,7 +749,6 @@ async def generate_similar_tag_candidates(
 async def generate_deep_cut_candidates(
     username: str,
     min_listeners: int = 100,
-    max_candidates: int = 300,
     top_artists_count: int = 30,
 ) -> dict[str, Any]:
     """
@@ -555,33 +762,39 @@ async def generate_deep_cut_candidates(
     5. For each album, call album.getInfo to get tracklist
     6. Collect all tracks from these albums
     7. Exclude tracks user has already played
+    8. Save all candidates (incremental processing avoids reprocessing)
 
     Saves results to data/silver/candidate_deep_cut/ Delta table.
 
     Args:
         username: Target user
         min_listeners: Minimum album listeners (quality threshold)
-        max_candidates: Maximum number of candidates
         top_artists_count: Number of top artists to process
 
     Returns:
         Metadata dict with path, rows, table_name
     """
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
+    delta_mgr_gold = PolarsDeltaIOManager(medallion_layer="gold")
 
     # Load data
     plays_lf = delta_mgr_silver.read_delta("plays").filter(
         pl.col("username") == username
     )
-    tracks_lf = delta_mgr_silver.read_delta("tracks")
     artists_lf = delta_mgr_silver.read_delta("artists")
 
-    # Get user's top artists by play count (id + name)
+    # Load user's artist play counts from gold table
+    artist_play_counts_lf = (
+        delta_mgr_gold.read_delta("artist_play_count")
+        .filter(pl.col("username") == username)
+        .select(["artist_id", "play_count"])
+        .rename({"play_count": "user_artist_play_count"})
+    )
+
+    # Get user's top artists by play count (id + name + play count from gold)
     # Filter to only artists with valid MBID (excludes compilation channels, etc.)
     top_artists_lf = (
-        plays_lf.select("track_id")
-        .join(tracks_lf.select("track_id", "artist_id"), on="track_id", how="left")
-        .join(
+        artist_play_counts_lf.join(
             artists_lf.select("artist_id", "artist_name", "artist_mbid"),
             on="artist_id",
             how="left",
@@ -592,9 +805,7 @@ async def generate_deep_cut_candidates(
             & pl.col("artist_mbid").is_not_null()
             & (pl.col("artist_mbid") != "")
         )
-        .group_by(["artist_id", "artist_name"])
-        .agg(pl.len().alias("play_count"))
-        .sort("play_count", descending=True)
+        .sort("user_artist_play_count", descending=True)
         .limit(top_artists_count)
     )
 
@@ -614,12 +825,13 @@ async def generate_deep_cut_candidates(
         artists_to_process_df = top_artists_lf.collect(engine="streaming")
 
     total_artists = len(artists_to_process_df)
-    print(f"Found {total_artists} deep-cut source artists to process for {username}")
+    logger.info(
+        f"Found {total_artists} deep-cut source artists to process for {username}"
+    )
     if total_artists > 50:
-        print("Sampling deep-cut artists to limit API requests")
-        artists_to_process_df = artists_to_process_df.filter(
-            pl.col("artist_name").hash().mod(100) < 50
-        )
+        logger.info("Sampling deep-cut artists to limit API requests")
+        # Use random sampling instead of hash/mod to avoid always skipping same artists
+        artists_to_process_df = artists_to_process_df.sample(fraction=0.5, seed=None)
 
     # Get played track IDs to exclude
     played_track_ids_df = (
@@ -639,8 +851,12 @@ async def generate_deep_cut_candidates(
             client.get_artist_top_albums(artist_name, limit=15)
             for artist_name in artist_names
         ]
-        print(f"Fetching top albums for {len(artist_names)} artists...")
-        all_artist_albums = await asyncio.gather(*album_tasks, return_exceptions=True)
+        logger.info(f"Fetching top albums for {len(artist_names)} artists...")
+        all_artist_albums = await _gather_with_progress(
+            album_tasks,
+            description="Fetching artist albums",
+        )
+        logger.info("Completed fetching top albums")
 
         # Prepare album info requests
         album_info_tasks = []
@@ -650,12 +866,14 @@ async def generate_deep_cut_candidates(
 
         for idx, top_albums in enumerate(all_artist_albums):
             if isinstance(top_albums, Exception):
-                print(f"Failed to fetch albums for {artist_names[idx]}: {top_albums}")
+                logger.warning(
+                    f"Failed to fetch albums for {artist_names[idx]}: {top_albums}"
+                )
                 continue
 
             # Type guard: top_albums is list here
             if not isinstance(top_albums, list):
-                print(f"Unexpected type for albums: {type(top_albums)}")
+                logger.warning(f"Unexpected type for albums: {type(top_albums)}")
                 continue
 
             total_albums_received += len(top_albums)
@@ -666,6 +884,11 @@ async def generate_deep_cut_candidates(
                 if int(album.get("playcount", 0)) >= min_listeners
             ]
             albums_filtered_by_min_listeners += len(top_albums) - len(filtered_albums)
+
+            # Get user's play count for this artist
+            user_artist_play_count = artists_to_process_df["user_artist_play_count"][
+                idx
+            ]
 
             # Queue album info requests (limit to top 10 albums)
             for album in filtered_albums[:10]:
@@ -685,15 +908,20 @@ async def generate_deep_cut_candidates(
                         "album_artist_mbid": album.get("artist", {}).get("mbid", "")
                         if isinstance(album.get("artist"), dict)
                         else "",
+                        "user_artist_play_count": user_artist_play_count,
                     }
                 )
 
         # Fetch all album info concurrently
-        print(
+        logger.info(
             f"Fetching track info for {len(album_info_tasks)} albums "
             f"(received {total_albums_received} total, filtered {albums_filtered_by_min_listeners} by min_listeners={min_listeners})..."
         )
-        all_album_info = await asyncio.gather(*album_info_tasks, return_exceptions=True)
+        all_album_info = await _gather_with_progress(
+            album_info_tasks,
+            description="Fetching album track info",
+        )
+        logger.info("Completed fetching album info")
 
         # Process all results
         total_tracks_examined = 0
@@ -730,6 +958,7 @@ async def generate_deep_cut_candidates(
                     tracks_filtered_by_album_listeners += 1
                     continue
 
+                # Use proper track_id logic: prefer MBID, else synthetic
                 track_id = (
                     track_mbid
                     if track_mbid
@@ -739,24 +968,24 @@ async def generate_deep_cut_candidates(
                     tracks_filtered_by_already_played += 1
                     continue
 
+                # Score = user's artist play count * album global popularity
+                # This prioritizes deep cuts from artists the user actually likes
+                score = float(metadata["user_artist_play_count"] * album_listeners)
+
                 all_candidates.append(
                     {
                         "username": username,
-                        "track_id": track_id,
-                        "track_name": track_name,
                         "track_mbid": track_mbid,
+                        "track_name": track_name,
                         "artist_name": metadata["artist_name"],
                         "artist_mbid": metadata["album_artist_mbid"],
                         "album_name": metadata["album_name"],
-                        "listeners": album_listeners,
-                        "playcount": album_listeners,
-                        "score": float(album_listeners),
-                        "source_artist_name": metadata["artist_name"],
+                        "score": score,
                         "source_artist_id": metadata["artist_id"],
                     }
                 )
 
-        print(
+        logger.info(
             f"Deep-cut generation for {username}: "
             f"examined {total_tracks_examined} tracks from {len(album_info_tasks)} albums, "
             f"filtered {tracks_filtered_by_album_listeners} by min_listeners ({min_listeners}), "
@@ -772,41 +1001,40 @@ async def generate_deep_cut_candidates(
             schema={
                 "username": pl.String,
                 "track_id": pl.String,
-                "track_name": pl.String,
                 "track_mbid": pl.String,
-                "artist_name": pl.String,
                 "artist_mbid": pl.String,
                 "album_name": pl.String,
-                "listeners": pl.Int64,
-                "playcount": pl.Int64,
                 "score": pl.Float64,
-                "source_artist_name": pl.String,
                 "source_artist_id": pl.String,
             }
         )
     else:
-        df = pl.DataFrame(all_candidates)
+        # Resolve track IDs from dimension table
+        df = _resolve_track_ids(all_candidates, delta_mgr_silver)
         df = (
-            df.unique(subset=["track_id"])
+            df.with_columns(
+                pl.col("username").cast(pl.String),
+                pl.col("track_id").cast(pl.String),
+                pl.col("track_mbid").cast(pl.String),
+                pl.col("artist_mbid").cast(pl.String),
+                pl.col("album_name").cast(pl.String),
+                pl.col("score").cast(pl.Float64),
+                pl.col("source_artist_id").cast(pl.String),
+            )
+            .unique(subset=["track_id"])
             .sort("score", descending=True)
-            .limit(max_candidates)
+            .select(
+                [
+                    "username",
+                    "track_id",
+                    "track_mbid",
+                    "artist_mbid",
+                    "album_name",
+                    "score",
+                    "source_artist_id",
+                ]
+            )
         )
-
-    # Ensure stable schema types (avoid Null dtypes)
-    df = df.with_columns(
-        pl.col("username").cast(pl.String),
-        pl.col("track_id").cast(pl.String),
-        pl.col("track_name").cast(pl.String),
-        pl.col("track_mbid").cast(pl.String),
-        pl.col("artist_name").cast(pl.String),
-        pl.col("artist_mbid").cast(pl.String),
-        pl.col("album_name").cast(pl.String),
-        pl.col("listeners").cast(pl.Int64),
-        pl.col("playcount").cast(pl.Int64),
-        pl.col("score").cast(pl.Float64),
-        pl.col("source_artist_name").cast(pl.String),
-        pl.col("source_artist_id").cast(pl.String),
-    )
 
     # Write to silver Delta table (merge for incrementality)
     write_meta = delta_mgr_silver.write_delta(
@@ -824,7 +1052,130 @@ async def generate_deep_cut_candidates(
     }
 
 
-def merge_candidate_sources(username: str) -> dict[str, Any]:
+def generate_old_favorites_candidates(
+    username: str,
+    min_days_since_last_play: int = 90,
+    max_candidates: int = 500,
+) -> dict[str, Any]:
+    """
+    Generate candidate tracks from user's old play history (tracks not played recently).
+
+    Strategy:
+    1. Get all tracks user has played with play timestamps
+    2. Calculate days since last play for each track
+    3. Filter tracks not played in min_days_since_last_play days
+    4. Score by: play count (popularity) + recency decay (half-life)
+    5. Return top N candidates
+
+    This is the "remind" mode: rediscover forgotten favorites.
+
+    Saves results to data/silver/candidate_old_favorites/ Delta table.
+
+    Args:
+        username: Target user
+        min_days_since_last_play: Minimum days since last play (default 90)
+        max_candidates: Maximum candidates to return (default 500)
+
+    Returns:
+        Metadata dict with path, rows, table_name
+    """
+    from datetime import datetime, timezone
+
+    delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
+
+    # Load plays for user
+    plays_lf = delta_mgr_silver.read_delta("plays").filter(
+        pl.col("username") == username
+    )
+
+    # Load user dimension to get per-user half-life
+    dim_users_lf = delta_mgr_silver.read_delta("dim_users")
+    user_half_life = (
+        dim_users_lf.filter(pl.col("username") == username)
+        .select("user_half_life_days")
+        .collect()
+    )
+
+    if len(user_half_life) == 0:
+        logger.warning(
+            f"No user dimension found for {username}, using default half-life"
+        )
+        half_life_days = 30.0  # MIN_HALF_LIFE_DAYS from dimensions.py
+    else:
+        half_life_days = float(user_half_life["user_half_life_days"].item())
+
+    # Get tracks with play statistics
+    now = datetime.now(timezone.utc)
+    track_stats = (
+        plays_lf.group_by("track_id")
+        .agg(
+            pl.len().alias("play_count"),
+            pl.col("scrobbled_at_utc").max().alias("last_played_at"),
+        )
+        .with_columns(
+            # Calculate days since last play
+            ((pl.lit(now.timestamp()) - pl.col("last_played_at").dt.epoch()) / 86400)
+            .cast(pl.Int64)
+            .alias("days_since_last_play")
+        )
+        .filter(pl.col("days_since_last_play") >= min_days_since_last_play)
+    )
+
+    # Score with half-life decay: play_count * exp(-days / half_life)
+    # Use per-user half-life (calculated as listening_span / 3, min 30 days)
+    scored_tracks = track_stats.with_columns(
+        (
+            pl.col("play_count")
+            * pl.lit(2).pow(-pl.col("days_since_last_play") / half_life_days)
+        ).alias("score")
+    )
+
+    # Get top candidates
+    candidates = (
+        scored_tracks.sort("score", descending=True)
+        .limit(max_candidates)
+        .with_columns(pl.lit(username).alias("username"))
+        .select(["username", "track_id", "score", "play_count", "days_since_last_play"])
+        .collect()
+    )
+
+    logger.info(
+        f"Found {len(candidates)} old favorite candidates for {username} "
+        f"(not played in {min_days_since_last_play}+ days)"
+    )
+
+    # Write to silver Delta table (overwrite per user)
+    if len(candidates) == 0:
+        # Create empty DataFrame with correct schema
+        candidates = pl.DataFrame(
+            schema={
+                "username": pl.String,
+                "track_id": pl.String,
+                "score": pl.Float64,
+                "play_count": pl.Int64,
+                "days_since_last_play": pl.Int64,
+            }
+        )
+
+    write_meta = delta_mgr_silver.write_delta(
+        candidates,
+        table_name="candidate_old_favorites",
+        mode="merge",
+        predicate="s.username = t.username",
+        partition_by="username",
+    )
+
+    return {
+        "path": write_meta["path"],
+        "rows": write_meta["rows"],
+        "table_name": write_meta["table_name"],
+    }
+
+
+def merge_candidate_sources(
+    username: str,
+    tracks_per_source: int = 500,
+) -> dict[str, Any]:
     """
     Merge candidate sources from silver tables into single gold table.
 
@@ -833,12 +1184,20 @@ def merge_candidate_sources(username: str) -> dict[str, Any]:
     - similar_artist: bool
     - similar_tag: bool
     - deep_cut_same_artist: bool
+    - old_favorite: bool
 
-    Deduplicates tracks that appear in multiple sources, preserving all source flags.
+    Normalizes scores within each source (min-max to 0-1 range), limits each source
+    to top N tracks, filters out tracks user has already played (except old_favorites),
+    and deduplicates tracks that appear in multiple sources.
+
+    Note: Metadata columns (track_name, artist_name, etc.) are NOT included in the gold
+    table, as recommendations may not exist in dimension tables yet.
+
     Saves result to data/gold/track_candidates/ Delta table.
 
     Args:
         username: Target user
+        tracks_per_source: Maximum tracks to include from each source (default 500)
 
     Returns:
         Metadata dict with path, rows, table_name
@@ -847,129 +1206,243 @@ def merge_candidate_sources(username: str) -> dict[str, Any]:
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
     delta_mgr_gold = PolarsDeltaIOManager(medallion_layer="gold")
 
-    # Load from silver tables
+    # Load from silver candidate tables
     similar_artists_lf = delta_mgr_silver.read_delta("candidate_similar_artist")
     similar_tags_lf = delta_mgr_silver.read_delta("candidate_similar_tag")
     deep_cuts_lf = delta_mgr_silver.read_delta("candidate_deep_cut")
 
-    # Normalize schemas across different sources
-    # similar_artists: has listeners, playcount, score (int)
-    # similar_tags: has tag_match_count, avg_rank, score (float)
-    # deep_cuts: has album_name, listeners, playcount, score (float)
+    # Try to load old_favorites (may not exist initially)
+    try:
+        old_favorites_lf = delta_mgr_silver.read_delta("candidate_old_favorites")
+    except (TableNotFoundError, FileNotFoundError):
+        old_favorites_lf = None
 
-    similar_artists_typed = (
-        similar_artists_lf.filter(pl.col("username") == username)
-        .with_columns(
-            pl.lit(None).cast(pl.String).alias("album_name"),
-            pl.lit(True).alias("similar_artist"),
-            pl.lit(False).alias("similar_tag"),
-            pl.lit(False).alias("deep_cut_same_artist"),
-            pl.col("score").cast(pl.Float64),
+    # Load plays to filter out already-played tracks
+    plays_lf = delta_mgr_silver.read_delta("plays")
+    played_track_ids = (
+        plays_lf.filter(pl.col("username") == username).select("track_id").unique()
+    )
+
+    # Load dimension tables for MBID lookup
+    tracks_dim_lf = delta_mgr_silver.read_delta("tracks")
+    artists_dim_lf = delta_mgr_silver.read_delta("artists")
+
+    # Process each source: normalize scores, limit, and filter played tracks
+    def process_source(
+        source_lf,
+        source_name: str,
+        filter_played: bool = True,
+    ):
+        """Normalize scores using percentile ranks, limit to top N, optionally filter played tracks."""
+        filtered = source_lf.filter(pl.col("username") == username)
+
+        # Filter out already-played tracks (except for old_favorites which ARE played tracks)
+        if filter_played:
+            filtered = filtered.join(played_track_ids, on="track_id", how="anti")
+
+        # Normalize scores using percentile rank (0-1) to avoid outlier domination
+        # This is more robust than min-max normalization
+        filtered = (
+            filtered.with_columns(pl.col("score").rank(method="average").alias("rank"))
+            .with_columns(
+                (pl.col("rank") / pl.col("rank").max()).alias("normalized_score")
+            )
+            .drop("rank")
         )
-        .select(
+
+        # Limit to top N tracks by original score
+        filtered = filtered.sort("score", descending=True).limit(tracks_per_source)
+
+        # Join with tracks dimension to get track_mbid and artist_id
+        filtered = filtered.join(
+            tracks_dim_lf.select(["track_id", "track_mbid", "artist_id"]),
+            on="track_id",
+            how="left",
+        )
+
+        # Join with artists dimension to get artist_mbid
+        filtered = filtered.join(
+            artists_dim_lf.select(["artist_id", "artist_mbid"]),
+            on="artist_id",
+            how="left",
+        ).drop("artist_id")
+
+        # Add source flags
+        filtered = filtered.with_columns(
+            pl.lit(source_name == "similar_artist").alias("similar_artist"),
+            pl.lit(source_name == "similar_tag").alias("similar_tag"),
+            pl.lit(source_name == "deep_cut").alias("deep_cut_same_artist"),
+            pl.lit(source_name == "old_favorite").alias("old_favorite"),
+        )
+
+        # Select standard columns (no metadata columns) - always include MBIDs
+        return filtered.select(
             [
                 "username",
                 "track_id",
-                "track_name",
                 "track_mbid",
-                "artist_name",
                 "artist_mbid",
-                "album_name",
-                "listeners",
-                "playcount",
-                "score",
+                "normalized_score",
                 "similar_artist",
                 "similar_tag",
                 "deep_cut_same_artist",
+                "old_favorite",
             ]
         )
+
+    similar_artists_processed = process_source(
+        similar_artists_lf,
+        "similar_artist",
+        filter_played=True,
+    )
+    similar_tags_processed = process_source(
+        similar_tags_lf,
+        "similar_tag",
+        filter_played=True,
+    )
+    deep_cuts_processed = process_source(
+        deep_cuts_lf,
+        "deep_cut",
+        filter_played=True,
     )
 
-    similar_tags_typed = (
-        similar_tags_lf.filter(pl.col("username") == username)
-        .with_columns(
-            pl.lit(None).cast(pl.String).alias("album_name"),
-            pl.lit(None).cast(pl.Int64).alias("listeners"),
-            pl.lit(None).cast(pl.Int64).alias("playcount"),
-            pl.lit(False).alias("similar_artist"),
-            pl.lit(True).alias("similar_tag"),
-            pl.lit(False).alias("deep_cut_same_artist"),
-        )
-        .select(
-            [
-                "username",
-                "track_id",
-                "track_name",
-                "track_mbid",
-                "artist_name",
-                "artist_mbid",
-                "album_name",
-                "listeners",
-                "playcount",
-                "score",
-                "similar_artist",
-                "similar_tag",
-                "deep_cut_same_artist",
-            ]
-        )
-    )
+    # Process old_favorites if available (don't filter played - they ARE played tracks)
+    sources_to_concat = [
+        similar_artists_processed,
+        similar_tags_processed,
+        deep_cuts_processed,
+    ]
 
-    deep_cuts_typed = (
-        deep_cuts_lf.filter(pl.col("username") == username)
-        .with_columns(
-            pl.lit(False).alias("similar_artist"),
-            pl.lit(False).alias("similar_tag"),
-            pl.lit(True).alias("deep_cut_same_artist"),
+    if old_favorites_lf is not None:
+        old_favorites_processed = process_source(
+            old_favorites_lf,
+            "old_favorite",
+            filter_played=False,  # Don't filter - these ARE old plays
         )
-        .select(
-            [
-                "username",
-                "track_id",
-                "track_name",
-                "track_mbid",
-                "artist_name",
-                "artist_mbid",
-                "album_name",
-                "listeners",
-                "playcount",
-                "score",
-                "similar_artist",
-                "similar_tag",
-                "deep_cut_same_artist",
-            ]
-        )
-    )
+        sources_to_concat.append(old_favorites_processed)
 
     # Concatenate all sources
-    all_candidates = pl.concat(
-        [similar_artists_typed, similar_tags_typed, deep_cuts_typed]
-    )
+    all_candidates = pl.concat(sources_to_concat)
 
-    # Deduplicate by track_id, aggregating source flags with max (True if any source had it)
-    merged = (
-        all_candidates.group_by(
-            "username",
-            "track_id",
-            "track_name",
-            "track_mbid",
-            "artist_name",
-            "artist_mbid",
-        )
+    # Deduplicate by track_id, aggregating source flags and summing normalized scores
+    # Summing scores rewards tracks recommended by multiple generators (consensus)
+    # Note: We don't join with tracks dimension for metadata, as candidates may not exist there yet
+    merged_lf = (
+        all_candidates.group_by("username", "track_id")
         .agg(
-            pl.first("album_name").alias("album_name"),
-            pl.first("listeners").alias("listeners"),
-            pl.first("playcount").alias("playcount"),
-            pl.max("similar_artist").alias("similar_artist"),
-            pl.max("similar_tag").alias("similar_tag"),
-            pl.max("deep_cut_same_artist").alias("deep_cut_same_artist"),
-            pl.max("score").alias("max_score"),
+            [
+                pl.first("track_mbid").alias("track_mbid"),
+                pl.first("artist_mbid").alias("artist_mbid"),
+                pl.max("similar_artist").alias("similar_artist"),
+                pl.max("similar_tag").alias("similar_tag"),
+                pl.max("deep_cut_same_artist").alias("deep_cut_same_artist"),
+                pl.max("old_favorite").alias("old_favorite"),
+                pl.sum("normalized_score").alias("score"),  # Sum to reward consensus
+            ]
         )
-        .sort("max_score", descending=True)
-        .drop("max_score")
+        .sort("score", descending=True)
     )
 
-    # Write to gold Delta table
-    df = merged.collect()
+    # Enrich candidate tracks with full metadata from Last.fm and MusicBrainz
+    # Join with tracks dimension to get track_name and artist_name needed for enrichment
+    merged_with_dim = merged_lf.join(
+        tracks_dim_lf.select(["track_id", "track_name", "artist_name"]),
+        on="track_id",
+        how="left",
+    )
+
+    # Filter to only tracks that DON'T exist in dim_tracks (need enrichment)
+    # Parse synthetic track_ids (format: "track_name|artist_name") for tracks without MBID
+    tracks_for_enrichment = (
+        merged_with_dim.filter(pl.col("track_name").is_null())  # Not in dim_tracks yet
+        .with_columns(
+            [
+                # Parse synthetic IDs: "track_name|artist_name"
+                pl.when(pl.col("track_id").str.contains("|"))
+                .then(pl.col("track_id").str.split("|").list.first())
+                .otherwise(None)
+                .alias("track_name"),
+                pl.when(pl.col("track_id").str.contains("|"))
+                .then(pl.col("track_id").str.split("|").list.last())
+                .otherwise(None)
+                .alias("artist_name"),
+            ]
+        )
+        # Filter to only tracks where we could extract metadata
+        .filter(
+            pl.col("track_name").is_not_null()
+            & pl.col("artist_name").is_not_null()
+            & (
+                pl.col("track_name") != pl.col("artist_name")
+            )  # Ensure split worked correctly
+        )
+    )
+
+    # Import enrichment function
+    from music_airflow.transform.dimensions import (
+        enrich_track_metadata,
+        _deduplicate_tracks,
+    )
+
+    # Only enrich if we have tracks with valid metadata
+    if tracks_for_enrichment.select("track_id").collect().shape[0] > 0:
+        # Enrich tracks (fetches from Last.fm and MusicBrainz)
+        num_to_enrich = (
+            tracks_for_enrichment.select("track_id").unique().collect().shape[0]
+        )
+        logger.info(
+            f"Enriching {num_to_enrich} new candidate tracks not yet in dim_tracks..."
+        )
+        enriched_tracks_lf = enrich_track_metadata(tracks_for_enrichment)
+
+        # Write enriched tracks to separate silver table for dimension flow to pick up
+        enriched_tracks_df = (
+            enriched_tracks_lf.select(
+                [
+                    "track_id",
+                    "track_name",
+                    "track_mbid",
+                    "artist_name",
+                    "artist_mbid",
+                    "album_name",
+                    "duration_ms",
+                    "listeners",
+                    "playcount",
+                    "tags",
+                    "track_url",
+                ]
+            )
+            .unique(subset=["track_id"])
+            .collect()
+        )
+
+        # Deduplicate tracks before writing
+        enriched_tracks_dedup_df = _deduplicate_tracks(
+            enriched_tracks_df.lazy()
+        ).collect()
+
+        # Add recommended_at timestamp after deduplication
+        enriched_tracks_with_timestamp = enriched_tracks_dedup_df.with_columns(
+            pl.lit(datetime.now()).alias("recommended_at")
+        )
+
+        # Append to silver candidate_enriched_tracks table (dimension flow will deduplicate on read)
+        if not enriched_tracks_with_timestamp.is_empty():
+            logger.info(
+                f"Appending {enriched_tracks_with_timestamp.shape[0]} enriched tracks to candidate_enriched_tracks..."
+            )
+            delta_mgr_silver.write_delta(
+                enriched_tracks_with_timestamp,
+                table_name="candidate_enriched_tracks",
+                mode="append",
+            )
+    else:
+        logger.info(
+            "No new tracks to enrich (all candidates already exist in dim_tracks or cannot parse track_id)"
+        )
+
+    # Write gold candidate table (without full metadata to keep it lightweight)
+    df = merged_lf.collect()  # type: ignore[attr-defined]
     write_meta = delta_mgr_gold.write_delta(
         df,
         table_name="track_candidates",

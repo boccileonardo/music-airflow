@@ -81,6 +81,19 @@ def _write_silver_base_tables(patched_delta_io):
         artists_df, table_name="artists", mode="overwrite"
     )
 
+    # Gold artist_play_count: user's play stats for each artist
+    artist_play_counts_df = pl.DataFrame(
+        {
+            "username": ["user1", "user1", "user1"],
+            "artist_id": ["a1", "b1", "c1"],
+            "artist_name": ["Artist A", "Artist B", "Artist C"],
+            "play_count": [10, 5, 3],
+        }
+    )
+    patched_delta_io("gold").write_delta(
+        artist_play_counts_df, table_name="artist_play_count", mode="overwrite"
+    )
+
 
 class TestSimilarArtistCandidates:
     @pytest.mark.asyncio
@@ -217,7 +230,6 @@ class TestSimilarTagCandidates:
                 username="user1",
                 top_tags_count=3,
                 min_tag_matches=3,  # explicitly test with 3 matches
-                max_rank=20,
             )
 
         assert result["table_name"] == "candidate_similar_tag"
@@ -232,10 +244,8 @@ class TestSimilarTagCandidates:
         assert df["tag_match_count"][0] == 3
         # Tags are sorted alphabetically when collected
         assert set(df["source_tags"][0].split(",")) == {"rock", "indie", "alt"}
-        # Score = tag_match_count * 1000 + (100 - avg_rank)
-        # avg_rank = (1 + 3 + 5) / 3 = 3
-        # score = 3000 + (100 - 3) = 3097
-        assert df["score"][0] == pytest.approx(3097.0, abs=0.1)
+        # Score = tag_match_count
+        assert df["score"][0] == 3.0
 
 
 class TestDeepCutCandidates:
@@ -256,21 +266,27 @@ class TestDeepCutCandidates:
             client = MockClient.return_value
             client.__aenter__ = AsyncMock(return_value=client)
             client.__aexit__ = AsyncMock(return_value=None)
-            # Top albums for Artist A, include both albums (no upper limit now)
-            client.get_artist_top_albums = AsyncMock(
-                return_value=[
-                    {
-                        "name": "Album One",
-                        "playcount": 10000,
-                        "artist": {"mbid": "a_mbid"},
-                    },
-                    {
-                        "name": "Album Two",
-                        "playcount": 1000000,
-                        "artist": {"mbid": "a_mbid"},
-                    },
-                ]
-            )
+
+            # Mock get_artist_top_albums to return albums only for Artist A
+            async def mock_top_albums(artist_name, limit=10):
+                if artist_name == "Artist A":
+                    return [
+                        {
+                            "name": "Album One",
+                            "playcount": 10000,
+                            "artist": {"mbid": "a_mbid"},
+                        },
+                        {
+                            "name": "Album Two",
+                            "playcount": 1000000,
+                            "artist": {"mbid": "a_mbid"},
+                        },
+                    ]
+                else:
+                    # Other artists have no albums above threshold
+                    return []
+
+            client.get_artist_top_albums = mock_top_albums
 
             # Album info returns track list including one already played
             async def mock_album_info(album_name, artist_name):
@@ -311,18 +327,53 @@ class TestDeepCutCandidates:
 
 class TestMergeCandidateSources:
     def test_dedup_and_source_flags(self, test_data_dir, patched_delta_io):
-        # Write synthetic silver candidate tables directly to test merge logic
+        # Write plays table (empty for this user to not filter candidates)
+        plays_df = pl.DataFrame(
+            {
+                "username": ["user1"],
+                "track_id": ["some_other_track"],
+            }
+        )
+        patched_delta_io("silver").write_delta(
+            plays_df, table_name="plays", mode="overwrite"
+        )
+
+        # Write dimension tables needed for joins
+        tracks_df = pl.DataFrame(
+            {
+                "track_id": ["artist b::new track", "artist c::tag track"],
+                "track_name": ["New Track", "Tag Track"],
+                "track_mbid": ["tmbid", "tm2"],
+                "artist_name": ["Artist B", "Artist C"],
+                "artist_id": ["b1", "c1"],
+                "album_name": ["Album Y", "Album X"],
+                "listeners": [5000, 6000],
+                "playcount": [10000, 6000],
+            }
+        )
+        patched_delta_io("silver").write_delta(
+            tracks_df, table_name="tracks", mode="overwrite"
+        )
+
+        artists_df = pl.DataFrame(
+            {
+                "artist_id": ["b1", "c1"],
+                "artist_mbid": ["bmbid", "cmbid"],
+            }
+        )
+        patched_delta_io("silver").write_delta(
+            artists_df, table_name="artists", mode="overwrite"
+        )
+
+        # Write synthetic silver candidate tables with updated schema (includes artist_mbid)
         similar_artist_df = pl.DataFrame(
             {
                 "username": ["user1"],
                 "track_id": ["artist b::new track"],
-                "track_name": ["New Track"],
                 "track_mbid": ["tmbid"],
-                "artist_name": ["Artist B"],
                 "artist_mbid": ["bmbid"],
-                "listeners": [5000],
-                "playcount": [10000],
-                "score": [10000.0],
+                "score": [10000],
+                "source_artist_id": ["a1"],
             }
         )
         patched_delta_io("silver").write_delta(
@@ -333,9 +384,7 @@ class TestMergeCandidateSources:
             {
                 "username": ["user1", "user1"],
                 "track_id": ["artist b::new track", "artist c::tag track"],
-                "track_name": ["New Track", "Tag Track"],
                 "track_mbid": ["tmbid", "tm2"],
-                "artist_name": ["Artist B", "Artist C"],
                 "artist_mbid": ["bmbid", "cmbid"],
                 "tag_match_count": [3, 4],
                 "avg_rank": [5.0, 3.0],
@@ -347,19 +396,15 @@ class TestMergeCandidateSources:
             similar_tag_df, table_name="candidate_similar_tag", mode="overwrite"
         )
 
-        # Ensure column order aligns with similar_* tables for concat
         deep_cut_df = pl.DataFrame(
             {
                 "username": ["user1"],
                 "track_id": ["artist c::tag track"],
-                "track_name": ["Tag Track"],
                 "track_mbid": ["tm2"],
-                "artist_name": ["Artist C"],
                 "artist_mbid": ["cmbid"],
-                "listeners": [6000],
-                "playcount": [6000],
-                "score": [0.0001],
                 "album_name": ["Album X"],
+                "score": [6000.0],
+                "source_artist_id": ["c1"],
             }
         )
         patched_delta_io("silver").write_delta(
@@ -386,8 +431,16 @@ class TestMergeCandidateSources:
         assert b_row["similar_artist"] is True
         assert b_row["similar_tag"] is True
         assert b_row["deep_cut_same_artist"] is False
+        assert b_row["old_favorite"] is False
+        # Metadata columns should NOT be present (candidates may not exist in dim tables)
+        assert "track_name" not in b_row
+        assert "artist_name" not in b_row
 
         c_row = rows["artist c::tag track"]
         assert c_row["similar_artist"] is False
         assert c_row["similar_tag"] is True
         assert c_row["deep_cut_same_artist"] is True
+        assert c_row["old_favorite"] is False
+        # Metadata columns should NOT be present
+        assert "track_name" not in c_row
+        assert "artist_name" not in c_row

@@ -4,7 +4,9 @@ Transform dimension data (tracks, artists) from bronze to silver layer.
 Cleans and structures raw Last.fm metadata for analytics.
 """
 
+import asyncio
 from datetime import datetime
+import logging
 from typing import Any
 
 import polars as pl
@@ -15,6 +17,8 @@ from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOMa
 from music_airflow.lastfm_client import LastFMClient
 import requests
 
+logger = logging.getLogger(__name__)
+
 # Minimum half-life for new users (30 days)
 MIN_HALF_LIFE_DAYS = 30.0
 
@@ -22,6 +26,7 @@ __all__ = [
     "transform_tracks_to_silver",
     "transform_artists_to_silver",
     "compute_dim_users",
+    "enrich_track_metadata",
     "_transform_tracks_raw_to_structured",
     "_transform_artists_raw_to_structured",
     "_deduplicate_tracks",
@@ -36,6 +41,9 @@ def transform_tracks_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]
     Reads raw JSON track data from bronze, extracts and flattens relevant fields,
     and merges into silver Delta table. Uses upsert based on MBID when available,
     otherwise falls back to track_name + artist_name + album_name.
+
+    Also checks for and incorporates enriched candidate tracks from candidate_enriched_tracks
+    table if it exists.
 
     Args:
         fetch_metadata: Metadata from extraction containing filename, tracks_fetched
@@ -62,6 +70,7 @@ def transform_tracks_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]
     # Apply transformations
     df = _transform_tracks_raw_to_structured(tracks_lf)
     df = _deduplicate_tracks(df)
+    df = _union_enriched_recommended_tracks(df)
 
     # Write to silver layer Delta table with merge/upsert
     table_name = "tracks"
@@ -164,6 +173,70 @@ def _search_musicbrainz_artist_mbid(artist_name: str) -> str | None:
         return None
 
 
+def _search_musicbrainz_track_mbid(track_name: str, artist_name: str) -> str | None:
+    """Search MusicBrainz for a track MBID (first hit)."""
+    try:
+        query = f'recording:"{track_name}" AND artist:"{artist_name}"'
+        resp = requests.get(
+            "https://musicbrainz.org/ws/2/recording",
+            params={"query": query, "fmt": "json", "limit": 1},
+            headers={
+                "User-Agent": "github.com/boccileonardo/music-airflow",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        recordings = data.get("recordings", [])
+        if recordings:
+            return recordings[0].get("id")
+        return None
+    except requests.RequestException:
+        print(
+            f"Unable to get MBID from MusicBrainz for track: {track_name} by {artist_name}"
+        )
+        return None
+
+
+def _union_enriched_recommended_tracks(df: pl.LazyFrame) -> pl.LazyFrame:
+    # Check for enriched candidate tracks and merge them in
+    silver_io = PolarsDeltaIOManager(medallion_layer="silver")
+    try:
+        candidate_tracks = silver_io.read_delta("candidate_enriched_tracks")
+        # Deduplicate by track_id, keeping the most recent enrichment
+        candidate_tracks = (
+            candidate_tracks.sort("recommended_at", descending=True)
+            .group_by("track_id")
+            .agg(
+                [
+                    pl.first("track_name"),
+                    pl.first("track_mbid"),
+                    pl.first("artist_name"),
+                    pl.first("artist_mbid"),
+                    pl.first("album_name"),
+                    pl.first("duration_ms"),
+                    pl.first("listeners"),
+                    pl.first("playcount"),
+                    pl.first("tags"),
+                    pl.first("track_url"),
+                ]
+            )
+        )
+        track_count: int = candidate_tracks.select(pl.len()).collect().item()
+        if track_count > 0:
+            logger.info(
+                f"Merging {track_count} enriched candidate tracks into dimension"
+            )
+            # Concatenate and deduplicate
+            combined_lf = pl.concat([df, candidate_tracks])
+            df = _deduplicate_tracks(combined_lf)
+    except (FileNotFoundError, TableNotFoundError):
+        # No enriched candidates yet, continue with just the fetched tracks
+        logger.info("No enriched candidate tracks found to merge into dimension")
+        pass
+    return df
+
+
 def _enrich_missing_artist_mbids(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
     """
     Enrich missing artist MBIDs by consulting Last.fm artist.search and
@@ -251,6 +324,170 @@ def _enrich_missing_artist_mbids(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
     )
 
     return enriched
+
+
+def enrich_track_metadata(
+    tracks_lf: pl.LazyFrame,
+) -> pl.LazyFrame:
+    """
+    Enrich track metadata by fetching from Last.fm and MusicBrainz.
+
+    For tracks without full metadata, fetches:
+    - Track MBID, duration, listeners, playcount, tags, URL
+    - Artist MBID
+    - Queries Last.fm track.getInfo first
+    - Falls back to MusicBrainz for missing track MBIDs
+
+    Args:
+        tracks_lf: LazyFrame with track_id, track_name, artist_name (min required)
+
+    Returns:
+        Enriched LazyFrame with full track metadata
+    """
+    # Collect unique track/artist combinations to enrich
+    tracks_to_enrich = (
+        tracks_lf.select(["track_id", "track_name", "artist_name"])
+        .unique()
+        .collect(engine="streaming")
+    )
+
+    if tracks_to_enrich.is_empty():
+        return tracks_lf
+
+    async def _enrich_tracks():
+        async with LastFMClient(api_key=None) as client:
+            # Fetch all track info concurrently
+            fetch_tasks = [
+                client.get_track_info(
+                    track=row["track_name"], artist=row["artist_name"]
+                )
+                for row in tracks_to_enrich.to_dicts()
+            ]
+
+            print(f"Enriching {len(fetch_tasks)} tracks from Last.fm...")
+            all_track_results = await asyncio.gather(
+                *fetch_tasks, return_exceptions=True
+            )
+
+            # Process results and build enriched data
+            enriched_data = []
+            for row, track_info in zip(tracks_to_enrich.to_dicts(), all_track_results):
+                track_name = row["track_name"]
+                artist_name = row["artist_name"]
+                track_id = row["track_id"]
+
+                # Handle errors or empty results from Last.fm
+                if isinstance(track_info, Exception):
+                    print(
+                        f"Last.fm fetch failed for track '{track_name}' by '{artist_name}': {track_info}"
+                    )
+                    track_info = {}
+
+                # Extract data from Last.fm response
+                track_mbid = track_info.get("mbid") or None
+                duration_ms = track_info.get("duration")
+                listeners = track_info.get("listeners")
+                playcount = track_info.get("playcount")
+                track_url = track_info.get("url")
+
+                # Extract artist info
+                artist_info = track_info.get("artist", {})
+                artist_mbid = artist_info.get("mbid") or None
+
+                # Extract album info
+                album_info = track_info.get("album", {})
+                album_name = album_info.get("title") if album_info else None
+
+                # Extract tags
+                toptags = track_info.get("toptags", {})
+                tag_list = toptags.get("tag", []) if toptags else []
+                if isinstance(tag_list, list):
+                    tags = ", ".join([t.get("name", "") for t in tag_list[:5]])
+                else:
+                    tags = None
+
+                # Fallback to MusicBrainz for track MBID if missing
+                if not track_mbid:
+                    print(
+                        f"Falling back to MusicBrainz for track: {track_name} by {artist_name}"
+                    )
+                    track_mbid = _search_musicbrainz_track_mbid(track_name, artist_name)
+
+                enriched_data.append(
+                    {
+                        "track_id": track_id,
+                        "track_name": track_name,
+                        "track_mbid": track_mbid,
+                        "artist_name": artist_name,
+                        "artist_mbid": artist_mbid,
+                        "album_name": album_name,
+                        "duration_ms": int(duration_ms) if duration_ms else None,
+                        "listeners": int(listeners) if listeners else None,
+                        "playcount": int(playcount) if playcount else None,
+                        "tags": tags,
+                        "track_url": track_url,
+                    }
+                )
+
+            return pl.DataFrame(
+                enriched_data,
+                schema={
+                    "track_id": pl.Utf8,
+                    "track_name": pl.Utf8,
+                    "track_mbid": pl.Utf8,
+                    "artist_name": pl.Utf8,
+                    "artist_mbid": pl.Utf8,
+                    "album_name": pl.Utf8,
+                    "duration_ms": pl.Int64,
+                    "listeners": pl.Int64,
+                    "playcount": pl.Int64,
+                    "tags": pl.Utf8,
+                    "track_url": pl.Utf8,
+                },
+            )
+
+    enriched_df = asyncio.run(_enrich_tracks())
+
+    if enriched_df.is_empty():
+        return tracks_lf
+
+    # Merge enriched data back into the original lazyframe
+    result = tracks_lf.join(
+        enriched_df.lazy(),
+        on=["track_id", "track_name", "artist_name"],
+        how="left",
+        suffix="_enriched",
+    )
+
+    # Coalesce to prefer enriched values where available
+    schema_names = result.collect_schema().names()
+
+    coalesce_columns = []
+    for col in [
+        "track_mbid",
+        "artist_mbid",
+        "album_name",
+        "duration_ms",
+        "listeners",
+        "playcount",
+        "tags",
+        "track_url",
+    ]:
+        enriched_col = f"{col}_enriched"
+        if enriched_col in schema_names:
+            coalesce_columns.append(
+                pl.coalesce([pl.col(enriched_col), pl.col(col)]).alias(col)
+            )
+
+    if coalesce_columns:
+        result = result.with_columns(coalesce_columns)
+
+    # Drop enriched suffix columns
+    cols_to_drop = [c for c in schema_names if c.endswith("_enriched")]
+    if cols_to_drop:
+        result = result.drop(cols_to_drop)
+
+    return result
 
 
 def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFrame:
