@@ -27,6 +27,7 @@ class TestTransformPlaysRawToStructured:
             "name": ["Track 1", "Track 2"],
             "mbid": ["mbid1", "mbid2"],
             "url": ["url1", "url2"],
+            "loved": ["1", "0"],
             "date": [
                 {"uts": "1609459200", "#text": "01 Jan 2021"},
                 {"uts": "1609545600", "#text": "02 Jan 2021"},
@@ -55,6 +56,7 @@ class TestTransformPlaysRawToStructured:
             "artist_name",
             "album_name",
             "album_mbid",
+            "is_loved",
             "track_id",
         ]
         assert result.columns == expected_cols
@@ -64,6 +66,7 @@ class TestTransformPlaysRawToStructured:
         assert result["track_name"].to_list() == ["Track 1", "Track 2"]
         assert result["artist_name"].to_list() == ["Artist 1", "Artist 2"]
         assert result["album_name"].to_list() == ["Album 1", "Album 2"]
+        assert result["is_loved"].to_list() == [True, False]
 
         # Check timestamps
         assert result["scrobbled_at"].to_list() == [1609459200, 1609545600]
@@ -85,6 +88,7 @@ class TestTransformPlaysRawToStructured:
             "name": ["Track 1"],
             "mbid": [""],
             "url": ["url1"],
+            "loved": ["0"],
             "date": [{"uts": "1609459200", "#text": "01 Jan 2021"}],
             "artist": [{"name": "Artist 1", "mbid": None}],
             "album": [{"#text": "Album 1", "mbid": None}],
@@ -104,6 +108,7 @@ class TestTransformPlaysRawToStructured:
             "name": ["Track 3", "Track 1", "Track 2"],
             "mbid": ["mbid3", "mbid1", "mbid2"],
             "url": ["url3", "url1", "url2"],
+            "loved": ["1", "0", "1"],
             "date": [
                 {"uts": "1609632000", "#text": "03 Jan 2021"},
                 {"uts": "1609459200", "#text": "01 Jan 2021"},
@@ -136,6 +141,7 @@ class TestTransformPlaysRawToStructured:
                 "name": pl.Utf8,
                 "mbid": pl.Utf8,
                 "url": pl.Utf8,
+                "loved": pl.Utf8,
                 "date": pl.Struct(
                     [pl.Field("uts", pl.Utf8), pl.Field("#text", pl.Utf8)]
                 ),
@@ -161,6 +167,7 @@ class TestTransformPlaysRawToStructured:
             "artist_name",
             "album_name",
             "album_mbid",
+            "is_loved",
             "track_id",
         ]
 
@@ -183,6 +190,7 @@ class TestTransformPlaysRawToStructuredIntegration:
                 "name": "Track 1",
                 "mbid": "mbid1",
                 "url": "url1",
+                "loved": "0",
                 "date": {"uts": "1609459200", "#text": "01 Jan 2021"},
                 "artist": {"name": "Artist 1", "mbid": "artist_mbid1"},
                 "album": {"#text": "Album 1", "mbid": "album_mbid1"},
@@ -191,6 +199,7 @@ class TestTransformPlaysRawToStructuredIntegration:
                 "name": "Track 2",
                 "mbid": "mbid2",
                 "url": "url2",
+                "loved": "1",
                 "date": {"uts": "1609462800", "#text": "01 Jan 2021"},
                 "artist": {"name": "Artist 2", "mbid": "artist_mbid2"},
                 "album": {"#text": "Album 2", "mbid": "album_mbid2"},
@@ -305,6 +314,7 @@ class TestTransformPlaysRawToStructuredIntegration:
                 "name": "Track User1",
                 "mbid": "mbid1",
                 "url": "url1",
+                "loved": "1",
                 "date": {"uts": "1672531200", "#text": "01 Jan 2023"},
                 "artist": {"name": "Artist 1", "mbid": "artist_mbid1"},
                 "album": {"#text": "Album 1", "mbid": "album_mbid1"},
@@ -321,6 +331,7 @@ class TestTransformPlaysRawToStructuredIntegration:
                 "name": "Track User2",
                 "mbid": "mbid2",
                 "url": "url2",
+                "loved": "0",
                 "date": {"uts": "1672531200", "#text": "01 Jan 2023"},
                 "artist": {"name": "Artist 2", "mbid": "artist_mbid2"},
                 "album": {"#text": "Album 2", "mbid": "album_mbid2"},
@@ -394,6 +405,7 @@ class TestTransformPlaysRawToStructuredIntegration:
                 "name": "Track",
                 "mbid": "mbid",
                 "url": "url",
+                "loved": "0",
                 "date": {"uts": "1609459200", "#text": "01 Jan 2021"},
                 "artist": {"name": "Artist", "mbid": "artist_mbid"},
                 "album": {"#text": "Album", "mbid": "album_mbid"},
@@ -589,6 +601,7 @@ class TestDeltaMergeMetrics:
                 "name": "Track 1",
                 "mbid": "mbid1",
                 "url": "url1",
+                "loved": "0",
                 "date": {"uts": "1609459200", "#text": "01 Jan 2021"},
                 "artist": {"name": "Artist 1", "mbid": "artist_mbid1"},
                 "album": {"#text": "Album 1", "mbid": "album_mbid1"},
@@ -636,6 +649,7 @@ class TestDeltaMergeMetrics:
                     "name": "Track 1 Updated",  # Update existing
                     "mbid": "mbid1",
                     "url": "url1",
+                    "loved": "1",
                     "date": {"uts": "1609459200", "#text": "01 Jan 2021"},
                     "artist": {"name": "Artist 1", "mbid": "artist_mbid1"},
                     "album": {"#text": "Album 1", "mbid": "album_mbid1"},
@@ -644,6 +658,7 @@ class TestDeltaMergeMetrics:
                     "name": "Track 2",  # New insert
                     "mbid": "mbid2",
                     "url": "url2",
+                    "loved": "0",
                     "date": {"uts": "1609462800", "#text": "01 Jan 2021"},
                     "artist": {"name": "Artist 2", "mbid": "artist_mbid2"},
                     "album": {"#text": "Album 2", "mbid": "album_mbid2"},

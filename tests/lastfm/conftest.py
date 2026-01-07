@@ -199,6 +199,7 @@ def sample_paginated_response_page1() -> dict[str, Any]:
                     "name": "Track 1",
                     "album": {"mbid": "album1", "#text": "Album 1"},
                     "url": "https://www.last.fm/music/Artist+1/_/Track+1",
+                    "loved": "1",
                     "date": {"uts": "1609459200", "#text": "01 Jan 2021, 00:00"},
                 },
                 {
@@ -207,6 +208,7 @@ def sample_paginated_response_page1() -> dict[str, Any]:
                     "name": "Track 2",
                     "album": {"mbid": "album2", "#text": "Album 2"},
                     "url": "https://www.last.fm/music/Artist+2/_/Track+2",
+                    "loved": "0",
                     "date": {"uts": "1609462800", "#text": "01 Jan 2021, 01:00"},
                 },
             ],
@@ -233,6 +235,7 @@ def sample_paginated_response_page2() -> dict[str, Any]:
                     "name": "Track 3",
                     "album": {"mbid": "album3", "#text": "Album 3"},
                     "url": "https://www.last.fm/music/Artist+3/_/Track+3",
+                    "loved": "0",
                     "date": {"uts": "1609466400", "#text": "01 Jan 2021, 02:00"},
                 },
             ],

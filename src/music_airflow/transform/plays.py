@@ -114,6 +114,7 @@ def transform_plays_raw_to_structured(
         - track_name, track_mbid, track_url: str
         - artist_name: str
         - album_name, album_mbid: str
+        - is_loved: bool (whether user loved this track)
         - track_id: str (coalesced: MBID or synthetic)
     """
     df = (
@@ -148,6 +149,7 @@ def transform_plays_raw_to_structured(
                 .then(None)
                 .otherwise(pl.col("album").struct.field("mbid"))
                 .alias("album_mbid"),
+                pl.col("loved").cast(pl.Utf8).eq("1").alias("is_loved"),
             ]
         )
         .select(
@@ -161,6 +163,7 @@ def transform_plays_raw_to_structured(
                 "artist_name",
                 "album_name",
                 "album_mbid",
+                "is_loved",
             ]
         )
         .with_columns(
