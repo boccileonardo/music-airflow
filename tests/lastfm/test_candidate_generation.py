@@ -349,6 +349,14 @@ class TestMergeCandidateSources:
                 "album_name": ["Album Y", "Album X"],
                 "listeners": [5000, 6000],
                 "playcount": [10000, 6000],
+                "youtube_url": [
+                    "https://youtube.com/watch?v=1",
+                    "https://youtube.com/watch?v=2",
+                ],
+                "spotify_url": [
+                    "https://open.spotify.com/track/1",
+                    "https://open.spotify.com/track/2",
+                ],
             }
         )
         patched_delta_io("silver").write_delta(

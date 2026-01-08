@@ -1410,6 +1410,8 @@ def merge_candidate_sources(
                     "playcount",
                     "tags",
                     "track_url",
+                    "youtube_url",
+                    "spotify_url",
                 ]
             )
             .unique(subset=["track_id"])
@@ -1441,8 +1443,34 @@ def merge_candidate_sources(
             "No new tracks to enrich (all candidates already exist in dim_tracks or cannot parse track_id)"
         )
 
-    # Write gold candidate table (without full metadata to keep it lightweight)
-    df = merged_lf.collect()  # type: ignore[attr-defined]
+    # Join with tracks dimension to add streaming links and track metadata
+    tracks_with_links = tracks_dim_lf.select(
+        [
+            "track_id",
+            "youtube_url",
+            "spotify_url",
+        ]
+    )
+
+    merged_with_links = merged_lf.join(
+        tracks_with_links,
+        on="track_id",
+        how="left",
+    )
+
+    # CRITICAL: Deduplicate by youtube_url at the gold layer
+    # Different track versions (e.g., "Song" vs "Song (Remastered)") may map to the same
+    # YouTube video. We deduplicate here to ensure downstream consumers (Streamlit app)
+    # get clean data with no duplicate videos. Keep highest-scored track for each video.
+    # Also filter out tracks without youtube_url since they cannot be played.
+    merged_deduped = (
+        merged_with_links.filter(pl.col("youtube_url").is_not_null())
+        .sort("score", descending=True)
+        .unique(subset=["username", "youtube_url"], keep="first")
+    )
+
+    # Write gold candidate table with streaming links (clean, deduplicated data)
+    df = merged_deduped.collect()  # type: ignore[attr-defined]
     write_meta = delta_mgr_gold.write_delta(
         df,
         table_name="track_candidates",

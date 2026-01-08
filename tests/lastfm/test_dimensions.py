@@ -761,3 +761,87 @@ class TestComputeDimUsersWithoutPlaysData:
             compute_dim_users(execution_date)
 
         assert "No plays data available yet" in str(exc_info.value)
+
+
+def test_enrich_track_metadata_with_streaming_links():
+    """Test that track enrichment includes streaming platform links."""
+    from music_airflow.transform.dimensions import enrich_track_metadata
+
+    # Sample tracks to enrich
+    tracks_to_enrich = pl.LazyFrame(
+        {
+            "track_id": ["track1"],
+            "track_name": ["Test Song"],
+            "artist_name": ["Test Artist"],
+        }
+    )
+
+    # Mock Last.fm API response
+    mock_track_info = {
+        "name": "Test Song",
+        "mbid": "test-mbid-123",
+        "duration": 180000,
+        "listeners": 5000,
+        "playcount": 10000,
+        "url": "https://www.last.fm/music/Test+Artist/_/Test+Song",
+        "artist": {
+            "name": "Test Artist",
+            "mbid": "artist-mbid-123",
+        },
+        "album": {
+            "title": "Test Album",
+        },
+        "toptags": {
+            "tag": [
+                {"name": "rock"},
+                {"name": "indie"},
+            ]
+        },
+    }
+
+    # Mock streaming links from scraper
+    mock_streaming_links = {
+        "youtube_url": "https://www.youtube.com/watch?v=test123",
+        "spotify_url": "https://open.spotify.com/track/test456",
+    }
+
+    with (
+        patch("music_airflow.transform.dimensions.LastFMClient") as mock_client,
+        patch("music_airflow.transform.dimensions.LastFMScraper") as mock_scraper,
+        patch(
+            "music_airflow.transform.dimensions._search_musicbrainz_track_mbid",
+            return_value=None,
+        ),
+    ):
+        # Setup client mock
+        mock_client_instance = AsyncMock()
+        mock_client_instance.get_track_info = AsyncMock(return_value=mock_track_info)
+        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+        mock_client_instance.__aexit__ = AsyncMock()
+        mock_client.return_value = mock_client_instance
+
+        # Setup scraper mock
+        mock_scraper_instance = AsyncMock()
+        mock_scraper_instance.get_streaming_links = AsyncMock(
+            return_value=mock_streaming_links
+        )
+        mock_scraper_instance.__aenter__ = AsyncMock(return_value=mock_scraper_instance)
+        mock_scraper_instance.__aexit__ = AsyncMock()
+        mock_scraper.return_value = mock_scraper_instance
+
+        # Run enrichment
+        result = enrich_track_metadata(tracks_to_enrich)
+        result_df = result.collect()
+
+        # Verify all columns exist
+        assert "youtube_url" in result_df.columns
+        assert "spotify_url" in result_df.columns
+
+        # Verify streaming links were populated
+        assert result_df["youtube_url"][0] == "https://www.youtube.com/watch?v=test123"
+        assert result_df["spotify_url"][0] == "https://open.spotify.com/track/test456"
+
+        # Verify scraper was called with correct URL
+        mock_scraper_instance.get_streaming_links.assert_called_once_with(
+            "https://www.last.fm/music/Test+Artist/_/Test+Song"
+        )

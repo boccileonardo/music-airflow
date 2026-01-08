@@ -218,6 +218,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# YouTube Streamlit Auth
+.youtube_token.json
+.streamlit/
+
 # Airflow
 airflow/*
 

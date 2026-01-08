@@ -16,15 +16,16 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "aiohttp>=3.13.2",
   "apache-airflow==3.1.5",
   "apache-airflow-providers-fab",
+  "beautifulsoup4>=4.14.3",
   "deltalake>=1.2.1",
+  "google-api-python-client>=2.187",
+  "google-auth-oauthlib>=1.2.3",
   "polars>=1.36.1",
   "python-dotenv>=1.2.1",
   "requests>=2.32.5",
   "streamlit>=1.52.2",
-  "tenacity>=9.1.2",
 ]
 
 [dependency-groups]

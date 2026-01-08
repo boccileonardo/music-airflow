@@ -15,6 +15,7 @@ from deltalake.exceptions import TableNotFoundError
 
 from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
 from music_airflow.lastfm_client import LastFMClient
+from music_airflow.utils.lastfm_scraper import LastFMScraper
 import requests
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,15 @@ def transform_tracks_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]
 
     # Apply transformations
     df = _transform_tracks_raw_to_structured(tracks_lf)
+
+    # Add youtube_url and spotify_url columns (will be enriched later)
+    df = df.with_columns(
+        [
+            pl.lit(None, dtype=pl.Utf8).alias("youtube_url"),
+            pl.lit(None, dtype=pl.Utf8).alias("spotify_url"),
+        ]
+    )
+
     df = _deduplicate_tracks(df)
     df = _union_enriched_recommended_tracks(df)
 
@@ -168,7 +178,8 @@ def _search_musicbrainz_artist_mbid(artist_name: str) -> str | None:
             return artists[0].get("id")
         return None
     except requests.RequestException:
-        # todo: log
+        # todo: figure out why so many failures to get:
+        # eg:  Unable to get MBID from MusicBrainz for track: Highway Star by Deep Purple
         print("Unable to get MBID from MusicBrainz for artist:", artist_name)
         return None
 
@@ -219,6 +230,8 @@ def _union_enriched_recommended_tracks(df: pl.LazyFrame) -> pl.LazyFrame:
                     pl.first("playcount"),
                     pl.first("tags"),
                     pl.first("track_url"),
+                    pl.first("youtube_url"),
+                    pl.first("spotify_url"),
                 ]
             )
         )
@@ -227,6 +240,38 @@ def _union_enriched_recommended_tracks(df: pl.LazyFrame) -> pl.LazyFrame:
             logger.info(
                 f"Merging {track_count} enriched candidate tracks into dimension"
             )
+
+            # Ensure consistent column order before concat
+            column_order = [
+                "track_name",
+                "artist_name",
+                "album_name",
+                "track_mbid",
+                "artist_mbid",
+                "duration_ms",
+                "track_url",
+                "tags",
+                "listeners",
+                "playcount",
+                "youtube_url",
+                "spotify_url",
+                "track_id",
+                "artist_id",
+            ]
+
+            # Reorder both dataframes to match
+            df = df.select(column_order)
+            candidate_tracks = candidate_tracks.with_columns(
+                # candidate_tracks doesn't have artist_id, compute it
+                pl.when(
+                    (pl.col("artist_mbid").is_not_null())
+                    & (pl.col("artist_mbid") != "")
+                )
+                .then(pl.col("artist_mbid"))
+                .otherwise(pl.col("artist_name"))
+                .alias("artist_id")
+            ).select(column_order)
+
             # Concatenate and deduplicate
             combined_lf = pl.concat([df, candidate_tracks])
             df = _deduplicate_tracks(combined_lf)
@@ -342,8 +387,19 @@ def enrich_track_metadata(
         tracks_lf: LazyFrame with track_id, track_name, artist_name (min required)
 
     Returns:
-        Enriched LazyFrame with full track metadata
+        Enriched LazyFrame with full track metadata including youtube_url and spotify_url
     """
+    # Ensure youtube_url and spotify_url columns exist in input
+    schema = tracks_lf.collect_schema()
+    if "youtube_url" not in schema:
+        tracks_lf = tracks_lf.with_columns(
+            pl.lit(None, dtype=pl.Utf8).alias("youtube_url")
+        )
+    if "spotify_url" not in schema:
+        tracks_lf = tracks_lf.with_columns(
+            pl.lit(None, dtype=pl.Utf8).alias("spotify_url")
+        )
+
     # Collect unique track/artist combinations to enrich
     tracks_to_enrich = (
         tracks_lf.select(["track_id", "track_name", "artist_name"])
@@ -355,7 +411,7 @@ def enrich_track_metadata(
         return tracks_lf
 
     async def _enrich_tracks():
-        async with LastFMClient(api_key=None) as client:
+        async with LastFMClient(api_key=None) as client, LastFMScraper() as scraper:
             # Fetch all track info concurrently
             fetch_tasks = [
                 client.get_track_info(
@@ -369,8 +425,10 @@ def enrich_track_metadata(
                 *fetch_tasks, return_exceptions=True
             )
 
-            # Process results and build enriched data
+            # Process results and build track URLs for scraping
             enriched_data = []
+            track_urls_to_scrape = []
+
             for row, track_info in zip(tracks_to_enrich.to_dicts(), all_track_results):
                 track_name = row["track_name"]
                 artist_name = row["artist_name"]
@@ -429,6 +487,30 @@ def enrich_track_metadata(
                     }
                 )
 
+                # Add to scraping list if we have a track_url
+                track_urls_to_scrape.append(track_url if track_url else None)
+
+            # Scrape streaming links from Last.fm pages
+            print(
+                f"Scraping streaming links from {len(track_urls_to_scrape)} Last.fm pages..."
+            )
+            streaming_links = []
+            for track_url in track_urls_to_scrape:
+                if track_url:
+                    links = await scraper.get_streaming_links(track_url)
+                    streaming_links.append(links)
+                else:
+                    streaming_links.append(
+                        {
+                            "youtube_url": None,
+                            "spotify_url": None,
+                        }
+                    )
+
+            # Merge streaming links into enriched data
+            for data_dict, links in zip(enriched_data, streaming_links):
+                data_dict.update(links)
+
             return pl.DataFrame(
                 enriched_data,
                 schema={
@@ -443,6 +525,8 @@ def enrich_track_metadata(
                     "playcount": pl.Int64,
                     "tags": pl.Utf8,
                     "track_url": pl.Utf8,
+                    "youtube_url": pl.Utf8,
+                    "spotify_url": pl.Utf8,
                 },
             )
 
@@ -472,6 +556,8 @@ def enrich_track_metadata(
         "playcount",
         "tags",
         "track_url",
+        "youtube_url",
+        "spotify_url",
     ]:
         enriched_col = f"{col}_enriched"
         if enriched_col in schema_names:
@@ -634,55 +720,78 @@ def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
     Returns:
         Deduplicated LazyFrame with one row per track
     """
+    # Check which streaming URL columns exist in the schema
+    schema_names = tracks_lf.collect_schema().names()
+    has_youtube = "youtube_url" in schema_names
+    has_spotify = "spotify_url" in schema_names
+
+    # Build aggregation list
+    agg_list = [
+        # non-null and non "", prefer rows with MBID
+        pl.col("track_mbid")
+        .filter((pl.col("track_mbid") != "") & pl.col("track_mbid").is_not_null())
+        .first()
+        .alias("track_mbid"),
+        pl.col("artist_mbid")
+        .filter((pl.col("artist_mbid") != "") & pl.col("artist_mbid").is_not_null())
+        .first()
+        .alias("artist_mbid"),
+        pl.col("duration_ms")
+        .filter(pl.col("duration_ms").is_not_null())
+        .first()
+        .alias("duration_ms"),
+        pl.col("track_url")
+        .filter((pl.col("track_url") != "") & pl.col("track_url").is_not_null())
+        .first()
+        .alias("track_url"),
+        pl.col("tags")
+        .filter((pl.col("tags") != "") & pl.col("tags").is_not_null())
+        .first()
+        .alias("tags"),
+        # Take max for numeric popularity metrics
+        pl.col("listeners").max().alias("listeners"),
+        pl.col("playcount").max().alias("playcount"),
+    ]
+
+    # Add streaming URLs if they exist
+    if has_youtube:
+        agg_list.append(
+            pl.col("youtube_url")
+            .filter((pl.col("youtube_url") != "") & pl.col("youtube_url").is_not_null())
+            .first()
+            .alias("youtube_url")
+        )
+    if has_spotify:
+        agg_list.append(
+            pl.col("spotify_url")
+            .filter((pl.col("spotify_url") != "") & pl.col("spotify_url").is_not_null())
+            .first()
+            .alias("spotify_url")
+        )
+
     # same track name by same artist with same album name should be considered same track
     deduplicated = (
-        tracks_lf.group_by(["track_name", "artist_name", "album_name"]).agg(
-            [
-                # non-null and non "", prefer rows with MBID
-                pl.col("track_mbid")
-                .filter(
-                    (pl.col("track_mbid") != "") & pl.col("track_mbid").is_not_null()
+        tracks_lf.group_by(["track_name", "artist_name", "album_name"])
+        .agg(agg_list)
+        .with_columns(
+            # Create track_id: prefer MBID when available, else synthetic from names
+            pl.when((pl.col("track_mbid").is_not_null()) & (pl.col("track_mbid") != ""))
+            .then(pl.col("track_mbid"))
+            .otherwise(
+                pl.concat_str(
+                    [pl.col("track_name"), pl.col("artist_name")], separator="|"
                 )
-                .first()
-                .alias("track_mbid"),
-                pl.col("artist_mbid")
-                .filter(
-                    (pl.col("artist_mbid") != "") & pl.col("artist_mbid").is_not_null()
-                )
-                .first()
-                .alias("artist_mbid"),
-                pl.col("duration_ms")
-                .filter(pl.col("duration_ms").is_not_null())
-                .first()
-                .alias("duration_ms"),
-                pl.col("track_url")
-                .filter((pl.col("track_url") != "") & pl.col("track_url").is_not_null())
-                .first()
-                .alias("track_url"),
-                pl.col("tags")
-                .filter((pl.col("tags") != "") & pl.col("tags").is_not_null())
-                .first()
-                .alias("tags"),
-                # Take max for numeric popularity metrics
-                pl.col("listeners").max().alias("listeners"),
-                pl.col("playcount").max().alias("playcount"),
-                # artist and track id
-            ]
+            )
+            .alias("track_id"),
+            # Create artist_id: use MBID if available, else artist name
+            # TODO: instead of artist name as fallback, use lastfm search for mbid based on fuzzy name search
+            pl.when(
+                (pl.col("artist_mbid").is_not_null()) & (pl.col("artist_mbid") != "")
+            )
+            .then(pl.col("artist_mbid"))
+            .otherwise(pl.col("artist_name"))
+            .alias("artist_id"),
         )
-    ).with_columns(
-        # Create track_id: prefer MBID when available, else synthetic from names
-        pl.when((pl.col("track_mbid").is_not_null()) & (pl.col("track_mbid") != ""))
-        .then(pl.col("track_mbid"))
-        .otherwise(
-            pl.concat_str([pl.col("track_name"), pl.col("artist_name")], separator="|")
-        )
-        .alias("track_id"),
-        # Create artist_id: use MBID if available, else artist name
-        # TODO: instead of artist name as fallback, use lastfm search for mbid based on fuzzy name search
-        pl.when((pl.col("artist_mbid").is_not_null()) & (pl.col("artist_mbid") != ""))
-        .then(pl.col("artist_mbid"))
-        .otherwise(pl.col("artist_name"))
-        .alias("artist_id"),
     )
 
     return deduplicated

@@ -27,3 +27,25 @@ uv run streamlit run src/music_airflow/app/streamlit_app.py
 ```
 
 The app will be available at http://localhost:8501
+
+### 3. Oauth setup on GCP for Youtube API and Streamlit Cloud Deployment
+
+Create a streamlit community cloud app.
+In GCP, create a project, enable youtube v3 api, create oauth credentials for web app with streamlit cloud url.
+Run the app locally first as above and authenticate to get the token.
+Copy the token from the `.youtube_token.json` file.
+On streamlit cloud, add the following to secrets toml:
+
+```toml
+[youtube]
+client_id = "ID"
+client_secret = "SECRET"
+
+[youtube_token]
+# Copy from .youtube_token.json after one-time authentication locally
+token = "TOKEN"
+refresh_token = ""
+token_uri = "https://oauth2.googleapis.com/token"
+client_id = "ID"
+client_secret = "SECRET"
+scopes = ["https://www.googleapis.com/auth/youtube.force-ssl"]
