@@ -1,0 +1,50 @@
+/* Custom CSS for Music Recommendation System Documentation */
+
+/* Mermaid diagram styling */
+.mermaid {
+    text-align: center;
+    margin: 2em 0;
+}
+
+/* Code block improvements */
+.highlight {
+    margin: 1em 0;
+}
+
+/* Table styling */
+table {
+    width: 100%;
+    margin: 1em 0;
+}
+
+/* Admonition custom colors for data layers */
+.admonition.bronze {
+    border-left-color: #cd7f32;
+}
+
+.admonition.silver {
+    border-left-color: #c0c0c0;
+}
+
+.admonition.gold {
+    border-left-color: #ffd700;
+}
+
+/* Better spacing for nested lists */
+ul ul, ol ol, ul ol, ol ul {
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+}
+
+/* Schema examples */
+.schema-example {
+    background-color: #f5f5f5;
+    padding: 1em;
+    border-radius: 4px;
+    margin: 1em 0;
+}
+
+/* Dark mode schema examples */
+[data-md-color-scheme="slate"] .schema-example {
+    background-color: #2e2e2e;
+}
