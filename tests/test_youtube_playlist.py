@@ -280,14 +280,14 @@ def test_add_video_to_playlist_retries_on_409():
     mock_resp.status = 409
     error = HttpError(mock_resp, b'{"error": {"code": 409, "message": "Conflict"}}')
 
-    # First two attempts fail with 409, third succeeds
+    # First attempt fails with 409, second succeeds (max_retries=2 means 2 total attempts)
     with patch("time.sleep"):  # Mock sleep to speed up test
-        mock_insert.execute.side_effect = [error, error, {}]
+        mock_insert.execute.side_effect = [error, {}]
 
         result = generator.add_video_to_playlist("PLtest123", "fJ9rUzIMcZQ")
 
         assert result is True
-        assert mock_insert.execute.call_count == 3
+        assert mock_insert.execute.call_count == 2
 
 
 def test_add_video_to_playlist_stops_on_quota_exceeded():

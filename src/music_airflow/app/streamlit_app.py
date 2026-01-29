@@ -120,7 +120,7 @@ def filter_candidates(
         )
 
     # Filter out excluded tracks by track_name + artist_name
-    # (track_id can change if MBID is added later, but name+artist is stable)
+    # (more stable than track_id which may vary due to normalization)
     if excluded_tracks is not None:
         excluded_track_keys = excluded_tracks.select(["track_name", "artist_name"])
         candidates = candidates.join(

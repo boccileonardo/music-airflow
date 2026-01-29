@@ -152,7 +152,7 @@ def test_compute_artist_aggregations(
     assert user1_artist_y["play_count"][0] == 1
     assert user1_artist_y["artist_name"][0] == "Artist Y"
 
-    # Check user2 - Artist Z (2 plays) - no MBID, uses artist_name as fallback
+    # Check user2 - Artist Z (2 plays) - uses canonical artist_id
     user2_artist_z = result_df.filter(
         (pl.col("username") == "user2") & (pl.col("artist_id") == "Artist Z")
     )

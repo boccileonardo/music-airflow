@@ -205,11 +205,13 @@ Veterans have gentler decay (~500 days), new users have aggressive decay (~30 da
 
 ### Track ID Generation
 
-Last.fm API inconsistently returns MBIDs. Stable IDs ensure consistent joins:
+Canonical IDs are generated using fuzzy text matching to handle track variations:
 
 ```python
-track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
+track_id = f"{normalize_text(track_name)}|{normalize_text(artist_name)}"
 ```
+
+This ensures consistent joins even when track names vary (e.g., "Song" vs "Song (Remastered)").
 
 ### Candidate Consolidation
 

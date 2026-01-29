@@ -99,14 +99,8 @@ def _resolve_track_ids(
     if not track_data:
         return pl.DataFrame()
 
-    # Create DataFrame with explicit schema to handle optional MBIDs
-    df = pl.DataFrame(
-        track_data,
-        schema_overrides={
-            "track_mbid": pl.String,
-            "artist_mbid": pl.String,
-        },
-    )
+    # Create DataFrame
+    df = pl.DataFrame(track_data)
 
     # Generate canonical track_id from normalized names
     df = df.with_columns(
@@ -319,18 +313,13 @@ async def generate_similar_artist_candidates(
 
             for track in top_tracks:
                 track_name = track.get("name")
-                track_mbid = track.get("mbid")
-                if track_mbid == "":
-                    track_mbid = None
                 artist_info = track.get("artist", {})
                 if isinstance(artist_info, dict):
                     artist_name_track = artist_info.get(
                         "name", metadata["similar_artist_name"]
                     )
-                    artist_mbid = artist_info.get("mbid")
                 else:
                     artist_name_track = metadata["similar_artist_name"]
-                    artist_mbid = None
 
                 listeners = int(track.get("listeners", 0))
                 playcount = int(track.get("playcount", 0))
@@ -359,10 +348,8 @@ async def generate_similar_artist_candidates(
                 all_candidates.append(
                     {
                         "username": username,
-                        "track_mbid": track_mbid,
                         "track_name": track_name,
                         "artist_name": artist_name_track,
-                        "artist_mbid": artist_mbid,
                         "similarity": metadata["similarity_score"],
                         "score": score,
                         "source_artist_id": metadata["source_artist_id"],
@@ -385,8 +372,6 @@ async def generate_similar_artist_candidates(
             schema={
                 "username": pl.String,
                 "track_id": pl.String,
-                "track_mbid": pl.String,
-                "artist_mbid": pl.String,
                 "similarity": pl.Float64,
                 "score": pl.Float64,
                 "source_artist_id": pl.String,
@@ -402,8 +387,6 @@ async def generate_similar_artist_candidates(
                 [
                     "username",
                     "track_id",
-                    "track_mbid",
-                    "artist_mbid",
                     "similarity",
                     "score",
                     "source_artist_id",
@@ -562,19 +545,12 @@ async def generate_similar_tag_candidates(
 
             for track in top_tracks:
                 track_name = track.get("name")
-                track_mbid = track.get("mbid", "")
-                if track_mbid == "":
-                    track_mbid = None
 
                 artist_info = track.get("artist", {})
                 if isinstance(artist_info, dict):
                     artist_name = artist_info.get("name", "")
-                    artist_mbid = artist_info.get("mbid", "")
-                    if artist_mbid == "":
-                        artist_mbid = None
                 else:
                     artist_name = str(artist_info) if artist_info else ""
-                    artist_mbid = None
 
                 # Generate canonical track ID
                 track_id = generate_canonical_track_id(track_name, artist_name)
@@ -588,10 +564,8 @@ async def generate_similar_tag_candidates(
                 if track_id not in track_tag_map:
                     track_tag_map[track_id] = {
                         "username": username,
-                        "track_mbid": track_mbid,
                         "track_name": track_name,
                         "artist_name": artist_name,
-                        "artist_mbid": artist_mbid,
                         "tags": [],
                     }
 
@@ -622,10 +596,8 @@ async def generate_similar_tag_candidates(
         all_candidates.append(
             {
                 "username": track_data["username"],
-                "track_mbid": track_data["track_mbid"],
                 "track_name": track_data["track_name"],
                 "artist_name": track_data["artist_name"],
-                "artist_mbid": track_data["artist_mbid"],
                 "tag_match_count": tag_match_count,
                 "score": score,
                 "source_tags": ",".join(track_data["tags"]),
@@ -643,8 +615,6 @@ async def generate_similar_tag_candidates(
             schema={
                 "username": pl.String,
                 "track_id": pl.String,
-                "track_mbid": pl.String,
-                "artist_mbid": pl.String,
                 "tag_match_count": pl.Int64,
                 "score": pl.Float64,
                 "source_tags": pl.String,
@@ -657,8 +627,6 @@ async def generate_similar_tag_candidates(
             df.with_columns(
                 pl.col("username").cast(pl.String),
                 pl.col("track_id").cast(pl.String),
-                pl.col("track_mbid").cast(pl.String),
-                pl.col("artist_mbid").cast(pl.String),
                 pl.col("tag_match_count").cast(pl.Int64),
                 pl.col("score").cast(pl.Float64),
                 pl.col("source_tags").cast(pl.String),
@@ -668,8 +636,6 @@ async def generate_similar_tag_candidates(
                 [
                     "username",
                     "track_id",
-                    "track_mbid",
-                    "artist_mbid",
                     "tag_match_count",
                     "score",
                     "source_tags",
@@ -739,19 +705,14 @@ async def generate_deep_cut_candidates(
     )
 
     # Get user's top artists by play count (id + name + play count from gold)
-    # Filter to only artists with valid MBID (excludes compilation channels, etc.)
+    # Filter to only artists with valid data
     top_artists_lf = (
         artist_play_counts_lf.join(
-            artists_lf.select("artist_id", "artist_name", "artist_mbid"),
+            artists_lf.select("artist_id", "artist_name"),
             on="artist_id",
             how="left",
         )
-        .filter(
-            pl.col("artist_id").is_not_null()
-            & pl.col("artist_name").is_not_null()
-            & pl.col("artist_mbid").is_not_null()
-            & (pl.col("artist_mbid") != "")
-        )
+        .filter(pl.col("artist_id").is_not_null() & pl.col("artist_name").is_not_null())
         .sort("user_artist_play_count", descending=True)
         .limit(top_artists_count)
     )
@@ -852,9 +813,6 @@ async def generate_deep_cut_candidates(
                         "artist_id": artist_ids[idx],
                         "album_name": album_name,
                         "album_playcount": int(album.get("playcount", 0)),
-                        "album_artist_mbid": album.get("artist", {}).get("mbid", "")
-                        if isinstance(album.get("artist"), dict)
-                        else "",
                         "user_artist_play_count": user_artist_play_count,
                     }
                 )
@@ -896,9 +854,6 @@ async def generate_deep_cut_candidates(
 
             for track in track_list:
                 track_name = track.get("name")
-                track_mbid = track.get("mbid", "")
-                if track_mbid == "":
-                    track_mbid = None
 
                 album_listeners = metadata["album_playcount"]
                 if album_listeners < min_listeners:
@@ -921,10 +876,8 @@ async def generate_deep_cut_candidates(
                 all_candidates.append(
                     {
                         "username": username,
-                        "track_mbid": track_mbid,
                         "track_name": track_name,
                         "artist_name": metadata["artist_name"],
-                        "artist_mbid": metadata["album_artist_mbid"],
                         "album_name": metadata["album_name"],
                         "score": score,
                         "source_artist_id": metadata["artist_id"],
@@ -947,8 +900,6 @@ async def generate_deep_cut_candidates(
             schema={
                 "username": pl.String,
                 "track_id": pl.String,
-                "track_mbid": pl.String,
-                "artist_mbid": pl.String,
                 "album_name": pl.String,
                 "score": pl.Float64,
                 "source_artist_id": pl.String,
@@ -961,8 +912,6 @@ async def generate_deep_cut_candidates(
             df.with_columns(
                 pl.col("username").cast(pl.String),
                 pl.col("track_id").cast(pl.String),
-                pl.col("track_mbid").cast(pl.String),
-                pl.col("artist_mbid").cast(pl.String),
                 pl.col("album_name").cast(pl.String),
                 pl.col("score").cast(pl.Float64),
                 pl.col("source_artist_id").cast(pl.String),
@@ -973,8 +922,6 @@ async def generate_deep_cut_candidates(
                 [
                     "username",
                     "track_id",
-                    "track_mbid",
-                    "artist_mbid",
                     "album_name",
                     "score",
                     "source_artist_id",
@@ -1169,9 +1116,8 @@ def merge_candidate_sources(
         plays_lf.filter(pl.col("username") == username).select("track_id").unique()
     )
 
-    # Load dimension tables for MBID lookup
+    # Load tracks dimension for streaming links
     tracks_dim_lf = delta_mgr_silver.read_delta("tracks")
-    artists_dim_lf = delta_mgr_silver.read_delta("artists")
 
     # Process each source: normalize scores, limit, and filter played tracks
     def process_source(
@@ -1199,20 +1145,6 @@ def merge_candidate_sources(
         # Limit to top N tracks by original score
         filtered = filtered.sort("score", descending=True).limit(tracks_per_source)
 
-        # Join with tracks dimension to get track_mbid and artist_id
-        filtered = filtered.join(
-            tracks_dim_lf.select(["track_id", "track_mbid", "artist_id"]),
-            on="track_id",
-            how="left",
-        )
-
-        # Join with artists dimension to get artist_mbid
-        filtered = filtered.join(
-            artists_dim_lf.select(["artist_id", "artist_mbid"]),
-            on="artist_id",
-            how="left",
-        ).drop("artist_id")
-
         # Add source flags
         filtered = filtered.with_columns(
             pl.lit(source_name == "similar_artist").alias("similar_artist"),
@@ -1221,13 +1153,11 @@ def merge_candidate_sources(
             pl.lit(source_name == "old_favorite").alias("old_favorite"),
         )
 
-        # Select standard columns (no metadata columns) - always include MBIDs
+        # Select standard columns (no metadata columns)
         return filtered.select(
             [
                 "username",
                 "track_id",
-                "track_mbid",
-                "artist_mbid",
                 "normalized_score",
                 "similar_artist",
                 "similar_tag",
@@ -1277,8 +1207,6 @@ def merge_candidate_sources(
         all_candidates.group_by("username", "track_id")
         .agg(
             [
-                pl.first("track_mbid").alias("track_mbid"),
-                pl.first("artist_mbid").alias("artist_mbid"),
                 pl.max("similar_artist").alias("similar_artist"),
                 pl.max("similar_tag").alias("similar_tag"),
                 pl.max("deep_cut_same_artist").alias("deep_cut_same_artist"),

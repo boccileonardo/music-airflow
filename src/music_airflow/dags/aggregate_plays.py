@@ -45,8 +45,8 @@ def gold_play_aggregations():
     Compute gold layer aggregate fact tables with recency measures.
 
     Reads silver plays, dim_users, and artists to create:
-    - artist_play_count (username, artist, artist_mbid, counts, recency)
-    - track_play_count (username, track, counts, recency)
+    - artist_play_count (username, artist, artist_id, counts, recency)
+    - track_play_count (username, track, track_id, counts, recency)
     """
 
     @task(
@@ -60,7 +60,7 @@ def gold_play_aggregations():
 
         Aggregates all historical plays to create per-user artist statistics.
         Uses dim_users for user-specific half-life values.
-        Enriches with artist_mbid from artists dimension.
+        Joins with artists dimension using canonical artist_id.
         Full refresh - recomputes entire table.
 
         Uses data_interval_start from Airflow context as reference for recency calculations.

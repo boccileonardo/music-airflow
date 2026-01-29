@@ -168,18 +168,18 @@ def test_exclusion_matching_by_name_not_id(temp_gold_dir):
     """
     Test that exclusions match by track_name + artist_name, not track_id.
 
-    This is important because track_id can change if MBID is added later,
-    but track_name + artist_name remain stable.
+    This ensures exclusions work even if track_id varies due to
+    text normalization or format changes.
     """
     # Exclude a track with one track_id format
     write_excluded_track(
         username="testuser",
-        track_id="track_name|artist_name",  # Synthetic ID without MBID
+        track_id="track_name|artist_name",  # Canonical ID format
         track_name="Great Song",
         artist_name="Amazing Artist",
     )
 
-    # Create candidate pool with same track but different track_id (has MBID)
+    # Create candidate pool with same track but different track_id format
     candidates = pl.DataFrame(
         {
             "track_id": ["mbid123", "mbid456", "track2|artist2"],
