@@ -1025,7 +1025,7 @@ def generate_old_favorites_candidates(
     Returns:
         Metadata dict with path, rows, table_name
     """
-    from datetime import datetime, timezone
+    from datetime import timezone
 
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
@@ -1289,105 +1289,10 @@ def merge_candidate_sources(
         .sort("score", descending=True)
     )
 
-    # Enrich candidate tracks with full metadata from Last.fm and MusicBrainz
-    # Join with tracks dimension to get track_name and artist_name needed for enrichment
-    merged_with_dim = merged_lf.join(
-        tracks_dim_lf.select(["track_id", "track_name", "artist_name"]),
-        on="track_id",
-        how="left",
-    )
-
-    # Filter to only tracks that DON'T exist in dim_tracks (need enrichment)
-    # Parse synthetic track_ids (format: "track_name|artist_name") for tracks without MBID
-    tracks_for_enrichment = (
-        merged_with_dim.filter(pl.col("track_name").is_null())  # Not in dim_tracks yet
-        .with_columns(
-            [
-                # Parse synthetic IDs: "track_name|artist_name"
-                pl.when(pl.col("track_id").str.contains("|"))
-                .then(pl.col("track_id").str.split("|").list.first())
-                .otherwise(None)
-                .alias("track_name"),
-                pl.when(pl.col("track_id").str.contains("|"))
-                .then(pl.col("track_id").str.split("|").list.last())
-                .otherwise(None)
-                .alias("artist_name"),
-            ]
-        )
-        # Filter to only tracks where we could extract metadata
-        .filter(
-            pl.col("track_name").is_not_null()
-            & pl.col("artist_name").is_not_null()
-            & (
-                pl.col("track_name") != pl.col("artist_name")
-            )  # Ensure split worked correctly
-        )
-    )
-
-    # Import enrichment function
-    from music_airflow.transform.dimensions import (
-        enrich_track_metadata,
-        _deduplicate_tracks,
-    )
-
-    # Only enrich if we have tracks with valid metadata
-    if tracks_for_enrichment.select("track_id").collect().shape[0] > 0:
-        # Enrich tracks (fetches from Last.fm and MusicBrainz)
-        num_to_enrich = (
-            tracks_for_enrichment.select("track_id").unique().collect().shape[0]
-        )
-        logger.info(
-            f"Enriching {num_to_enrich} new candidate tracks not yet in dim_tracks..."
-        )
-        enriched_tracks_lf = enrich_track_metadata(tracks_for_enrichment)
-
-        # Write enriched tracks to separate silver table for dimension flow to pick up
-        enriched_tracks_df = (
-            enriched_tracks_lf.select(
-                [
-                    "track_id",
-                    "track_name",
-                    "track_mbid",
-                    "artist_name",
-                    "artist_mbid",
-                    "album_name",
-                    "duration_ms",
-                    "listeners",
-                    "playcount",
-                    "tags",
-                    "track_url",
-                    "youtube_url",
-                    "spotify_url",
-                ]
-            )
-            .unique(subset=["track_id"])
-            .collect()
-        )
-
-        # Deduplicate tracks before writing
-        enriched_tracks_dedup_df = _deduplicate_tracks(
-            enriched_tracks_df.lazy()
-        ).collect()
-
-        # Add recommended_at timestamp after deduplication
-        enriched_tracks_with_timestamp = enriched_tracks_dedup_df.with_columns(
-            pl.lit(datetime.now()).alias("recommended_at")
-        )
-
-        # Append to silver candidate_enriched_tracks table (dimension flow will deduplicate on read)
-        if not enriched_tracks_with_timestamp.is_empty():
-            logger.info(
-                f"Appending {enriched_tracks_with_timestamp.shape[0]} enriched tracks to candidate_enriched_tracks..."
-            )
-            delta_mgr_silver.write_delta(
-                enriched_tracks_with_timestamp,
-                table_name="candidate_enriched_tracks",
-                mode="append",
-            )
-    else:
-        logger.info(
-            "No new tracks to enrich (all candidates already exist in dim_tracks or cannot parse track_id)"
-        )
+    # Note: We no longer enrich tracks here to avoid circular dependency.
+    # New tracks discovered in candidates will be enriched by the weekly
+    # dimension update DAG which reads from gold/track_candidates.
+    # This creates a 1-7 day delay for full metadata, which is acceptable.
 
     # Join with tracks dimension to add streaming links and track metadata
     tracks_with_links = tracks_dim_lf.select(

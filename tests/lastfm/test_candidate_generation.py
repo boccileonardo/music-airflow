@@ -41,11 +41,11 @@ def patched_delta_io(test_data_dir):
 
 def _write_silver_base_tables(patched_delta_io):
     """Create minimal silver tables for plays, tracks, artists."""
-    # Plays: one user with a played track (track_id format: "track|artist")
+    # Plays: one user with a played track (track_id format: "track|artist" normalized)
     plays_df = pl.DataFrame(
         {
             "username": ["user1"],
-            "track_id": ["Known|Artist A"],
+            "track_id": ["known|artist a"],  # normalized
         }
     )
     patched_delta_io("silver").write_delta(
@@ -56,9 +56,9 @@ def _write_silver_base_tables(patched_delta_io):
     tracks_df = pl.DataFrame(
         {
             "track_id": [
-                "Known|Artist A",
-                "New Track|Artist B",
-                "Tag Track|Artist C",
+                "known|artist a",  # normalized
+                "new track|artist b",
+                "tag track|artist c",
             ],
             "artist_id": ["a1", "b1", "c1"],
         }
@@ -155,8 +155,8 @@ class TestSimilarArtistCandidates:
         out_path = Path(result["path"])  # data/silver/candidate_similar_artist
         assert out_path.exists()
         df = pl.read_delta(str(out_path))
-        # Only New Track should remain (clone and small filtered); prefer MBID when present
-        assert df["track_id"].to_list() == ["tmbid"]
+        # Only New Track should remain (clone and small filtered); uses canonical ID
+        assert df["track_id"].to_list() == ["new track|artist b"]
         assert df["username"].to_list() == ["user1"]
 
 
@@ -240,7 +240,7 @@ class TestSimilarTagCandidates:
         # Only Rock Track A should be in results (appears in 3 tags)
         # Rock Track B only appears in 1 tag, filtered out
         assert len(df) == 1
-        assert df["track_id"][0] == "rta_mbid"
+        assert df["track_id"][0] == "rock track a|artist d"
         assert df["tag_match_count"][0] == 3
         # Tags are sorted alphabetically when collected
         assert set(df["source_tags"][0].split(",")) == {"rock", "indie", "alt"}
@@ -321,7 +321,10 @@ class TestDeepCutCandidates:
         df = pl.read_delta(str(out_path)).sort("track_id")
         # Both Hidden Gem and Popular Track should be included (no max_listeners filter)
         # Known|Artist A is filtered because already played
-        assert df["track_id"].to_list() == ["hg_mbid", "pt_mbid"]
+        assert df["track_id"].to_list() == [
+            "hidden gem|artist a",
+            "popular track|artist a",
+        ]
         assert set(df["album_name"].to_list()) == {"Album One", "Album Two"}
 
 

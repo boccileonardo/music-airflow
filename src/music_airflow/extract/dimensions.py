@@ -47,10 +47,36 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
         # No plays data yet - nothing to process
         raise AirflowSkipException("No plays data available yet - run plays DAG first")
 
-    # Get unique tracks (keep as LazyFrame)
+    # Get unique tracks from plays (keep as LazyFrame)
     unique_tracks_lf = plays_lf.select(
         ["track_name", "artist_name", "track_mbid"]
     ).unique()
+
+    # Also check for tracks from candidate_generation (gold layer)
+    # Parse track_id format: "normalized_track|normalized_artist"
+    try:
+        gold_io = PolarsDeltaIOManager(medallion_layer="gold")
+        candidates_lf = gold_io.read_delta("track_candidates")
+        # Parse track_id to extract track/artist names
+        # track_id format: "track_name|artist_name" (both normalized)
+        # We'll use the candidate_source to get the original names when available
+        candidate_tracks_lf = (
+            candidates_lf.select(["track_id", "candidate_source"])
+            .unique(subset=["track_id"])
+            .with_columns(
+                [
+                    pl.col("track_id").str.split("|").list.get(0).alias("track_name"),
+                    pl.col("track_id").str.split("|").list.get(1).alias("artist_name"),
+                    pl.lit(None, dtype=pl.Utf8).alias("track_mbid"),
+                ]
+            )
+            .select(["track_name", "artist_name", "track_mbid"])
+        )
+        # Union with play tracks
+        unique_tracks_lf = pl.concat([unique_tracks_lf, candidate_tracks_lf]).unique()
+    except (FileNotFoundError, TableNotFoundError):
+        # No candidates yet, just use tracks from plays
+        pass
 
     # Check which tracks already exist in silver
     try:

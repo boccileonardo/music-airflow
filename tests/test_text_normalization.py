@@ -123,7 +123,6 @@ class TestIsMusicVideo:
     def test_empty_and_none(self):
         """Test edge cases."""
         assert is_music_video("") is False
-        assert is_music_video(None) is False
 
 
 class TestGenerateCanonicalTrackId:

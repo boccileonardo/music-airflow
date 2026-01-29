@@ -20,7 +20,7 @@ logging.basicConfig(
 @st.cache_data
 def load_track_candidates(username: str) -> pl.LazyFrame:
     """Load track candidates from Delta table with streaming links."""
-    # Load candidates from gold table (already has youtube_url and spotify_url)
+    # Load candidates from gold table
     gold_io = PolarsDeltaIOManager("gold")
     silver_io = PolarsDeltaIOManager("silver")
 
@@ -28,35 +28,37 @@ def load_track_candidates(username: str) -> pl.LazyFrame:
         pl.col("username") == username
     )
 
-    # Join with enriched tracks for additional metadata (tags, duration, etc.)
-    track_info = silver_io.read_delta("candidate_enriched_tracks")
+    # Join with tracks dimension for metadata (tags, duration, URLs, etc.)
+    # Note: Some tracks may not have enrichment yet (1-7 day delay after generation)
+    # We handle this gracefully with a left join
+    tracks_dim = silver_io.read_delta("tracks")
 
     candidates = (
-        candidates.with_columns(
-            pl.col("track_id").str.split_exact("|", 1).struct.unnest()
-        )
-        .rename(mapping={"field_0": "track_name", "field_1": "artist_name"})
-        .join(
-            track_info.select(
+        candidates.join(
+            tracks_dim.select(
                 [
-                    "track_name",
-                    "artist_name",
                     "track_id",
                     "album_name",
                     "duration_ms",
                     "tags",
-                    "recommended_at",
+                    "youtube_url",
+                    "spotify_url",
                 ]
             ),
-            on=["artist_name", "track_name"],
+            on="track_id",
             how="left",
             suffix="_enriched",
         )
         .sort("score", "recommended_at", descending=True)
-        .group_by(
-            "track_id", "track_name", "artist_name"
-        )  # todo: figure out why duplicate tracks with diff id
+        .group_by("track_id")  # Deduplicate by track_id, keep highest score
         .first()
+        .with_columns(
+            [
+                # Parse track_id to get track_name and artist_name
+                pl.col("track_id").str.split("|").list.get(0).alias("track_name"),
+                pl.col("track_id").str.split("|").list.get(1).alias("artist_name"),
+            ]
+        )
         .select(
             [
                 "track_id",

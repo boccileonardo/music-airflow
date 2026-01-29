@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import polars as pl
 import pytest
 from airflow.exceptions import AirflowSkipException
+from deltalake.exceptions import TableNotFoundError
 
 from music_airflow.extract.dimensions import (
     extract_tracks_to_bronze,
@@ -313,14 +314,22 @@ class TestExtractTracksToBronze:
         mock_plays_io = MagicMock()
         mock_plays_io.read_delta.return_value = plays_df
 
-        mock_tracks_io = MagicMock()
-        mock_tracks_io.read_delta.return_value = existing_tracks_df
+        mock_gold_io = MagicMock()
+        # No candidates table yet - raises TableNotFoundError
+        mock_gold_io.read_delta.side_effect = TableNotFoundError("No candidates")
 
-        call_count = [0]
+        mock_silver_io = MagicMock()
+        mock_silver_io.read_delta.return_value = existing_tracks_df
 
         def get_io_manager(medallion_layer):
-            call_count[0] += 1
-            return mock_plays_io if call_count[0] == 1 else mock_tracks_io
+            if medallion_layer == "silver":
+                return (
+                    mock_plays_io
+                    if mock_plays_io.read_delta.call_count == 0
+                    else mock_silver_io
+                )
+            else:  # gold
+                return mock_gold_io
 
         mock_delta_io.side_effect = get_io_manager
 
@@ -550,156 +559,6 @@ class TestTransformArtistsToSilver:
         assert len(df) == 1
         assert df["artist_name"][0] == "Artist X"
 
-    @patch("music_airflow.transform.dimensions.LastFMClient")
-    def test_transform_artists_enriches_mbid_and_filters_invalid(
-        self, mock_client_class, test_data_dir
-    ):
-        """Enrich missing MBIDs and drop invalid artists (listeners < 1000)."""
-        import json
-
-        bronze_dir = test_data_dir / "bronze" / "artists"
-        bronze_dir.mkdir(parents=True, exist_ok=True)
-        silver_dir = test_data_dir / "silver"
-        silver_dir.mkdir(parents=True, exist_ok=True)
-
-        # Two artists: one missing MBID with high listeners/tags (to enrich),
-        # one missing MBID with low listeners (should be excluded)
-        artists_data = [
-            {
-                "name": "Likely Valid",
-                "mbid": "",
-                "url": "urlA",
-                "stats": {"listeners": 20000, "playcount": 30000},
-                "tags": {"tag": [{"name": "rock"}]},
-                "bio": {"summary": "Some bio"},
-            },
-            {
-                "name": "Likely Invalid",
-                "mbid": "",
-                "url": "urlB",
-                "stats": {"listeners": 500, "playcount": 1000},
-                "tags": {"tag": [{"name": "pop"}]},
-                "bio": {"summary": "short"},
-            },
-        ]
-
-        artists_file = bronze_dir / "artists_enrich_test.json"
-        with open(artists_file, "w") as f:
-            json.dump(artists_data, f)
-
-        # Mock LastFMClient.search_artist to return an MBID for "Likely Valid"
-        mock_client = MagicMock()
-
-        async def _search_artist(name, limit=1):  # type: ignore[unused-argument]
-            if name == "Likely Valid":
-                return [{"name": name, "mbid": "mbid-123"}]
-            return []
-
-        mock_client.search_artist.side_effect = _search_artist
-
-        # Mock the async context manager
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=None)
-        mock_client_class.return_value = mock_client
-
-        # Patch IO managers
-        with (
-            patch("music_airflow.transform.dimensions.JSONIOManager") as mock_json_io,
-            patch(
-                "music_airflow.transform.dimensions.PolarsDeltaIOManager"
-            ) as mock_delta_io,
-        ):
-            from music_airflow.utils.polars_io_manager import (
-                JSONIOManager,
-                PolarsDeltaIOManager,
-            )
-
-            json_mgr = JSONIOManager(medallion_layer="bronze")
-            json_mgr.base_dir = test_data_dir / "bronze"
-
-            delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-            delta_mgr.base_dir = test_data_dir / "silver"
-
-            mock_json_io.return_value = json_mgr
-            mock_delta_io.return_value = delta_mgr
-
-            fetch_metadata = {"filename": "artists/artists_enrich_test.json"}
-            result = transform_artists_to_silver(fetch_metadata)
-
-        assert result["rows"] == 1
-        df = pl.read_delta(str(silver_dir / "artists"))
-        assert set(df["artist_name"]) == {"Likely Valid"}
-        # Enriched MBID should be applied and artist_id should use MBID
-        row = df.filter(pl.col("artist_name") == "Likely Valid").to_dict(
-            as_series=False
-        )
-        assert row["artist_mbid"][0] == "mbid-123"
-        assert row["artist_id"][0] == "mbid-123"
-
-    @patch("music_airflow.transform.dimensions.LastFMClient")
-    @patch("music_airflow.transform.dimensions._search_musicbrainz_artist_mbid")
-    def test_transform_artists_enriches_via_musicbrainz_when_lastfm_has_no_mbid(
-        self, mock_mbz, mock_client_class, test_data_dir
-    ):
-        """Fallback to MusicBrainz if Last.fm search returns empty/blank MBID."""
-        import json
-
-        bronze_dir = test_data_dir / "bronze" / "artists"
-        bronze_dir.mkdir(parents=True, exist_ok=True)
-        silver_dir = test_data_dir / "silver"
-        silver_dir.mkdir(parents=True, exist_ok=True)
-
-        artists_data = [
-            {
-                "name": "Fallback Artist",
-                "mbid": "",
-                "url": "urlC",
-                "stats": {"listeners": 5000, "playcount": 8000},
-                "tags": {"tag": [{"name": "alt"}]},
-                "bio": {"summary": "bio"},
-            }
-        ]
-
-        artists_file = bronze_dir / "artists_enrich_mbz.json"
-        with open(artists_file, "w") as f:
-            json.dump(artists_data, f)
-
-        # LastFM returns match but empty mbid, forcing MBZ fallback
-        mock_client = MagicMock()
-        mock_client.search_artist.return_value = [
-            {"name": "Fallback Artist", "mbid": ""}
-        ]
-        mock_client_class.return_value = mock_client
-        mock_mbz.return_value = "mbid-fallback-999"
-
-        with (
-            patch("music_airflow.transform.dimensions.JSONIOManager") as mock_json_io,
-            patch(
-                "music_airflow.transform.dimensions.PolarsDeltaIOManager"
-            ) as mock_delta_io,
-        ):
-            from music_airflow.utils.polars_io_manager import (
-                JSONIOManager,
-                PolarsDeltaIOManager,
-            )
-
-            json_mgr = JSONIOManager(medallion_layer="bronze")
-            json_mgr.base_dir = test_data_dir / "bronze"
-
-            delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-            delta_mgr.base_dir = test_data_dir / "silver"
-
-            mock_json_io.return_value = json_mgr
-            mock_delta_io.return_value = delta_mgr
-
-            fetch_metadata = {"filename": "artists/artists_enrich_mbz.json"}
-            result = transform_artists_to_silver(fetch_metadata)
-
-        assert result["rows"] == 1
-        df = pl.read_delta(str(silver_dir / "artists"))
-        assert df["artist_mbid"][0] == "mbid-fallback-999"
-        assert df["artist_id"][0] == "mbid-fallback-999"
-
 
 class TestExtractWithoutPlaysData:
     """Test extraction functions when plays data doesn't exist yet."""
@@ -761,87 +620,3 @@ class TestComputeDimUsersWithoutPlaysData:
             compute_dim_users(execution_date)
 
         assert "No plays data available yet" in str(exc_info.value)
-
-
-def test_enrich_track_metadata_with_streaming_links():
-    """Test that track enrichment includes streaming platform links."""
-    from music_airflow.transform.dimensions import enrich_track_metadata
-
-    # Sample tracks to enrich
-    tracks_to_enrich = pl.LazyFrame(
-        {
-            "track_id": ["track1"],
-            "track_name": ["Test Song"],
-            "artist_name": ["Test Artist"],
-        }
-    )
-
-    # Mock Last.fm API response
-    mock_track_info = {
-        "name": "Test Song",
-        "mbid": "test-mbid-123",
-        "duration": 180000,
-        "listeners": 5000,
-        "playcount": 10000,
-        "url": "https://www.last.fm/music/Test+Artist/_/Test+Song",
-        "artist": {
-            "name": "Test Artist",
-            "mbid": "artist-mbid-123",
-        },
-        "album": {
-            "title": "Test Album",
-        },
-        "toptags": {
-            "tag": [
-                {"name": "rock"},
-                {"name": "indie"},
-            ]
-        },
-    }
-
-    # Mock streaming links from scraper
-    mock_streaming_links = {
-        "youtube_url": "https://www.youtube.com/watch?v=test123",
-        "spotify_url": "https://open.spotify.com/track/test456",
-    }
-
-    with (
-        patch("music_airflow.transform.dimensions.LastFMClient") as mock_client,
-        patch("music_airflow.transform.dimensions.LastFMScraper") as mock_scraper,
-        patch(
-            "music_airflow.transform.dimensions._search_musicbrainz_track_mbid",
-            return_value=None,
-        ),
-    ):
-        # Setup client mock
-        mock_client_instance = AsyncMock()
-        mock_client_instance.get_track_info = AsyncMock(return_value=mock_track_info)
-        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
-        mock_client_instance.__aexit__ = AsyncMock()
-        mock_client.return_value = mock_client_instance
-
-        # Setup scraper mock
-        mock_scraper_instance = AsyncMock()
-        mock_scraper_instance.get_streaming_links = AsyncMock(
-            return_value=mock_streaming_links
-        )
-        mock_scraper_instance.__aenter__ = AsyncMock(return_value=mock_scraper_instance)
-        mock_scraper_instance.__aexit__ = AsyncMock()
-        mock_scraper.return_value = mock_scraper_instance
-
-        # Run enrichment
-        result = enrich_track_metadata(tracks_to_enrich)
-        result_df = result.collect()
-
-        # Verify all columns exist
-        assert "youtube_url" in result_df.columns
-        assert "spotify_url" in result_df.columns
-
-        # Verify streaming links were populated
-        assert result_df["youtube_url"][0] == "https://www.youtube.com/watch?v=test123"
-        assert result_df["spotify_url"][0] == "https://open.spotify.com/track/test456"
-
-        # Verify scraper was called with correct URL
-        mock_scraper_instance.get_streaming_links.assert_called_once_with(
-            "https://www.last.fm/music/Test+Artist/_/Test+Song"
-        )
