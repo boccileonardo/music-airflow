@@ -109,6 +109,8 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
         "playcount",
         "tags",
         "track_url",
+        "youtube_url",
+        "spotify_url",
     ]
     assert result.columns == expected_cols
 
@@ -120,6 +122,9 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
     assert result["listeners"][0] == 5000
     assert result["playcount"][0] == 10000
     assert result["tags"][0] == "rock, indie, alternative"
+    # youtube_url and spotify_url will be None in test data (no enrichment)
+    assert result["youtube_url"][0] is None
+    assert result["spotify_url"][0] is None
 
     # Check second row
     assert result["tags"][1] == "pop, electronic"

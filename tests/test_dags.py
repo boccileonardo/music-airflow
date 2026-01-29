@@ -163,7 +163,8 @@ class TestLastFmDimensionsDag:
         dag = dag_bag.get_dag("lastfm_dimensions")
 
         assert dag is not None
-        assert dag.schedule == "@weekly"
+        assert isinstance(dag.schedule, list)
+        assert len(dag.schedule) == 2  # plays + candidates
         assert dag.catchup is False
         assert "dimensions" in dag.tags
 

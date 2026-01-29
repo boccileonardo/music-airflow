@@ -11,7 +11,6 @@ Returns DataFrames for silver-layer storage; DAG consolidates into single gold t
 All candidates are saved (no limits), relying on incremental processing to avoid reprocessing.
 """
 
-from deltalake.exceptions import TableNotFoundError
 from datetime import datetime
 from typing import Any
 import logging
@@ -144,6 +143,8 @@ async def generate_similar_artist_candidates(
     Returns:
         Metadata dict with path, rows, table_name
     """
+    from deltalake.exceptions import TableNotFoundError
+
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
     delta_mgr_gold = PolarsDeltaIOManager(medallion_layer="gold")
 
@@ -151,8 +152,35 @@ async def generate_similar_artist_candidates(
     plays_lf = delta_mgr_silver.read_delta("plays").filter(
         pl.col("username") == username
     )
-    tracks_lf = delta_mgr_silver.read_delta("tracks")
-    artists_lf = delta_mgr_silver.read_delta("artists")
+
+    # Bootstrap: Return empty result if dimension tables don't exist yet (first run)
+    try:
+        tracks_lf = delta_mgr_silver.read_delta("tracks")
+        artists_lf = delta_mgr_silver.read_delta("artists")
+    except (FileNotFoundError, TableNotFoundError):
+        # Write empty table so candidates_asset is produced (triggers dimensions DAG)
+        empty_df = pl.DataFrame(
+            schema={
+                "username": pl.String,
+                "track_id": pl.String,
+                "track_name": pl.String,
+                "artist_name": pl.String,
+                "similarity": pl.Float64,
+                "score": pl.Float64,
+                "source_artist_id": pl.String,
+            }
+        )
+        write_meta = delta_mgr_silver.write_delta(
+            empty_df,
+            table_name="candidate_similar_artist",
+            mode="overwrite",
+            partition_by="username",
+        )
+        return {
+            "path": write_meta["path"],
+            "rows": 0,
+            "table_name": write_meta["table_name"],
+        }
 
     # Load user's artist play counts for scoring
     artist_play_counts_lf = (
@@ -387,6 +415,8 @@ async def generate_similar_artist_candidates(
                 [
                     "username",
                     "track_id",
+                    "track_name",
+                    "artist_name",
                     "similarity",
                     "score",
                     "source_artist_id",
@@ -440,12 +470,41 @@ async def generate_similar_tag_candidates(
     Returns:
         Metadata dict with path, rows, table_name
     """
+    from deltalake.exceptions import TableNotFoundError
+
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
 
     # Load data
     plays = delta_mgr_silver.read_delta("plays").filter(pl.col("username") == username)
-    tracks = delta_mgr_silver.read_delta("tracks")
-    artists = delta_mgr_silver.read_delta("artists")
+
+    # Bootstrap: Return empty result if dimension tables don't exist yet (first run)
+    try:
+        tracks = delta_mgr_silver.read_delta("tracks")
+        artists = delta_mgr_silver.read_delta("artists")
+    except (FileNotFoundError, TableNotFoundError):
+        # Write empty table so candidates_asset is produced (triggers dimensions DAG)
+        empty_df = pl.DataFrame(
+            schema={
+                "username": pl.String,
+                "track_id": pl.String,
+                "track_name": pl.String,
+                "artist_name": pl.String,
+                "tag_match_count": pl.Int64,
+                "score": pl.Float64,
+                "source_tags": pl.String,
+            }
+        )
+        write_meta = delta_mgr_silver.write_delta(
+            empty_df,
+            table_name="candidate_similar_tag",
+            mode="overwrite",
+            partition_by="username",
+        )
+        return {
+            "path": write_meta["path"],
+            "rows": 0,
+            "table_name": write_meta["table_name"],
+        }
 
     # Build user's tag profile with frequency counts
     tag_profile = (
@@ -636,6 +695,8 @@ async def generate_similar_tag_candidates(
                 [
                     "username",
                     "track_id",
+                    "track_name",
+                    "artist_name",
                     "tag_match_count",
                     "score",
                     "source_tags",
@@ -694,7 +755,36 @@ async def generate_deep_cut_candidates(
     plays_lf = delta_mgr_silver.read_delta("plays").filter(
         pl.col("username") == username
     )
-    artists_lf = delta_mgr_silver.read_delta("artists")
+
+    # Bootstrap: Return empty result if dimension tables don't exist yet (first run)
+    from deltalake.exceptions import TableNotFoundError
+
+    try:
+        artists_lf = delta_mgr_silver.read_delta("artists")
+    except (FileNotFoundError, TableNotFoundError):
+        # Write empty table so candidates_asset is produced (triggers dimensions DAG)
+        empty_df = pl.DataFrame(
+            schema={
+                "username": pl.String,
+                "track_id": pl.String,
+                "track_name": pl.String,
+                "artist_name": pl.String,
+                "album_name": pl.String,
+                "score": pl.Float64,
+                "source_artist_id": pl.String,
+            }
+        )
+        write_meta = delta_mgr_silver.write_delta(
+            empty_df,
+            table_name="candidate_deep_cut",
+            mode="overwrite",
+            partition_by="username",
+        )
+        return {
+            "path": write_meta["path"],
+            "rows": 0,
+            "table_name": write_meta["table_name"],
+        }
 
     # Load user's artist play counts from gold table
     artist_play_counts_lf = (
@@ -922,6 +1012,8 @@ async def generate_deep_cut_candidates(
                 [
                     "username",
                     "track_id",
+                    "track_name",
+                    "artist_name",
                     "album_name",
                     "score",
                     "source_artist_id",
@@ -1095,6 +1187,8 @@ def merge_candidate_sources(
     Returns:
         Metadata dict with path, rows, table_name
     """
+    from deltalake.exceptions import TableNotFoundError
+
     # IO managers for silver and gold layers
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
     delta_mgr_gold = PolarsDeltaIOManager(medallion_layer="gold")
@@ -1117,7 +1211,20 @@ def merge_candidate_sources(
     )
 
     # Load tracks dimension for streaming links
-    tracks_dim_lf = delta_mgr_silver.read_delta("tracks")
+    # Bootstrap: If dimension doesn't exist yet, use empty DataFrame (no streaming links)
+    try:
+        tracks_dim_lf = delta_mgr_silver.read_delta("tracks")
+    except (FileNotFoundError, TableNotFoundError):
+        # First run: no dimension table yet, streaming links will be NULL
+        tracks_dim_lf = pl.LazyFrame(
+            schema={
+                "track_id": pl.String,
+                "track_name": pl.String,
+                "artist_name": pl.String,
+                "youtube_url": pl.String,
+                "spotify_url": pl.String,
+            }
+        )
 
     # Process each source: normalize scores, limit, and filter played tracks
     def process_source(
@@ -1153,11 +1260,13 @@ def merge_candidate_sources(
             pl.lit(source_name == "old_favorite").alias("old_favorite"),
         )
 
-        # Select standard columns (no metadata columns)
+        # Select standard columns (keep track_name/artist_name for new track enrichment)
         return filtered.select(
             [
                 "username",
                 "track_id",
+                "track_name",
+                "artist_name",
                 "normalized_score",
                 "similar_artist",
                 "similar_tag",
@@ -1202,9 +1311,9 @@ def merge_candidate_sources(
 
     # Deduplicate by track_id, aggregating source flags and summing normalized scores
     # Summing scores rewards tracks recommended by multiple generators (consensus)
-    # Note: We don't join with tracks dimension for metadata, as candidates may not exist there yet
+    # Keep track_name/artist_name from candidates for new track enrichment
     merged_lf = (
-        all_candidates.group_by("username", "track_id")
+        all_candidates.group_by("username", "track_id", "track_name", "artist_name")
         .agg(
             [
                 pl.max("similar_artist").alias("similar_artist"),
@@ -1218,37 +1327,67 @@ def merge_candidate_sources(
     )
 
     # Note: We no longer enrich tracks here to avoid circular dependency.
-    # New tracks discovered in candidates will be enriched by the weekly
-    # dimension update DAG which reads from gold/track_candidates.
-    # This creates a 1-7 day delay for full metadata, which is acceptable.
+    # New tracks discovered in candidates will be enriched by the
+    # dimension update DAG which reads track_name/artist_name from gold/track_candidates.
 
-    # Join with tracks dimension to add streaming links and track metadata
+    # Join with tracks dimension to add streaming links
+    # Keep candidate track_name/artist_name (from API) for new tracks,
+    # use dimension values (enriched) for existing tracks
     tracks_with_links = tracks_dim_lf.select(
         [
             "track_id",
+            "track_name",
+            "artist_name",
             "youtube_url",
             "spotify_url",
         ]
     )
 
-    merged_with_links = merged_lf.join(
-        tracks_with_links,
-        on="track_id",
-        how="left",
+    merged_with_links = (
+        merged_lf.join(
+            tracks_with_links,
+            on="track_id",
+            how="left",
+            suffix="_dim",
+        )
+        .with_columns(
+            [
+                # Prefer dimension track_name/artist_name if available, otherwise keep candidate values
+                pl.coalesce([pl.col("track_name_dim"), pl.col("track_name")]).alias(
+                    "track_name"
+                ),
+                pl.coalesce([pl.col("artist_name_dim"), pl.col("artist_name")]).alias(
+                    "artist_name"
+                ),
+            ]
+        )
+        .drop(["track_name_dim", "artist_name_dim"])
     )
 
-    # CRITICAL: Deduplicate by youtube_url at the gold layer
-    # Different track versions (e.g., "Song" vs "Song (Remastered)") may map to the same
-    # YouTube video. We deduplicate here to ensure downstream consumers (Streamlit app)
-    # get clean data with no duplicate videos. Keep highest-scored track for each video.
-    # Also filter out tracks without youtube_url since they cannot be played.
+    # Deduplicate by track_id first (keep highest score)
+    # Note: We include tracks even if they don't have youtube_url yet - they're new discoveries
+    # that will be enriched by the dimensions DAG reading from gold/track_candidates
+    merged_deduped = merged_with_links.sort("score", descending=True).unique(
+        subset=["username", "track_id"], keep="first"
+    )
+
+    # For tracks that DO have youtube_url (already enriched), deduplicate by video
+    # to avoid duplicate YouTube videos in recommendations
+    # Tracks without youtube_url (new discoveries) pass through unchanged
     merged_deduped = (
-        merged_with_links.filter(pl.col("youtube_url").is_not_null())
+        merged_deduped.with_columns(
+            # Create a dedup key: if youtube_url exists, use it; else use track_id
+            pl.when(pl.col("youtube_url").is_not_null())
+            .then(pl.col("youtube_url"))
+            .otherwise(pl.col("track_id"))
+            .alias("_dedup_key")
+        )
         .sort("score", descending=True)
-        .unique(subset=["username", "youtube_url"], keep="first")
+        .unique(subset=["username", "_dedup_key"], keep="first")
+        .drop("_dedup_key")
     )
 
-    # Write gold candidate table with streaming links (clean, deduplicated data)
+    # Write gold candidate table (includes both enriched and unenriched tracks)
     df = merged_deduped.collect()  # type: ignore[attr-defined]
     write_meta = delta_mgr_gold.write_delta(
         df,

@@ -2,14 +2,18 @@
 Dimension Tables DAG - Fetch and maintain track/artist metadata.
 
 This DAG incrementally builds dimension tables with Last.fm metadata:
-- tracks (bronze → silver): Track details, tags, listeners, playcount
+- tracks (bronze → silver): Track details, tags, listeners, playcount, streaming links
 - artists (bronze → silver): Artist details, tags, listeners, bio
 
-Only fetches metadata for new tracks/artists across all users' play history.
+Fetches metadata for:
+1. New tracks from user play history (silver/plays)
+2. New tracks discovered by candidate generation (gold/track_candidates)
+
 Dimensions are global (not per-user).
 
 Configuration:
-- Runs weekly (dimensions change slowly)
+- Runs when plays or candidates are updated (asset-triggered)
+- Enriches new recommendations in single cycle
 - Incremental: only fetches new tracks/artists
 - Rate limited to respect Last.fm API limits
 """
@@ -25,12 +29,16 @@ tracks_asset = Asset("delta://data/silver/tracks")
 artists_asset = Asset("delta://data/silver/artists")
 dim_users_asset = Asset("delta://data/silver/dim_users")
 
-# Asset consumed by this DAG
+# Assets consumed by this DAG
 plays_asset = Asset("delta://data/silver/plays")
+candidates_asset = Asset("delta://data/gold/track_candidates")
 
 
 @dag(
-    schedule="@weekly",
+    schedule=[
+        plays_asset,
+        candidates_asset,
+    ],  # Single-cycle flow: plays → candidates → dimensions
     start_date=DAG_START_DATE,
     catchup=False,  # Don't backfill dimensions
     max_active_runs=1,

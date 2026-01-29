@@ -18,10 +18,12 @@ Last.fm API → Bronze (JSON) → Silver (Delta) → Gold (Aggregations) → Str
 
 | DAG | Schedule | Purpose |
 |-----|----------|---------|
-| lastfm_plays | @daily | Extract listening history |
-| lastfm_dimensions | @weekly | Extract track/artist metadata |
-| gold_play_aggregations | Asset-triggered | Compute recency scores |
-| candidate_generation | Asset-triggered | Generate recommendations |
+| lastfm_plays | @daily | Extract listening history, trigger candidate generation |
+| candidate_generation | Asset-triggered (plays) | Generate recommendations, trigger dimensions |
+| lastfm_dimensions | Asset-triggered (plays + candidates) | Extract track/artist metadata with streaming links |
+| gold_play_aggregations | Asset-triggered (plays + dimensions) | Compute recency scores |
+
+**Flow**: plays → candidates → dimensions (single-cycle enrichment) → aggregations
 
 ### Key Tables
 

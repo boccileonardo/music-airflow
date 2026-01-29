@@ -64,16 +64,8 @@ def transform_tracks_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]
     filename = fetch_metadata["filename"]
     tracks_lf = io_manager.read_json(filename)
 
-    # Apply transformations
+    # Apply transformations (includes streaming links from bronze enrichment)
     df = _transform_tracks_raw_to_structured(tracks_lf)
-
-    # Add youtube_url and spotify_url columns (will be enriched later)
-    df = df.with_columns(
-        [
-            pl.lit(None, dtype=pl.Utf8).alias("youtube_url"),
-            pl.lit(None, dtype=pl.Utf8).alias("spotify_url"),
-        ]
-    )
 
     df = _deduplicate_tracks(df)
     # Note: Removed _union_enriched_recommended_tracks() to eliminate circular dependency
@@ -193,7 +185,21 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
             .otherwise(None)
             .alias("tags"),
         ]
-    ).select(
+    )
+
+    # Add streaming links if available (enriched in bronze extraction)
+    # Use pl.when to handle cases where columns don't exist
+    if "youtube_url" in df.collect_schema().names():
+        df = df.with_columns(pl.col("youtube_url").alias("youtube_url"))
+    else:
+        df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("youtube_url"))
+
+    if "spotify_url" in df.collect_schema().names():
+        df = df.with_columns(pl.col("spotify_url").alias("spotify_url"))
+    else:
+        df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("spotify_url"))
+
+    df = df.select(
         [
             "track_name",
             "artist_name",
@@ -203,6 +209,8 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
             "playcount",
             "tags",
             "track_url",
+            "youtube_url",
+            "spotify_url",
         ]
     )
 

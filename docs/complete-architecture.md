@@ -9,8 +9,8 @@ The system avoids recommendation feedback loops by using exponential decay scori
 **Bronze**: Raw JSON from Last.fm API
 
 - User play history (daily per user)
-- Track metadata (weekly batch for new tracks)
-- Artist metadata with similar artists (weekly batch)
+- Track metadata (on-demand for new tracks)
+- Artist metadata (on-demand for new tracks)
 
 **Silver**: Structured Delta tables
 
@@ -35,8 +35,8 @@ graph TB
 
     subgraph "Bronze Layer"
         B1[plays JSON<br/>daily per user]
-        B2[tracks JSON<br/>weekly batch]
-        B3[artists JSON<br/>weekly batch]
+        B2[tracks JSON<br/>on-demand]
+        B3[artists JSON<br/>on-demand]
     end
 
     subgraph "Silver Layer"
@@ -58,12 +58,21 @@ graph TB
     end
 
     API --> B1
+    B1 --> S1
+
+    S1 --> S5
+    S2 --> S5
+    S3 --> S5
+    G2 --> S5
+
+    S5 --> G3
+
+    G3 --> API
     API --> B2
     API --> B3
-
-    B1 --> S1
     B2 --> S2
     B3 --> S3
+
     S1 --> S4
 
     S1 --> G1
@@ -74,14 +83,6 @@ graph TB
     S1 --> G2
     S4 --> G2
 
-    S1 --> S5
-    S2 --> S5
-    S3 --> S5
-    G2 --> S5
-
-    S5 --> G3
-    S2 --> G3
-
     G3 --> APP
     APP --> YT
 ```
@@ -90,38 +91,43 @@ graph TB
 
 ```mermaid
 graph LR
-    D1[lastfm_plays<br/>@daily] -->|plays asset| D3[gold_play_aggregations<br/>asset-triggered]
-    D1 -->|plays asset| D4[candidate_generation<br/>asset-triggered]
+    D1[lastfm_plays<br/>@daily] -->|plays asset| D2[candidate_generation<br/>asset-triggered]
+    D2 -->|candidates asset| D3[lastfm_dimensions<br/>asset-triggered]
+    D1 -->|plays asset| D3
+    D3 -->|artists/tracks/users| D4[gold_play_aggregations<br/>asset-triggered]
+    D1 -->|plays asset| D4
 
-    D2[lastfm_dimensions<br/>@weekly] -->|tracks asset| D4
-    D2 -->|artists asset| D3
-    D2 -->|artists asset| D4
-    D2 -->|dim_users asset| D3
-
-    D3 -->|artist_play_count asset| APP[Streamlit App]
-    D3 -->|track_play_count asset| APP
-    D4 -->|track_candidates asset| APP
+    D4 -->|artist_play_count asset| APP[Streamlit App]
+    D4 -->|track_play_count asset| APP
+    D2 -->|track_candidates asset| APP
 ```
 
 **lastfm_plays** (@daily):
 
 - Extracts user listening history
 - Builds plays table incrementally with catchup enabled for backfills
+- Triggers candidate generation
 
-**lastfm_dimensions** (@weekly):
+**candidate_generation** (asset-triggered by plays):
 
-- Fetches metadata for new tracks/artists
-- Computes user dimension table with half-life values
+- Generates four types of candidates (similar artists, similar tags, deep cuts, old favorites)
+- Reads existing track/artist dimensions when available
+- Preserves track_name/artist_name from Last.fm API for dimension enrichment
+- Writes to gold/track_candidates
+- Triggers dimensions DAG
 
-**gold_play_aggregations** (asset-triggered):
+**lastfm_dimensions** (asset-triggered by plays + candidates):
+
+- Discovers new tracks from plays and candidates
+- Fetches metadata from Last.fm API
+- Enriches with YouTube/Spotify streaming links via web scraping
+- Computes user profiles with half-life values
+- Single-cycle enrichment: New tracks discovered by candidates are enriched in the same daily run
+
+**gold_play_aggregations** (asset-triggered by plays + dimensions):
 
 - Computes play statistics with exponential decay recency scores
 - Full refresh since scores are time-dependent
-
-**candidate_generation** (asset-triggered):
-
-- Generates four types of candidates (similar artists, similar tags, deep cuts, old favorites)
-- Consolidates into gold table with type indicators
 
 ## Recommendation Candidates
 
@@ -205,25 +211,40 @@ Veterans have gentler decay (~500 days), new users have aggressive decay (~30 da
 
 ### Track ID Generation
 
-Canonical IDs are generated using fuzzy text matching to handle track variations:
+Canonical track IDs use text normalization for robust matching across data sources:
 
 ```python
 track_id = f"{normalize_text(track_name)}|{normalize_text(artist_name)}"
 ```
 
-This ensures consistent joins even when track names vary (e.g., "Song" vs "Song (Remastered)").
+**Normalization**:
+- Lowercase conversion
+- Removal of punctuation, parenthetical notes, and extra whitespace
+- Stripping of qualifiers like "(Remastered)", "(Live)", "(feat. X)", years
+
+This ensures consistent joins across track name variations (e.g., "Song" matches "Song (Remastered 2020)").
+
+### Streaming Link Enrichment
+
+Track metadata includes streaming links scraped from Last.fm track pages:
+- YouTube URL (prioritized for playlist creation)
+- Spotify URL (for cross-platform compatibility)
+
+Enables direct playback in the Streamlit app and automated YouTube playlist generation.
 
 ### Candidate Consolidation
 
 Four silver candidate tables merge into one gold table with one-hot encoding:
 
 ```python
-# Deduplicate by (username, track_id)
-similar_artist = any(source == "similar_artist")
-similar_tag = any(source == "similar_tag")
-deep_cut = any(source == "deep_cut")
-old_favorite = any(source == "old_favorite")
-score = max(scores_across_sources)
+# Normalize scores within each source using percentile ranking
+# Limit each source to top N tracks (default 500)
+# Deduplicate by (username, track_id), aggregate source flags
+similar_artist = max(source == "similar_artist")
+similar_tag = max(source == "similar_tag")
+deep_cut = max(source == "deep_cut")
+old_favorite = max(source == "old_favorite")
+score = sum(normalized_scores)  # Sum rewards multi-source consensus
 ```
 
-Tracks can belong to multiple categories simultaneously.
+Tracks can belong to multiple categories simultaneously. Tracks appearing in multiple sources get higher scores (consensus bonus).

@@ -381,6 +381,8 @@ class TestMergeCandidateSources:
             {
                 "username": ["user1"],
                 "track_id": ["artist b::new track"],
+                "track_name": ["New Track"],
+                "artist_name": ["Artist B"],
                 "track_mbid": ["tmbid"],
                 "artist_mbid": ["bmbid"],
                 "score": [10000],
@@ -395,6 +397,8 @@ class TestMergeCandidateSources:
             {
                 "username": ["user1", "user1"],
                 "track_id": ["artist b::new track", "artist c::tag track"],
+                "track_name": ["New Track", "Tag Track"],
+                "artist_name": ["Artist B", "Artist C"],
                 "track_mbid": ["tmbid", "tm2"],
                 "artist_mbid": ["bmbid", "cmbid"],
                 "tag_match_count": [3, 4],
@@ -411,6 +415,8 @@ class TestMergeCandidateSources:
             {
                 "username": ["user1"],
                 "track_id": ["artist c::tag track"],
+                "track_name": ["Tag Track"],
+                "artist_name": ["Artist C"],
                 "track_mbid": ["tm2"],
                 "artist_mbid": ["cmbid"],
                 "album_name": ["Album X"],
@@ -443,15 +449,21 @@ class TestMergeCandidateSources:
         assert b_row["similar_tag"] is True
         assert b_row["deep_cut_same_artist"] is False
         assert b_row["old_favorite"] is False
-        # Metadata columns should NOT be present (candidates may not exist in dim tables)
-        assert "track_name" not in b_row
-        assert "artist_name" not in b_row
+        # Track metadata SHOULD be present (needed for dimension extraction)
+        assert b_row["track_name"] == "New Track"
+        assert b_row["artist_name"] == "Artist B"
+        # YouTube/Spotify URLs should be present (joined from tracks dimension)
+        assert b_row["youtube_url"] == "https://youtube.com/watch?v=1"
+        assert b_row["spotify_url"] == "https://open.spotify.com/track/1"
 
         c_row = rows["artist c::tag track"]
         assert c_row["similar_artist"] is False
         assert c_row["similar_tag"] is True
         assert c_row["deep_cut_same_artist"] is True
         assert c_row["old_favorite"] is False
-        # Metadata columns should NOT be present
-        assert "track_name" not in c_row
-        assert "artist_name" not in c_row
+        # Track metadata SHOULD be present
+        assert c_row["track_name"] == "Tag Track"
+        assert c_row["artist_name"] == "Artist C"
+        # YouTube/Spotify URLs should be present
+        assert c_row["youtube_url"] == "https://youtube.com/watch?v=2"
+        assert c_row["spotify_url"] == "https://open.spotify.com/track/2"

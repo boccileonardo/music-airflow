@@ -15,6 +15,7 @@ from deltalake.exceptions import TableNotFoundError
 
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager, JSONIOManager
+from music_airflow.utils.lastfm_scraper import LastFMScraper
 import polars as pl
 
 
@@ -51,23 +52,18 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
     unique_tracks_lf = plays_lf.select(["track_name", "artist_name"]).unique()
 
     # Also check for tracks from candidate_generation (gold layer)
-    # Parse track_id format: "normalized_track|normalized_artist"
+    # Candidates include track_name and artist_name for API calls
     try:
         gold_io = PolarsDeltaIOManager(medallion_layer="gold")
         candidates_lf = gold_io.read_delta("track_candidates")
-        # Parse track_id to extract track/artist names
-        # track_id format: "track_name|artist_name" (both normalized)
-        # We'll use the candidate_source to get the original names when available
+
+        # Extract track names from candidates (use original names for API calls)
         candidate_tracks_lf = (
-            candidates_lf.select(["track_id", "candidate_source"])
-            .unique(subset=["track_id"])
-            .with_columns(
-                [
-                    pl.col("track_id").str.split("|").list.get(0).alias("track_name"),
-                    pl.col("track_id").str.split("|").list.get(1).alias("artist_name"),
-                ]
+            candidates_lf.select(["track_name", "artist_name"])
+            .filter(
+                pl.col("track_name").is_not_null() & pl.col("artist_name").is_not_null()
             )
-            .select(["track_name", "artist_name"])
+            .unique()
         )
         # Union with play tracks
         unique_tracks_lf = pl.concat([unique_tracks_lf, candidate_tracks_lf]).unique()
@@ -149,6 +145,29 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
         raise AirflowSkipException(
             f"No track metadata successfully fetched (0/{track_count} succeeded)"
         )
+
+    # Enrich with streaming links from Last.fm track pages
+    print(f"Fetching streaming links for {len(tracks_data)} tracks...")
+    track_urls = [track.get("url", "") for track in tracks_data if track.get("url")]
+
+    async with LastFMScraper() as scraper:
+        streaming_links = await scraper.get_streaming_links_batch(track_urls)
+
+    # Merge streaming links into track data
+    for idx, track in enumerate(tracks_data):
+        track_url = track.get("url", "")
+        if track_url and track_url in streaming_links:
+            links = streaming_links[track_url]
+            track["youtube_url"] = links.get("youtube")
+            track["spotify_url"] = links.get("spotify")
+        else:
+            track["youtube_url"] = None
+            track["spotify_url"] = None
+
+    enriched_count = sum(
+        1 for t in tracks_data if t.get("youtube_url") or t.get("spotify_url")
+    )
+    print(f"Enriched {enriched_count}/{len(tracks_data)} tracks with streaming links")
 
     # Save to bronze as JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -6,7 +6,9 @@ saves each to silver tables, then consolidates into a single gold table with
 type indicators and deduplication.
 
 Configuration:
-- Runs when silver layer assets are updated (plays, artists, tracks)
+- Runs when plays data is updated (depends on silver/plays asset)
+- Uses existing dimensions (tracks/artists) from previous runs for user's play history
+- Discovers new tracks which will be enriched by downstream dimensions DAG
 - Generates candidates for all active users
 - Saves intermediate results to silver, final unified table to gold
 """
@@ -15,17 +17,15 @@ from typing import Any
 from music_airflow.utils.constants import DAG_START_DATE
 from airflow.sdk import Asset, dag, task
 
-# Assets consumed by this DAG
+# Asset consumed by this DAG
 plays_asset = Asset("delta://data/silver/plays")
-artists_asset = Asset("delta://data/silver/artists")
-tracks_asset = Asset("delta://data/silver/tracks")
 
 # Asset produced by this DAG
 candidates_asset = Asset("delta://data/gold/track_candidates")
 
 
 @dag(
-    schedule=[plays_asset, artists_asset, tracks_asset],
+    schedule=[plays_asset],
     start_date=DAG_START_DATE,
     catchup=False,
     max_active_runs=1,
@@ -62,7 +62,7 @@ def candidate_generation():
 
     @task(
         multiple_outputs=False,
-        inlets=[plays_asset, artists_asset],
+        inlets=[plays_asset],
     )
     def generate_similar_artist(username: str) -> dict[str, Any]:
         """
@@ -88,7 +88,7 @@ def candidate_generation():
     # Similar tag candidates per user
     @task(
         multiple_outputs=False,
-        inlets=[plays_asset, tracks_asset],
+        inlets=[plays_asset],
     )
     def generate_similar_tag(username: str) -> dict[str, Any]:
         """
@@ -114,7 +114,7 @@ def candidate_generation():
     # Deep cut candidates per user
     @task(
         multiple_outputs=False,
-        inlets=[plays_asset, artists_asset, tracks_asset],
+        inlets=[plays_asset],
     )
     def generate_deep_cut(username: str) -> dict[str, Any]:
         """
