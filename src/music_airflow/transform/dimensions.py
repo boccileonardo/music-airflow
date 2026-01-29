@@ -40,11 +40,7 @@ def transform_tracks_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]
     Transform raw track metadata from bronze to structured Delta table in silver layer.
 
     Reads raw JSON track data from bronze, extracts and flattens relevant fields,
-    and merges into silver Delta table. Uses upsert based on MBID when available,
-    otherwise falls back to track_name + artist_name + album_name.
-
-    Also checks for and incorporates enriched candidate tracks from candidate_enriched_tracks
-    table if it exists.
+    and merges into silver Delta table using canonical track_id for deduplication.
 
     Args:
         fetch_metadata: Metadata from extraction containing filename, tracks_fetched
@@ -105,7 +101,7 @@ def transform_artists_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any
     Transform raw artist metadata from bronze to structured Delta table in silver layer.
 
     Reads raw JSON artist data from bronze, extracts and flattens relevant fields,
-    and merges into silver Delta table. Uses upsert based on MBID when available.
+    and merges into silver Delta table using canonical artist_id for deduplication.
 
     Args:
         fetch_metadata: Metadata from extraction containing filename, artists_fetched
@@ -133,14 +129,8 @@ def transform_artists_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any
     df = _transform_artists_raw_to_structured(artists_lf)
     df = _deduplicate_artists(df)
 
-    # Exclude invalid artists (no mbid and listeners < 1000)
-    df = df.filter(
-        ~(
-            (pl.col("artist_mbid").is_null() | (pl.col("artist_mbid") == ""))
-            & (pl.col("listeners") < 1000)
-        )
-    )
-    # Note: No longer enriching missing artist MBIDs to avoid MusicBrainz dependency
+    # Exclude artists with very low listener counts (likely invalid)
+    df = df.filter(pl.col("listeners") >= 1000)
 
     # Write to silver layer Delta table with merge/upsert
     table_name = "artists"
@@ -165,7 +155,6 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
 
     Extracts relevant fields from nested JSON structure:
     - Basic info: name, artist, album, duration
-    - MBIDs for linking
     - Popularity metrics: listeners, playcount
     - Tags (flattened to comma-separated string)
     - URLs
@@ -180,12 +169,10 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
         [
             # Basic info
             pl.col("name").alias("track_name"),
-            pl.col("mbid").alias("track_mbid"),
             pl.col("url").alias("track_url"),
             pl.col("duration").cast(pl.Int64).alias("duration_ms"),
             # Artist info (nested struct)
             pl.col("artist").struct.field("name").alias("artist_name"),
-            pl.col("artist").struct.field("mbid").alias("artist_mbid"),
             # Album info (nested struct)
             pl.when(pl.col("album").is_not_null())
             .then(pl.col("album").struct.field("title"))
@@ -209,9 +196,7 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
     ).select(
         [
             "track_name",
-            "track_mbid",
             "artist_name",
-            "artist_mbid",
             "album_name",
             "duration_ms",
             "listeners",
@@ -229,7 +214,7 @@ def _transform_artists_raw_to_structured(raw_artists: pl.LazyFrame) -> pl.LazyFr
     Transform raw Last.fm artist metadata to structured format.
 
     Extracts relevant fields from nested JSON structure:
-    - Basic info: name, mbid
+    - Basic info: name
     - Popularity metrics: listeners, playcount
     - Tags (flattened to comma-separated string)
     - Bio summary (first 500 chars)
@@ -245,7 +230,6 @@ def _transform_artists_raw_to_structured(raw_artists: pl.LazyFrame) -> pl.LazyFr
         [
             # Basic info
             pl.col("name").alias("artist_name"),
-            pl.col("mbid").alias("artist_mbid"),
             pl.col("url").alias("artist_url"),
             # Popularity metrics (nested in stats struct)
             pl.when(pl.col("stats").is_not_null())
@@ -276,7 +260,6 @@ def _transform_artists_raw_to_structured(raw_artists: pl.LazyFrame) -> pl.LazyFr
     ).select(
         [
             "artist_name",
-            "artist_mbid",
             "listeners",
             "playcount",
             "tags",
@@ -345,8 +328,6 @@ def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
     agg_list = [
         pl.first("track_name").alias("track_name"),
         pl.first("artist_name").alias("artist_name"),
-        pl.first("track_mbid").alias("track_mbid"),
-        pl.first("artist_mbid").alias("artist_mbid"),
         pl.first("album_name").alias("album_name"),
         pl.first("duration_ms").alias("duration_ms"),
         pl.first("track_url").alias("track_url"),
@@ -402,7 +383,6 @@ def _deduplicate_artists(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
     deduplicated = sorted_artists.group_by("artist_id").agg(
         [
             pl.first("artist_name").alias("artist_name"),
-            pl.first("artist_mbid").alias("artist_mbid"),
             pl.first("artist_url").alias("artist_url"),
             pl.first("tags").alias("tags"),
             pl.first("bio_summary").alias("bio_summary"),

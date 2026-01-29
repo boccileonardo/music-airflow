@@ -102,9 +102,7 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
     # Check schema (track_id and artist_id added during deduplication, not in raw transform)
     expected_cols = [
         "track_name",
-        "track_mbid",
         "artist_name",
-        "artist_mbid",
         "album_name",
         "duration_ms",
         "listeners",
@@ -116,18 +114,14 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
 
     # Check first row
     assert result["track_name"][0] == "Song A"
-    assert result["track_mbid"][0] == "track-mbid-1"
     assert result["artist_name"][0] == "Artist X"
-    assert result["artist_mbid"][0] == "artist-mbid-1"
     assert result["album_name"][0] == "Album 1"
     assert result["duration_ms"][0] == 180000
     assert result["listeners"][0] == 5000
     assert result["playcount"][0] == 10000
     assert result["tags"][0] == "rock, indie, alternative"
 
-    # Check second row (missing mbids)
-    assert result["track_mbid"][1] == ""
-    assert result["artist_mbid"][1] == ""
+    # Check second row
     assert result["tags"][1] == "pop, electronic"
 
 
@@ -138,7 +132,6 @@ def test_transform_artists_raw_to_structured(sample_raw_artists):
     # Check schema (artist_id added during deduplication, not in raw transform)
     expected_cols = [
         "artist_name",
-        "artist_mbid",
         "listeners",
         "playcount",
         "tags",
@@ -149,7 +142,6 @@ def test_transform_artists_raw_to_structured(sample_raw_artists):
 
     # Check first row
     assert result["artist_name"][0] == "Artist X"
-    assert result["artist_mbid"][0] == "artist-mbid-1"
     assert result["listeners"][0] == 50000
     assert result["playcount"][0] == 100000
     assert result["tags"][0] == "rock, indie, alternative"
@@ -158,7 +150,6 @@ def test_transform_artists_raw_to_structured(sample_raw_artists):
     assert result["artist_url"][0] == "https://last.fm/artist/x"
 
     # Check second row
-    assert result["artist_mbid"][1] == ""
     assert result["tags"][1] == "pop, electronic"
 
 

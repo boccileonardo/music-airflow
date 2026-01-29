@@ -48,9 +48,7 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
         raise AirflowSkipException("No plays data available yet - run plays DAG first")
 
     # Get unique tracks from plays (keep as LazyFrame)
-    unique_tracks_lf = plays_lf.select(
-        ["track_name", "artist_name", "track_mbid"]
-    ).unique()
+    unique_tracks_lf = plays_lf.select(["track_name", "artist_name"]).unique()
 
     # Also check for tracks from candidate_generation (gold layer)
     # Parse track_id format: "normalized_track|normalized_artist"
@@ -67,10 +65,9 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
                 [
                     pl.col("track_id").str.split("|").list.get(0).alias("track_name"),
                     pl.col("track_id").str.split("|").list.get(1).alias("artist_name"),
-                    pl.lit(None, dtype=pl.Utf8).alias("track_mbid"),
                 ]
             )
-            .select(["track_name", "artist_name", "track_mbid"])
+            .select(["track_name", "artist_name"])
         )
         # Union with play tracks
         unique_tracks_lf = pl.concat([unique_tracks_lf, candidate_tracks_lf]).unique()
@@ -96,11 +93,10 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
 
     # Only collect once to preserve row order across columns
     new_tracks_df: pl.DataFrame = new_tracks_lf.select(
-        "track_name", "artist_name", "track_mbid"
+        "track_name", "artist_name"
     ).collect(engine="streaming")
     track_names: list = new_tracks_df["track_name"].to_list()
     artist_names: list = new_tracks_df["artist_name"].to_list()
-    track_mbids: list = new_tracks_df["track_mbid"].to_list()
 
     track_count = len(track_names)
     if track_count == 0:
@@ -115,7 +111,6 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
             client.get_track_info(
                 track=track_names[idx],
                 artist=artist_names[idx],
-                mbid=track_mbids[idx] if track_mbids[idx] else None,
             )
             for idx in range(track_count)
         ]
@@ -140,10 +135,6 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
                 continue
 
             try:
-                # Preserve the MBID from plays rather than the one from API response
-                # (API often returns empty MBID even when we query with one)
-                if track_mbids[idx]:
-                    track_info["mbid"] = track_mbids[idx]
                 tracks_data.append(track_info)
             except (ValueError, KeyError) as e:
                 print(

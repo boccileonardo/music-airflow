@@ -112,11 +112,11 @@ def transform_plays_raw_to_structured(
         - username: str
         - scrobbled_at: int (Unix timestamp)
         - scrobbled_at_utc: datetime (UTC)
-        - track_name, track_mbid, track_url: str
+        - track_name, track_url: str
         - artist_name: str
-        - album_name, album_mbid: str
+        - album_name: str
         - is_loved: bool (whether user loved this track)
-        - track_id: str (coalesced: MBID or synthetic)
+        - track_id: str (canonical normalized ID)
     """
     df = (
         raw_tracks.with_columns(
@@ -135,10 +135,6 @@ def transform_plays_raw_to_structured(
                 .alias("scrobbled_at_utc"),
                 # Track info
                 pl.col("name").alias("track_name"),
-                pl.when(pl.col("mbid") == "")
-                .then(None)
-                .otherwise(pl.col("mbid"))
-                .alias("track_mbid"),
                 pl.col("url").alias("track_url"),
                 # Artist info - extract from nested struct
                 # Artist has "name" field in the struct
@@ -146,10 +142,6 @@ def transform_plays_raw_to_structured(
                 # Album info - extract from nested struct
                 # Album has "#text" field in the struct
                 pl.col("album").struct.field("#text").alias("album_name"),
-                pl.when(pl.col("album").struct.field("mbid") == "")
-                .then(None)
-                .otherwise(pl.col("album").struct.field("mbid"))
-                .alias("album_mbid"),
                 pl.col("loved").cast(pl.Utf8).eq("1").alias("is_loved"),
             ]
         )
@@ -159,11 +151,9 @@ def transform_plays_raw_to_structured(
                 "scrobbled_at",
                 "scrobbled_at_utc",
                 "track_name",
-                "track_mbid",
                 "track_url",
                 "artist_name",
                 "album_name",
-                "album_mbid",
                 "is_loved",
             ]
         )

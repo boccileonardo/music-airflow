@@ -51,17 +51,14 @@ class TestTransformPlaysRawToStructured:
             "scrobbled_at",
             "scrobbled_at_utc",
             "track_name",
-            "track_mbid",
             "track_url",
             "artist_name",
             "album_name",
-            "album_mbid",
             "is_loved",
             "track_id",
         ]
         assert result.columns == expected_cols
 
-        # Check data
         assert result["username"].to_list() == ["testuser", "testuser"]
         assert result["track_name"].to_list() == ["Track 1", "Track 2"]
         assert result["artist_name"].to_list() == ["Artist 1", "Artist 2"]
@@ -81,25 +78,6 @@ class TestTransformPlaysRawToStructured:
             dt_values[1].timestamp()
             == dt.datetime(2021, 1, 2, 0, 0, 0, tzinfo=dt.timezone.utc).timestamp()
         )
-
-    def test_missing_mbids(self):
-        """Test handling of missing MBIDs (converted to None)."""
-        raw_data = {
-            "name": ["Track 1"],
-            "mbid": [""],
-            "url": ["url1"],
-            "loved": ["0"],
-            "date": [{"uts": "1609459200", "#text": "01 Jan 2021"}],
-            "artist": [{"name": "Artist 1", "mbid": None}],
-            "album": [{"#text": "Album 1", "mbid": None}],
-        }
-
-        df = pl.LazyFrame(raw_data)
-        result = transform_plays_raw_to_structured(df, "testuser").collect()
-
-        # Empty string MBIDs should be converted to None
-        assert result["track_mbid"].to_list() == [None]
-        assert result["album_mbid"].to_list() == [None]
 
     def test_sorting_by_timestamp(self):
         """Test that results are sorted by scrobbled_at."""
@@ -139,18 +117,13 @@ class TestTransformPlaysRawToStructured:
         raw_data = pl.LazyFrame(
             schema={
                 "name": pl.Utf8,
-                "mbid": pl.Utf8,
                 "url": pl.Utf8,
                 "loved": pl.Utf8,
                 "date": pl.Struct(
                     [pl.Field("uts", pl.Utf8), pl.Field("#text", pl.Utf8)]
                 ),
-                "artist": pl.Struct(
-                    [pl.Field("name", pl.Utf8), pl.Field("mbid", pl.Utf8)]
-                ),
-                "album": pl.Struct(
-                    [pl.Field("#text", pl.Utf8), pl.Field("mbid", pl.Utf8)]
-                ),
+                "artist": pl.Struct([pl.Field("name", pl.Utf8)]),
+                "album": pl.Struct([pl.Field("#text", pl.Utf8)]),
             }
         )
 
@@ -162,11 +135,9 @@ class TestTransformPlaysRawToStructured:
             "scrobbled_at",
             "scrobbled_at_utc",
             "track_name",
-            "track_mbid",
             "track_url",
             "artist_name",
             "album_name",
-            "album_mbid",
             "is_loved",
             "track_id",
         ]
