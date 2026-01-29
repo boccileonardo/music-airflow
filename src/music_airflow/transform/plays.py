@@ -9,6 +9,7 @@ from typing import Any
 import polars as pl
 
 from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
+from music_airflow.utils.text_normalization import generate_canonical_track_id
 
 
 def transform_plays_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]:
@@ -168,15 +169,13 @@ def transform_plays_raw_to_structured(
         )
         .with_columns(
             [
-                # Create track_id: prefer MBID when available, else synthetic from names
-                pl.when(
-                    (pl.col("track_mbid").is_not_null()) & (pl.col("track_mbid") != "")
-                )
-                .then(pl.col("track_mbid"))
-                .otherwise(
-                    pl.concat_str(
-                        [pl.col("track_name"), pl.col("artist_name")], separator="|"
-                    )
+                # Create track_id using canonical normalization
+                pl.struct(["track_name", "artist_name"])
+                .map_elements(
+                    lambda x: generate_canonical_track_id(
+                        x["track_name"], x["artist_name"]
+                    ),
+                    return_dtype=pl.Utf8,
                 )
                 .alias("track_id"),
             ]

@@ -21,6 +21,7 @@ import polars as pl
 
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
+from music_airflow.utils.text_normalization import generate_canonical_track_id
 
 logger = logging.getLogger(__name__)
 
@@ -83,26 +84,22 @@ def _resolve_track_ids(
     delta_mgr: PolarsDeltaIOManager,
 ) -> pl.DataFrame:
     """
-    Resolve track IDs by looking up existing dimension table entries.
+    Generate canonical track IDs for track data.
 
-    Strategy:
-    1. If track has MBID from API, use it as track_id
-    2. If no MBID, create temporary synthetic ID (track_name|artist_name)
-    3. Look up in tracks dimension table to find canonical track_id
-    4. This ensures we match existing plays even when API doesn't return MBIDs
+    Uses text normalization to create consistent track_ids regardless
+    of recording version (remastered, live, etc.).
 
     Args:
-        track_data: List of dicts with track_mbid, track_name, artist_name
-        delta_mgr: IO manager for reading dimension tables
+        track_data: List of dicts with track_name and artist_name
+        delta_mgr: IO manager (not used anymore, kept for compatibility)
 
     Returns:
-        DataFrame with track_id resolved from dimension table
+        DataFrame with canonical track_id added
     """
     if not track_data:
         return pl.DataFrame()
 
     # Create DataFrame with explicit schema to handle optional MBIDs
-    # Note: Other fields vary by caller, so we let those infer naturally
     df = pl.DataFrame(
         track_data,
         schema_overrides={
@@ -111,64 +108,15 @@ def _resolve_track_ids(
         },
     )
 
-    # Create preliminary track_id using same logic as dimension table
+    # Generate canonical track_id from normalized names
     df = df.with_columns(
-        pl.when(pl.col("track_mbid").is_not_null() & (pl.col("track_mbid") != ""))
-        .then(pl.col("track_mbid"))
-        .otherwise(
-            pl.concat_str([pl.col("track_name"), pl.col("artist_name")], separator="|")
+        pl.struct(["track_name", "artist_name"])
+        .map_elements(
+            lambda x: generate_canonical_track_id(x["track_name"], x["artist_name"]),
+            return_dtype=pl.Utf8,
         )
-        .alias("track_id_temp")
+        .alias("track_id")
     )
-
-    # Look up in dimension table to get canonical track_id
-    # This handles case where:
-    # - User played a track WITH mbid (stored as mbid in dimensions)
-    # - We get same track from album.getInfo WITHOUT mbid (would create synthetic)
-    # - We need to match them as the same track
-    try:
-        tracks_dim_lf = delta_mgr.read_delta("tracks")
-        # Check if dimension table has the columns we need for lookup
-        if "track_name" in tracks_dim_lf.collect_schema().names():
-            tracks_dim_df = (
-                tracks_dim_lf.select(["track_id", "track_name", "artist_name"])
-                .with_columns(
-                    pl.col("track_name").str.to_lowercase().alias("track_name_lower"),
-                    pl.col("artist_name").str.to_lowercase().alias("artist_name_lower"),
-                )
-                .select(["track_id", "track_name_lower", "artist_name_lower"])
-                .collect()
-            )
-
-            # Try to match by track_name + artist_name (case-insensitive)
-            df = (
-                df.with_columns(
-                    pl.col("track_name").str.to_lowercase().alias("track_name_lower"),
-                    pl.col("artist_name").str.to_lowercase().alias("artist_name_lower"),
-                )
-                .join(
-                    tracks_dim_df,
-                    on=["track_name_lower", "artist_name_lower"],
-                    how="left",
-                )
-                # Use dimension track_id if found, otherwise use our temporary ID
-                .with_columns(
-                    pl.coalesce([pl.col("track_id"), pl.col("track_id_temp")]).alias(
-                        "track_id"
-                    )
-                )
-                .drop("track_id_temp", "track_name_lower", "artist_name_lower")
-            )
-        else:
-            # Dimension table doesn't have track_name - just use our synthetic IDs
-            df = df.with_columns(pl.col("track_id_temp").alias("track_id")).drop(
-                "track_id_temp"
-            )
-    except Exception:
-        # If dimension lookup fails, fall back to synthetic IDs
-        df = df.with_columns(pl.col("track_id_temp").alias("track_id")).drop(
-            "track_id_temp"
-        )
 
     return df
 
@@ -392,10 +340,8 @@ async def generate_similar_artist_candidates(
                     tracks_filtered_by_min_listeners += 1
                     continue
 
-                # Create track ID consistent with plays: prefer MBID else "track|artist"
-                track_id = (
-                    track_mbid if track_mbid else f"{track_name}|{artist_name_track}"
-                )
+                # Create canonical track ID using text normalization
+                track_id = generate_canonical_track_id(track_name, artist_name_track)
 
                 # Skip if already played
                 if track_id in played_track_ids_set:
@@ -630,7 +576,8 @@ async def generate_similar_tag_candidates(
                     artist_name = str(artist_info) if artist_info else ""
                     artist_mbid = None
 
-                track_id = track_mbid if track_mbid else f"{track_name}|{artist_name}"
+                # Generate canonical track ID
+                track_id = generate_canonical_track_id(track_name, artist_name)
 
                 # Skip if already played
                 if track_id in played_track_ids_set:
@@ -958,12 +905,11 @@ async def generate_deep_cut_candidates(
                     tracks_filtered_by_album_listeners += 1
                     continue
 
-                # Use proper track_id logic: prefer MBID, else synthetic
-                track_id = (
-                    track_mbid
-                    if track_mbid
-                    else f"{track_name}|{metadata['artist_name']}"
+                # Generate canonical track ID
+                track_id = generate_canonical_track_id(
+                    track_name, metadata["artist_name"]
                 )
+
                 if track_id in played_track_ids_set:
                     tracks_filtered_by_already_played += 1
                     continue
