@@ -16,6 +16,11 @@ from deltalake.exceptions import TableNotFoundError
 from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.lastfm_scraper import LastFMScraper
+from music_airflow.utils.text_normalization import (
+    generate_canonical_track_id,
+    generate_canonical_artist_id,
+    is_music_video,
+)
 import requests
 
 logger = logging.getLogger(__name__)
@@ -707,91 +712,86 @@ def _transform_artists_raw_to_structured(raw_artists: pl.LazyFrame) -> pl.LazyFr
 
 def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Deduplicate tracks with same attributes, maintaining non-null metadata.
+    Deduplicate tracks using fuzzy text matching on normalized names.
 
-    When multiple rows exist, consolidate by:
-    - Keeping non-null values preferentially
-    - Prioritizing rows with MBIDs
-    - Taking max for numeric fields (listeners, playcount, duration)
+    Uses canonical track IDs based on normalized track + artist names.
+    When multiple versions exist (live, remastered, etc.):
+    - Prefers non-music-video versions
+    - Prefers versions with highest playcount
+    - Keeps best metadata from chosen version
+    - Uses max playcount across all versions
 
     Args:
         tracks_lf: LazyFrame with potentially duplicate tracks
 
     Returns:
-        Deduplicated LazyFrame with one row per track
+        Deduplicated LazyFrame with canonical track_id and best metadata
     """
     # Check which streaming URL columns exist in the schema
     schema_names = tracks_lf.collect_schema().names()
     has_youtube = "youtube_url" in schema_names
     has_spotify = "spotify_url" in schema_names
 
-    # Build aggregation list
+    # Add helper columns for deduplication
+    tracks_with_helpers = tracks_lf.with_columns(
+        [
+            # Generate canonical track_id from normalized names
+            pl.struct(["track_name", "artist_name"])
+            .map_elements(
+                lambda x: generate_canonical_track_id(
+                    x["track_name"], x["artist_name"]
+                ),
+                return_dtype=pl.Utf8,
+            )
+            .alias("track_id"),
+            # Detect music videos
+            pl.col("track_name")
+            .map_elements(is_music_video, return_dtype=pl.Boolean)
+            .alias("is_music_video"),
+            # Fill null playcount for sorting
+            pl.col("playcount").fill_null(0).alias("playcount_filled"),
+        ]
+    )
+
+    # Sort: non-videos first, then by playcount descending
+    # This ensures we pick the best version of each track
+    sorted_tracks = tracks_with_helpers.sort(
+        [
+            pl.col("is_music_video"),  # False (non-video) first
+            pl.col("playcount_filled"),
+        ],
+        descending=[False, True],
+    )
+
+    # Build aggregation list - take first (best) of each group
     agg_list = [
-        # non-null and non "", prefer rows with MBID
-        pl.col("track_mbid")
-        .filter((pl.col("track_mbid") != "") & pl.col("track_mbid").is_not_null())
-        .first()
-        .alias("track_mbid"),
-        pl.col("artist_mbid")
-        .filter((pl.col("artist_mbid") != "") & pl.col("artist_mbid").is_not_null())
-        .first()
-        .alias("artist_mbid"),
-        pl.col("duration_ms")
-        .filter(pl.col("duration_ms").is_not_null())
-        .first()
-        .alias("duration_ms"),
-        pl.col("track_url")
-        .filter((pl.col("track_url") != "") & pl.col("track_url").is_not_null())
-        .first()
-        .alias("track_url"),
-        pl.col("tags")
-        .filter((pl.col("tags") != "") & pl.col("tags").is_not_null())
-        .first()
-        .alias("tags"),
-        # Take max for numeric popularity metrics
-        pl.col("listeners").max().alias("listeners"),
-        pl.col("playcount").max().alias("playcount"),
+        pl.first("track_name").alias("track_name"),
+        pl.first("artist_name").alias("artist_name"),
+        pl.first("track_mbid").alias("track_mbid"),
+        pl.first("artist_mbid").alias("artist_mbid"),
+        pl.first("album_name").alias("album_name"),
+        pl.first("duration_ms").alias("duration_ms"),
+        pl.first("track_url").alias("track_url"),
+        pl.first("tags").alias("tags"),
+        # Take max for popularity metrics across all versions
+        pl.max("listeners").alias("listeners"),
+        pl.max("playcount").alias("playcount"),
     ]
 
     # Add streaming URLs if they exist
     if has_youtube:
-        agg_list.append(
-            pl.col("youtube_url")
-            .filter((pl.col("youtube_url") != "") & pl.col("youtube_url").is_not_null())
-            .first()
-            .alias("youtube_url")
-        )
+        agg_list.append(pl.first("youtube_url").alias("youtube_url"))
     if has_spotify:
-        agg_list.append(
-            pl.col("spotify_url")
-            .filter((pl.col("spotify_url") != "") & pl.col("spotify_url").is_not_null())
-            .first()
-            .alias("spotify_url")
-        )
+        agg_list.append(pl.first("spotify_url").alias("spotify_url"))
 
-    # same track name by same artist with same album name should be considered same track
-    deduplicated = (
-        tracks_lf.group_by(["track_name", "artist_name", "album_name"])
-        .agg(agg_list)
-        .with_columns(
-            # Create track_id: prefer MBID when available, else synthetic from names
-            pl.when((pl.col("track_mbid").is_not_null()) & (pl.col("track_mbid") != ""))
-            .then(pl.col("track_mbid"))
-            .otherwise(
-                pl.concat_str(
-                    [pl.col("track_name"), pl.col("artist_name")], separator="|"
-                )
-            )
-            .alias("track_id"),
-            # Create artist_id: use MBID if available, else artist name
-            # TODO: instead of artist name as fallback, use lastfm search for mbid based on fuzzy name search
-            pl.when(
-                (pl.col("artist_mbid").is_not_null()) & (pl.col("artist_mbid") != "")
-            )
-            .then(pl.col("artist_mbid"))
-            .otherwise(pl.col("artist_name"))
-            .alias("artist_id"),
-        )
+    # Group by canonical track_id
+    deduplicated = sorted_tracks.group_by("track_id").agg(agg_list)
+
+    # Generate artist_id using normalized artist name
+    deduplicated = deduplicated.with_columns(
+        pl.col("artist_name")
+        .map_elements(generate_canonical_artist_id, return_dtype=pl.Utf8)
+        .alias("artist_id")
     )
 
     return deduplicated
@@ -799,56 +799,39 @@ def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
 
 def _deduplicate_artists(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Deduplicate artists.
+    Deduplicate artists using fuzzy text matching on normalized names.
 
-    When multiple rows exist, consolidate by:
-    - Keeping non-null values preferentially
-    - Prioritizing rows with MBIDs
-    - Taking max for numeric fields (listeners, playcount)
+    Uses canonical artist IDs based on normalized artist names.
+    When multiple entries exist, keeps best metadata and max popularity metrics.
 
     Args:
         artists_lf: LazyFrame with potentially duplicate artists
 
     Returns:
-        Deduplicated LazyFrame with one row per artist
+        Deduplicated LazyFrame with canonical artist_id
     """
-    deduplicated = (
-        artists_lf.group_by("artist_name").agg(
-            [
-                # non-null and non "", prefer rows with MBID
-                pl.col("artist_mbid")
-                .filter(
-                    (pl.col("artist_mbid") != "") & pl.col("artist_mbid").is_not_null()
-                )
-                .first()
-                .alias("artist_mbid"),
-                pl.col("artist_url")
-                .filter(
-                    (pl.col("artist_url") != "") & pl.col("artist_url").is_not_null()
-                )
-                .first()
-                .alias("artist_url"),
-                pl.col("tags")
-                .filter((pl.col("tags") != "") & pl.col("tags").is_not_null())
-                .first()
-                .alias("tags"),
-                pl.col("bio_summary")
-                .filter(
-                    (pl.col("bio_summary") != "") & pl.col("bio_summary").is_not_null()
-                )
-                .first()
-                .alias("bio_summary"),
-                # Take max for numeric popularity metrics
-                pl.col("listeners").max().alias("listeners"),
-                pl.col("playcount").max().alias("playcount"),
-            ]
-        )
-    ).with_columns(
-        # Create artist_id: use MBID if available, else artist name
-        pl.when((pl.col("artist_mbid").is_not_null()) & (pl.col("artist_mbid") != ""))
-        .then(pl.col("artist_mbid"))
-        .otherwise(pl.col("artist_name"))
-        .alias("artist_id"),
+    # Generate canonical artist_id from normalized name
+    artists_with_id = artists_lf.with_columns(
+        pl.col("artist_name")
+        .map_elements(generate_canonical_artist_id, return_dtype=pl.Utf8)
+        .alias("artist_id")
+    )
+
+    # Sort by playcount descending to get best version first
+    sorted_artists = artists_with_id.sort("playcount", descending=True, nulls_last=True)
+
+    # Group by canonical artist_id, take first (best) of each
+    deduplicated = sorted_artists.group_by("artist_id").agg(
+        [
+            pl.first("artist_name").alias("artist_name"),
+            pl.first("artist_mbid").alias("artist_mbid"),
+            pl.first("artist_url").alias("artist_url"),
+            pl.first("tags").alias("tags"),
+            pl.first("bio_summary").alias("bio_summary"),
+            # Take max for popularity metrics
+            pl.max("listeners").alias("listeners"),
+            pl.max("playcount").alias("playcount"),
+        ]
     )
 
     return deduplicated

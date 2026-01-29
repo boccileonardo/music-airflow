@@ -12,6 +12,7 @@ You do not write excessive comments. You do not generate markdown files unless e
 You make use of modern open table format (Delta lake) for data storage, including incremental upserts via delta merge where applicable.
 Before giving code back for review, you ensure tests pass and type checker and linter report no issues.
 You are familiar with the lakehouse (bronze, silver, gold) pattern and structure code folders and data folder accordingly.
+You consult the documentation in docs/ before applying changes to the code and update it as needed after making changes.
 
 ## The Project
 This project implements a music recommendation system using Apache Airflow 3.0+ and Last.fm data. The system uses a medallion architecture (bronze → silver → gold) with Delta Lake tables.
