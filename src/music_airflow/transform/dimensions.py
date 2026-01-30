@@ -162,6 +162,17 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
     has_youtube = "youtube_url" in input_schema_names
     has_spotify = "spotify_url" in input_schema_names
 
+    # Check if toptags.tag has actual data (not List(Null))
+    # When all tracks have empty tag lists, Polars infers List(Null) which causes
+    # StructFieldNotFoundError when trying to access struct.field("name")
+    input_schema = raw_tracks.collect_schema()
+    toptags_dtype = input_schema.get("toptags")
+    has_tags_data = False
+    if toptags_dtype is not None:
+        # Check if the tag field inside toptags struct is not List(Null)
+        toptags_str = str(toptags_dtype)
+        has_tags_data = "List(Null)" not in toptags_str
+
     df = raw_tracks.with_columns(
         [
             # Basic info
@@ -173,7 +184,12 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
             # Popularity metrics
             pl.col("listeners").cast(pl.Int64).alias("listeners"),
             pl.col("playcount").cast(pl.Int64).alias("playcount"),
-            # Tags - extract top 5 tag names as comma-separated string
+        ]
+    )
+
+    # Add tags column - only attempt to parse if data exists
+    if has_tags_data:
+        df = df.with_columns(
             pl.when(pl.col("toptags").is_not_null())
             .then(
                 pl.col("toptags")
@@ -183,9 +199,11 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
                 .list.join(", ")
             )
             .otherwise(None)
-            .alias("tags"),
-        ]
-    )
+            .alias("tags")
+        )
+    else:
+        # All tags are empty, just use None
+        df = df.with_columns(pl.lit(None, dtype=pl.String).alias("tags"))
 
     # Add streaming links if available (enriched in bronze extraction)
     # Cast to String to avoid Null type issues when all values are null
@@ -435,7 +453,7 @@ def compute_dim_users(execution_date: datetime) -> dict[str, Any]:
     # Read silver plays table
     try:
         io_manager = PolarsDeltaIOManager(medallion_layer="silver")
-        plays_lf: pl.LazyFrame = io_manager.read_delta("plays")  # type: ignore[assignment]
+        plays_lf: pl.LazyFrame = io_manager.read_delta("plays")
     except (FileNotFoundError, TableNotFoundError):
         # No plays data yet - nothing to process
         raise AirflowSkipException("No plays data available yet - run plays DAG first")
