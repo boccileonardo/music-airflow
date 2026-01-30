@@ -296,7 +296,7 @@ def _compute_track_aggregations(
 
     Returns:
         Aggregated LazyFrame with columns:
-        - username, track_id, track_name, artist_name, album_name
+        - username, track_id, track_name, artist_name
         - play_count, first_played_on, last_played_on
         - recency_score, days_since_last_play
     """
@@ -335,7 +335,6 @@ def _compute_track_aggregations(
                 # Keep name columns for reference (should be consistent within track_id)
                 pl.col("track_name").first().alias("track_name"),
                 pl.col("artist_name").first().alias("artist_name"),
-                pl.col("album_name").first().alias("album_name"),
             ]
         )
         .with_columns(
@@ -356,7 +355,6 @@ def _compute_track_aggregations(
                 "track_id",
                 "track_name",
                 "artist_name",
-                "album_name",
                 "play_count",
                 "first_played_on",
                 "last_played_on",

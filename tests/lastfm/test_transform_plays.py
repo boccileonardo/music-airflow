@@ -53,7 +53,6 @@ class TestTransformPlaysRawToStructured:
             "track_name",
             "track_url",
             "artist_name",
-            "album_name",
             "is_loved",
             "track_id",
         ]
@@ -62,7 +61,6 @@ class TestTransformPlaysRawToStructured:
         assert result["username"].to_list() == ["testuser", "testuser"]
         assert result["track_name"].to_list() == ["Track 1", "Track 2"]
         assert result["artist_name"].to_list() == ["Artist 1", "Artist 2"]
-        assert result["album_name"].to_list() == ["Album 1", "Album 2"]
         assert result["is_loved"].to_list() == [True, False]
 
         # Check timestamps
@@ -137,7 +135,6 @@ class TestTransformPlaysRawToStructured:
             "track_name",
             "track_url",
             "artist_name",
-            "album_name",
             "is_loved",
             "track_id",
         ]

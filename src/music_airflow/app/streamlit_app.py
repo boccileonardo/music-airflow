@@ -277,7 +277,6 @@ def main():
                                 "track_id",
                                 "track_name",
                                 "artist_name",
-                                "album_name",
                                 "score",
                                 "similar_artist",
                                 "similar_tag",

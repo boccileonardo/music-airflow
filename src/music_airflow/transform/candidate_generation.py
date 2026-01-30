@@ -786,7 +786,6 @@ async def generate_deep_cut_candidates(
                 "track_id": pl.String,
                 "track_name": pl.String,
                 "artist_name": pl.String,
-                "album_name": pl.String,
                 "score": pl.Float64,
                 "source_artist_id": pl.String,
             }
@@ -937,7 +936,6 @@ async def generate_deep_cut_candidates(
                     {
                         "artist_name": artist_names[idx],
                         "artist_id": artist_ids[idx],
-                        "album_name": album_name,
                         "album_playcount": int(album.get("playcount", 0)),
                         "user_artist_play_count": user_artist_play_count,
                     }
@@ -1004,7 +1002,6 @@ async def generate_deep_cut_candidates(
                         "username": username,
                         "track_name": track_name,
                         "artist_name": metadata["artist_name"],
-                        "album_name": metadata["album_name"],
                         "score": score,
                         "source_artist_id": metadata["artist_id"],
                     }
@@ -1026,7 +1023,6 @@ async def generate_deep_cut_candidates(
             schema={
                 "username": pl.String,
                 "track_id": pl.String,
-                "album_name": pl.String,
                 "score": pl.Float64,
                 "source_artist_id": pl.String,
             }
@@ -1038,7 +1034,6 @@ async def generate_deep_cut_candidates(
             df.with_columns(
                 pl.col("username").cast(pl.String),
                 pl.col("track_id").cast(pl.String),
-                pl.col("album_name").cast(pl.String),
                 pl.col("score").cast(pl.Float64),
                 pl.col("source_artist_id").cast(pl.String),
             )
@@ -1050,7 +1045,6 @@ async def generate_deep_cut_candidates(
                     "track_id",
                     "track_name",
                     "artist_name",
-                    "album_name",
                     "score",
                     "source_artist_id",
                 ]
@@ -1222,7 +1216,7 @@ def merge_candidate_sources(
     to top N tracks, filters out tracks user has already played (except old_favorites),
     and deduplicates tracks that appear in multiple sources.
 
-    Note: Metadata columns (track_name, artist_name, album_name, duration_ms, tags, etc.)
+    Note: Metadata columns (track_name, artist_name, duration_ms, tags, etc.)
     ARE included in the gold table for presentation-ready data. New tracks that don't exist
     in dimension tables yet will have NULL values for enrichment columns.
 
@@ -1269,6 +1263,8 @@ def merge_candidate_sources(
                 "track_id": pl.String,
                 "track_name": pl.String,
                 "artist_name": pl.String,
+                "duration_ms": pl.Int64,
+                "tags": pl.String,
                 "youtube_url": pl.String,
                 "spotify_url": pl.String,
             }
@@ -1402,7 +1398,6 @@ def merge_candidate_sources(
             "track_id",
             "track_name",
             "artist_name",
-            "album_name",
             "duration_ms",
             "tags",
             "youtube_url",
@@ -1427,7 +1422,6 @@ def merge_candidate_sources(
                     "artist_name"
                 ),
                 # Keep dimension enrichment columns (will be NULL for new tracks)
-                pl.col("album_name").alias("album_name"),
                 pl.col("duration_ms").alias("duration_ms"),
                 pl.col("tags").alias("tags"),
             ]

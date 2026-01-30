@@ -170,11 +170,6 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
             pl.col("duration").cast(pl.Int64).alias("duration_ms"),
             # Artist info (nested struct)
             pl.col("artist").struct.field("name").alias("artist_name"),
-            # Album info (nested struct)
-            pl.when(pl.col("album").is_not_null())
-            .then(pl.col("album").struct.field("title"))
-            .otherwise(None)
-            .alias("album_name"),
             # Popularity metrics
             pl.col("listeners").cast(pl.Int64).alias("listeners"),
             pl.col("playcount").cast(pl.Int64).alias("playcount"),
@@ -208,7 +203,6 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
         [
             "track_name",
             "artist_name",
-            "album_name",
             "duration_ms",
             "listeners",
             "playcount",
@@ -341,7 +335,6 @@ def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
     agg_list = [
         pl.first("track_name").alias("track_name"),
         pl.first("artist_name").alias("artist_name"),
-        pl.first("album_name").alias("album_name"),
         pl.first("duration_ms").alias("duration_ms"),
         pl.first("track_url").alias("track_url"),
         pl.first("tags").alias("tags"),

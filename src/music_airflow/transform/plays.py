@@ -114,7 +114,6 @@ def transform_plays_raw_to_structured(
         - scrobbled_at_utc: datetime (UTC)
         - track_name, track_url: str
         - artist_name: str
-        - album_name: str
         - is_loved: bool (whether user loved this track)
         - track_id: str (canonical normalized ID)
     """
@@ -139,9 +138,6 @@ def transform_plays_raw_to_structured(
                 # Artist info - extract from nested struct
                 # Artist has "name" field in the struct
                 pl.col("artist").struct.field("name").alias("artist_name"),
-                # Album info - extract from nested struct
-                # Album has "#text" field in the struct
-                pl.col("album").struct.field("#text").alias("album_name"),
                 pl.col("loved").cast(pl.Utf8).eq("1").alias("is_loved"),
             ]
         )
@@ -153,7 +149,6 @@ def transform_plays_raw_to_structured(
                 "track_name",
                 "track_url",
                 "artist_name",
-                "album_name",
                 "is_loved",
             ]
         )

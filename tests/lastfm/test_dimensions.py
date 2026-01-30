@@ -103,7 +103,6 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
     expected_cols = [
         "track_name",
         "artist_name",
-        "album_name",
         "duration_ms",
         "listeners",
         "playcount",
@@ -117,7 +116,6 @@ def test_transform_tracks_raw_to_structured(sample_raw_tracks):
     # Check first row
     assert result["track_name"][0] == "Song A"
     assert result["artist_name"][0] == "Artist X"
-    assert result["album_name"][0] == "Album 1"
     assert result["duration_ms"][0] == 180000
     assert result["listeners"][0] == 5000
     assert result["playcount"][0] == 10000

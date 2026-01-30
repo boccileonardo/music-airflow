@@ -325,7 +325,6 @@ class TestDeepCutCandidates:
             "hidden gem|artist a",
             "popular track|artist a",
         ]
-        assert set(df["album_name"].to_list()) == {"Album One", "Album Two"}
 
 
 class TestMergeCandidateSources:
@@ -349,7 +348,6 @@ class TestMergeCandidateSources:
                 "track_mbid": ["tmbid", "tm2"],
                 "artist_name": ["Artist B", "Artist C"],
                 "artist_id": ["b1", "c1"],
-                "album_name": ["Album Y", "Album X"],
                 "duration_ms": [180000, 240000],
                 "tags": ["rock,indie", "rock,pop"],
                 "listeners": [5000, 6000],
@@ -421,7 +419,6 @@ class TestMergeCandidateSources:
                 "artist_name": ["Artist C"],
                 "track_mbid": ["tm2"],
                 "artist_mbid": ["cmbid"],
-                "album_name": ["Album X"],
                 "score": [6000.0],
                 "source_artist_id": ["c1"],
             }
