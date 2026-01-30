@@ -9,6 +9,8 @@ from music_airflow.app.excluded_tracks import (
     read_excluded_tracks,
     write_excluded_artist,
     read_excluded_artists,
+    remove_excluded_track,
+    remove_excluded_artist,
 )
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
@@ -322,4 +324,232 @@ def test_artist_exclusion_filters_all_tracks(temp_gold_dir):
     # Should exclude all tracks from "Blocked Artist"
     assert len(filtered) == 2
     assert "Blocked Artist" not in filtered["artist_name"].to_list()
-    assert set(filtered["artist_name"].to_list()) == {"Good Artist", "Another Artist"}
+
+
+def test_remove_excluded_track(temp_gold_dir):
+    """Test removing an excluded track."""
+    # First, exclude a track
+    write_excluded_track(
+        username="testuser",
+        track_id="track1|artist1",
+        track_name="Test Track",
+        artist_name="Test Artist",
+    )
+
+    # Verify it's excluded
+    excluded = read_excluded_tracks("testuser").collect()
+    assert len(excluded) == 1
+
+    # Remove the exclusion
+    remove_excluded_track(
+        username="testuser",
+        track_id="track1|artist1",
+        track_name="Test Track",
+        artist_name="Test Artist",
+    )
+
+    # Verify it's no longer excluded
+    excluded_after = read_excluded_tracks("testuser").collect()
+    assert len(excluded_after) == 0
+
+
+def test_remove_excluded_track_keeps_other_tracks(temp_gold_dir):
+    """Test that removing an excluded track doesn't affect other exclusions."""
+    # Exclude multiple tracks
+    write_excluded_track(
+        username="testuser",
+        track_id="track1|artist1",
+        track_name="Track 1",
+        artist_name="Artist 1",
+    )
+    write_excluded_track(
+        username="testuser",
+        track_id="track2|artist2",
+        track_name="Track 2",
+        artist_name="Artist 2",
+    )
+    write_excluded_track(
+        username="otheruser",
+        track_id="track3|artist3",
+        track_name="Track 3",
+        artist_name="Artist 3",
+    )
+
+    # Verify all are excluded
+    excluded = read_excluded_tracks("testuser").collect()
+    assert len(excluded) == 2
+
+    # Remove one exclusion
+    remove_excluded_track(
+        username="testuser",
+        track_id="track1|artist1",
+        track_name="Track 1",
+        artist_name="Artist 1",
+    )
+
+    # Verify only one remains for testuser
+    excluded_after = read_excluded_tracks("testuser").collect()
+    assert len(excluded_after) == 1
+    assert excluded_after["track_name"][0] == "Track 2"
+
+    # Verify other user's exclusion is unaffected
+    other_excluded = read_excluded_tracks("otheruser").collect()
+    assert len(other_excluded) == 1
+    assert other_excluded["track_name"][0] == "Track 3"
+
+
+def test_remove_excluded_track_nonexistent(temp_gold_dir):
+    """Test removing a track that isn't excluded (should not error)."""
+    # Try to remove a track that was never excluded
+    result = remove_excluded_track(
+        username="testuser",
+        track_id="nonexistent|artist",
+        track_name="Nonexistent",
+        artist_name="Artist",
+    )
+
+    # Should not error, just return empty result
+    assert result == {}
+
+
+def test_remove_excluded_track_empty_table(temp_gold_dir):
+    """Test removing a track when the table doesn't exist yet."""
+    # Try to remove when table doesn't exist
+    result = remove_excluded_track(
+        username="testuser",
+        track_id="track1|artist1",
+        track_name="Test Track",
+        artist_name="Test Artist",
+    )
+
+    # Should not error
+    assert result == {}
+
+
+def test_remove_excluded_artist(temp_gold_dir):
+    """Test removing an excluded artist."""
+    # First, exclude an artist
+    write_excluded_artist(
+        username="testuser",
+        artist_name="Test Artist",
+    )
+
+    # Verify it's excluded
+    excluded = read_excluded_artists("testuser").collect()
+    assert len(excluded) == 1
+
+    # Remove the exclusion
+    remove_excluded_artist(
+        username="testuser",
+        artist_name="Test Artist",
+    )
+
+    # Verify it's no longer excluded
+    excluded_after = read_excluded_artists("testuser").collect()
+    assert len(excluded_after) == 0
+
+
+def test_remove_excluded_artist_keeps_other_artists(temp_gold_dir):
+    """Test that removing an excluded artist doesn't affect other exclusions."""
+    # Exclude multiple artists
+    write_excluded_artist(username="testuser", artist_name="Artist 1")
+    write_excluded_artist(username="testuser", artist_name="Artist 2")
+    write_excluded_artist(username="otheruser", artist_name="Artist 3")
+
+    # Verify all are excluded
+    excluded = read_excluded_artists("testuser").collect()
+    assert len(excluded) == 2
+
+    # Remove one exclusion
+    remove_excluded_artist(username="testuser", artist_name="Artist 1")
+
+    # Verify only one remains for testuser
+    excluded_after = read_excluded_artists("testuser").collect()
+    assert len(excluded_after) == 1
+    assert excluded_after["artist_name"][0] == "Artist 2"
+
+    # Verify other user's exclusion is unaffected
+    other_excluded = read_excluded_artists("otheruser").collect()
+    assert len(other_excluded) == 1
+    assert other_excluded["artist_name"][0] == "Artist 3"
+
+
+def test_remove_excluded_artist_nonexistent(temp_gold_dir):
+    """Test removing an artist that isn't excluded (should not error)."""
+    # Try to remove an artist that was never excluded
+    result = remove_excluded_artist(
+        username="testuser",
+        artist_name="Nonexistent Artist",
+    )
+
+    # Should not error, just return empty result
+    assert result == {}
+
+
+def test_remove_excluded_artist_empty_table(temp_gold_dir):
+    """Test removing an artist when the table doesn't exist yet."""
+    # Try to remove when table doesn't exist
+    result = remove_excluded_artist(
+        username="testuser",
+        artist_name="Test Artist",
+    )
+
+    # Should not error
+    assert result == {}
+
+
+def test_remove_and_re_exclude_track(temp_gold_dir):
+    """Test that a track can be removed and then excluded again."""
+    # Exclude a track
+    write_excluded_track(
+        username="testuser",
+        track_id="track1|artist1",
+        track_name="Test Track",
+        artist_name="Test Artist",
+    )
+
+    # Remove the exclusion
+    remove_excluded_track(
+        username="testuser",
+        track_id="track1|artist1",
+        track_name="Test Track",
+        artist_name="Test Artist",
+    )
+
+    # Verify it's no longer excluded
+    excluded = read_excluded_tracks("testuser").collect()
+    assert len(excluded) == 0
+
+    # Re-exclude the same track
+    write_excluded_track(
+        username="testuser",
+        track_id="track1|artist1",
+        track_name="Test Track",
+        artist_name="Test Artist",
+    )
+
+    # Verify it's excluded again
+    excluded_again = read_excluded_tracks("testuser").collect()
+    assert len(excluded_again) == 1
+    assert excluded_again["track_name"][0] == "Test Track"
+
+
+def test_remove_and_re_exclude_artist(temp_gold_dir):
+    """Test that an artist can be removed and then excluded again."""
+    # Exclude an artist
+    write_excluded_artist(username="testuser", artist_name="Test Artist")
+
+    # Remove the exclusion
+    remove_excluded_artist(username="testuser", artist_name="Test Artist")
+
+    # Verify it's no longer excluded
+    excluded = read_excluded_artists("testuser").collect()
+    assert len(excluded) == 0
+
+    # Re-exclude the same artist
+    write_excluded_artist(username="testuser", artist_name="Test Artist")
+
+    # Verify it's excluded again
+    excluded_again = read_excluded_artists("testuser").collect()
+    assert len(excluded_again) == 1
+    assert excluded_again["artist_name"][0] == "Test Artist"

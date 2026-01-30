@@ -1,14 +1,24 @@
 import logging
+import traceback
+
 import polars as pl
 import streamlit as st
+
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 from music_airflow.utils.constants import LAST_FM_USERNAMES
-from music_airflow.app.youtube_playlist import YouTubePlaylistGenerator
+from music_airflow.app.youtube_playlist import (
+    YouTubePlaylistGenerator,
+    load_youtube_creds,
+    poll_device_token,
+    run_youtube_oauth,
+)
 from music_airflow.app.excluded_tracks import (
     write_excluded_track,
     read_excluded_tracks,
     write_excluded_artist,
     read_excluded_artists,
+    remove_excluded_track,
+    remove_excluded_artist,
 )
 
 # Configure logging to show in Streamlit
@@ -172,7 +182,7 @@ def main():
             .select(["artist_name", "Plays"])
             .rename({"artist_name": "Artist"})
         )
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.dataframe(display_df, width="content", hide_index=True)
     else:
         st.info("No artist play data available yet.")
 
@@ -286,6 +296,7 @@ def main():
                                 "spotify_url",
                                 "tags",
                                 "duration_ms",
+                                "username",
                                 "weighted_score",
                             ]
                         )
@@ -349,222 +360,387 @@ def main():
             display_recommendations,
         )
 
-        # Track exclusion UI
-        st.subheader("Remove Unwanted Tracks")
-        st.write(
-            "Don't like a recommendation? Remove it and we'll replace it with a new one."
-        )
-
-        # Get current track IDs for dropdown
-        current_tracks = recommendations.select(
-            ["track_id", "track_name", "artist_name"]
-        ).to_dicts()
-        track_options = {
-            f"{t['track_name']} - {t['artist_name']}": t for t in current_tracks
-        }
-
-        if len(track_options) > 0:
-            selected_track_display = st.selectbox(
-                "Select track to remove",
-                options=list(track_options.keys()),
-                key="track_to_remove",
-            )
-
-            if st.button("🗑️ Remove and Replace Track", type="secondary"):
-                selected_track = track_options[selected_track_display]
-                track_id = selected_track["track_id"]
-
-                # Write to excluded recommendations table
-                try:
-                    write_excluded_track(
-                        username=st.session_state.username,
-                        track_id=track_id,
-                        track_name=selected_track["track_name"],
-                        artist_name=selected_track["artist_name"],
-                    )
-
-                    # Track exclusion in session using track_name + artist_name (stable keys)
-                    excluded_key = (
-                        selected_track["track_name"],
-                        selected_track["artist_name"],
-                    )
-                    if "excluded_in_session" not in st.session_state:
-                        st.session_state.excluded_in_session = set()
-                    st.session_state.excluded_in_session.add(excluded_key)
-
-                    # Remove from current recommendations
-                    st.session_state.recommendations = recommendations.filter(
-                        (pl.col("track_name") != selected_track["track_name"])
-                        | (pl.col("artist_name") != selected_track["artist_name"])
-                    )
-
-                    # Find replacement from candidate pool
-                    if "candidate_pool" in st.session_state:
-                        # Get already displayed tracks (track_name, artist_name) pairs
-                        displayed_tracks = set(
-                            zip(
-                                recommendations.select("track_name")
-                                .to_series()
-                                .to_list(),
-                                recommendations.select("artist_name")
-                                .to_series()
-                                .to_list(),
-                            )
-                        )
-                        # Add newly excluded tracks
-                        displayed_tracks.update(st.session_state.excluded_in_session)
-
-                        # Find first track not in displayed or excluded
-                        pool = st.session_state.candidate_pool
-                        replacement = None
-                        for row in pool.iter_rows(named=True):
-                            track_key = (row["track_name"], row["artist_name"])
-                            if track_key not in displayed_tracks:
-                                replacement = pool.filter(
-                                    (pl.col("track_name") == row["track_name"])
-                                    & (pl.col("artist_name") == row["artist_name"])
-                                ).limit(1)
-                                break
-
-                        if replacement is not None and len(replacement) > 0:
-                            # Add replacement to recommendations
-                            st.session_state.recommendations = pl.concat(
-                                [
-                                    st.session_state.recommendations,
-                                    replacement,
-                                ]
-                            )
-                            st.success(
-                                f"✅ Removed '{selected_track['track_name']}' and replaced with '{replacement['track_name'][0]}'"
-                            )
-                        else:
-                            st.warning(
-                                f"⚠️ Removed '{selected_track['track_name']}' but no replacement available from current pool."
-                            )
-                    else:
-                        st.success(
-                            f"✅ Removed '{selected_track['track_name']}' from recommendations."
-                        )
-
-                    # Force rerun to update display
-                    st.rerun()
-
-                except Exception as e:
-                    st.error(f"Error excluding track: {e}")
-        else:
-            st.info("No tracks to remove.")
-
-        # Artist exclusion UI
+        # Unified Exclusion Management
         st.divider()
-        st.subheader("Block Artists")
-        st.write("Don't want to see any tracks from an artist? Block them entirely.")
-
-        # Get unique artists from current recommendations
-        current_artists = (
-            recommendations.select("artist_name")
-            .unique()
-            .sort("artist_name")
-            .to_series()
-            .to_list()
+        st.header("🚫 Manage Exclusions")
+        st.write(
+            "Exclude unwanted tracks/artists from current recommendations, or restore previously excluded items."
         )
 
-        if len(current_artists) > 0:
-            selected_artist = st.selectbox(
-                "Select artist to block",
-                options=current_artists,
-                key="artist_to_block",
-            )
+        # Load current exclusions
+        excluded_tracks_df = read_excluded_tracks(username)
+        excluded_artists_df = read_excluded_artists(username)
 
-            if st.button("🚫 Block Artist", type="secondary"):
-                try:
-                    write_excluded_artist(
-                        username=st.session_state.username,
-                        artist_name=selected_artist,
+        try:
+            excluded_tracks_collected = excluded_tracks_df.collect()
+            n_excluded_tracks = len(excluded_tracks_collected)
+        except Exception:
+            excluded_tracks_collected = pl.DataFrame()
+            n_excluded_tracks = 0
+
+        try:
+            excluded_artists_collected = excluded_artists_df.collect()
+            n_excluded_artists = len(excluded_artists_collected)
+        except Exception:
+            excluded_artists_collected = pl.DataFrame()
+            n_excluded_artists = 0
+
+        # Initialize active tab in session state
+        if "active_exclusion_tab" not in st.session_state:
+            st.session_state.active_exclusion_tab = "Tracks"
+
+        # Create tab selector using radio buttons for persistence
+        selected_tab = st.radio(
+            "Select exclusion type",
+            [
+                f"🎵 Tracks ({n_excluded_tracks} excluded)",
+                f"🎤 Artists ({n_excluded_artists} excluded)",
+            ],
+            index=0 if st.session_state.active_exclusion_tab == "Tracks" else 1,
+            horizontal=True,
+            key="exclusion_tab_selector",
+            label_visibility="collapsed",
+        )
+
+        # Update session state based on selection
+        if "Tracks" in selected_tab:
+            st.session_state.active_exclusion_tab = "Tracks"
+        else:
+            st.session_state.active_exclusion_tab = "Artists"
+
+        if st.session_state.active_exclusion_tab == "Tracks":
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Exclude from Current")
+                st.write(
+                    "Remove a track from current recommendations and exclude it permanently."
+                )
+
+                # Get current track IDs for dropdown
+                current_tracks = recommendations.select(
+                    ["track_id", "track_name", "artist_name"]
+                ).to_dicts()
+                track_options = {
+                    f"{t['track_name']} - {t['artist_name']}": t for t in current_tracks
+                }
+
+                if len(track_options) > 0:
+                    selected_track_display = st.selectbox(
+                        "Select track to exclude",
+                        options=list(track_options.keys()),
+                        key="track_to_remove",
                     )
 
-                    # Track artist exclusion in session
-                    if "excluded_artists_in_session" not in st.session_state:
-                        st.session_state.excluded_artists_in_session = set()
-                    st.session_state.excluded_artists_in_session.add(selected_artist)
+                    if st.button(
+                        "🗑️ Exclude Track", type="secondary", key="exclude_track_btn"
+                    ):
+                        selected_track = track_options[selected_track_display]
+                        track_id = selected_track["track_id"]
 
-                    # Remove all tracks from this artist
-                    tracks_removed = len(
-                        recommendations.filter(pl.col("artist_name") == selected_artist)
+                        try:
+                            write_excluded_track(
+                                username=st.session_state.username,
+                                track_id=track_id,
+                                track_name=selected_track["track_name"],
+                                artist_name=selected_track["artist_name"],
+                            )
+
+                            # Track exclusion in session
+                            excluded_key = (
+                                selected_track["track_name"],
+                                selected_track["artist_name"],
+                            )
+                            if "excluded_in_session" not in st.session_state:
+                                st.session_state.excluded_in_session = set()
+                            st.session_state.excluded_in_session.add(excluded_key)
+
+                            # Remove from current recommendations
+                            st.session_state.recommendations = recommendations.filter(
+                                (pl.col("track_name") != selected_track["track_name"])
+                                | (
+                                    pl.col("artist_name")
+                                    != selected_track["artist_name"]
+                                )
+                            )
+
+                            # Find replacement from candidate pool
+                            if "candidate_pool" in st.session_state:
+                                displayed_tracks = set(
+                                    zip(
+                                        recommendations.select("track_name")
+                                        .to_series()
+                                        .to_list(),
+                                        recommendations.select("artist_name")
+                                        .to_series()
+                                        .to_list(),
+                                    )
+                                )
+                                displayed_tracks.update(
+                                    st.session_state.excluded_in_session
+                                )
+
+                                pool = st.session_state.candidate_pool
+                                replacement = None
+                                for row in pool.iter_rows(named=True):
+                                    track_key = (row["track_name"], row["artist_name"])
+                                    if track_key not in displayed_tracks:
+                                        replacement = pool.filter(
+                                            (pl.col("track_name") == row["track_name"])
+                                            & (
+                                                pl.col("artist_name")
+                                                == row["artist_name"]
+                                            )
+                                        ).limit(1)
+                                        break
+
+                                if replacement is not None and len(replacement) > 0:
+                                    replacement = replacement.select(
+                                        st.session_state.recommendations.columns
+                                    )
+                                    st.session_state.recommendations = pl.concat(
+                                        [
+                                            st.session_state.recommendations,
+                                            replacement,
+                                        ]
+                                    )
+                                    st.success(
+                                        f"✅ Excluded '{selected_track['track_name']}' and replaced with '{replacement['track_name'][0]}'"
+                                    )
+                                else:
+                                    st.success(
+                                        f"✅ Excluded '{selected_track['track_name']}' (no replacement available)"
+                                    )
+                            else:
+                                st.success(
+                                    f"✅ Excluded '{selected_track['track_name']}'"
+                                )
+
+                            st.session_state.active_exclusion_tab = "Tracks"
+                            st.rerun()
+
+                        except Exception as e:
+                            st.error(f"Error excluding track: {e}")
+                else:
+                    st.info("No tracks in current recommendations.")
+
+            with col2:
+                st.subheader("Restore Excluded")
+                if n_excluded_tracks > 0:
+                    st.write("Previously excluded tracks:")
+
+                    # Show compact list of excluded tracks
+                    display_excluded_tracks = excluded_tracks_collected.select(
+                        [
+                            pl.col("track_name").alias("Track"),
+                            pl.col("artist_name").alias("Artist"),
+                        ]
+                    )
+                    st.dataframe(
+                        display_excluded_tracks, width="content", hide_index=True
                     )
 
-                    st.session_state.recommendations = recommendations.filter(
-                        pl.col("artist_name") != selected_artist
+                    # Restore functionality
+                    track_to_revert_options = {
+                        f"{row['track_name']} - {row['artist_name']}": row
+                        for row in excluded_tracks_collected.to_dicts()
+                    }
+
+                    selected_track_to_revert = st.selectbox(
+                        "Select track to restore",
+                        options=list(track_to_revert_options.keys()),
+                        key="track_to_revert",
                     )
 
-                    # Try to replace removed tracks
-                    if "candidate_pool" in st.session_state and tracks_removed > 0:
-                        pool = st.session_state.candidate_pool
-
-                        # Get already displayed and excluded info from the UPDATED recommendations
-                        updated_recommendations = st.session_state.recommendations
-                        displayed_tracks = set(
-                            zip(
-                                updated_recommendations.select("track_name")
-                                .to_series()
-                                .to_list(),
-                                updated_recommendations.select("artist_name")
-                                .to_series()
-                                .to_list(),
-                            )
-                        )
-                        if "excluded_in_session" in st.session_state:
-                            displayed_tracks.update(
-                                st.session_state.excluded_in_session
-                            )
-
-                        excluded_artists_set = (
-                            st.session_state.excluded_artists_in_session
-                        )
-
-                        # Find replacement tracks
-                        replacements = []
-                        for row in pool.iter_rows(named=True):
-                            if len(replacements) >= tracks_removed:
-                                break
-                            track_key = (row["track_name"], row["artist_name"])
-                            if (
-                                track_key not in displayed_tracks
-                                and row["artist_name"] not in excluded_artists_set
-                            ):
-                                replacements.append(row)
-                                displayed_tracks.add(track_key)
-
-                        if replacements:
-                            # Create DataFrame from replacements using the same schema as recommendations
-                            replacement_df = pl.DataFrame(
-                                replacements,
-                                schema=pool.schema,
-                            )
-                            st.session_state.recommendations = pl.concat(
-                                [
-                                    st.session_state.recommendations,
-                                    replacement_df,
-                                ]
+                    if st.button(
+                        "✅ Restore Track", type="secondary", key="restore_track_btn"
+                    ):
+                        try:
+                            track_info = track_to_revert_options[
+                                selected_track_to_revert
+                            ]
+                            remove_excluded_track(
+                                username=username,
+                                track_id=track_info["track_id"],
+                                track_name=track_info["track_name"],
+                                artist_name=track_info["artist_name"],
                             )
                             st.success(
-                                f"✅ Blocked '{selected_artist}' and replaced {len(replacements)}/{tracks_removed} tracks"
+                                f"✅ Restored '{track_info['track_name']}' - it will appear in future recommendations."
                             )
-                        else:
-                            st.warning(
-                                f"⚠️ Blocked '{selected_artist}' ({tracks_removed} tracks removed) but no replacements available."
+                            st.session_state.active_exclusion_tab = "Tracks"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error restoring track: {e}")
+                else:
+                    st.info("No excluded tracks yet.")
+
+        elif st.session_state.active_exclusion_tab == "Artists":
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Block from Current")
+                st.write(
+                    "Block an artist entirely - removes all their tracks from recommendations."
+                )
+
+                # Get unique artists from current recommendations
+                current_artists = (
+                    recommendations.select("artist_name")
+                    .unique()
+                    .sort("artist_name")
+                    .to_series()
+                    .to_list()
+                )
+
+                if len(current_artists) > 0:
+                    selected_artist = st.selectbox(
+                        "Select artist to block",
+                        options=current_artists,
+                        key="artist_to_block",
+                    )
+
+                    if st.button(
+                        "🚫 Block Artist", type="secondary", key="block_artist_btn"
+                    ):
+                        try:
+                            write_excluded_artist(
+                                username=st.session_state.username,
+                                artist_name=selected_artist,
                             )
-                    else:
-                        st.success(
-                            f"✅ Blocked '{selected_artist}' from future recommendations."
-                        )
 
-                    # Force rerun to update display
-                    st.rerun()
+                            # Track artist exclusion in session
+                            if "excluded_artists_in_session" not in st.session_state:
+                                st.session_state.excluded_artists_in_session = set()
+                            st.session_state.excluded_artists_in_session.add(
+                                selected_artist
+                            )
 
-                except Exception as e:
-                    st.error(f"Error blocking artist: {e}")
-        else:
-            st.info("No artists to block.")
+                            # Remove all tracks from this artist
+                            tracks_removed = len(
+                                recommendations.filter(
+                                    pl.col("artist_name") == selected_artist
+                                )
+                            )
+
+                            st.session_state.recommendations = recommendations.filter(
+                                pl.col("artist_name") != selected_artist
+                            )
+
+                            # Try to replace removed tracks
+                            if (
+                                "candidate_pool" in st.session_state
+                                and tracks_removed > 0
+                            ):
+                                pool = st.session_state.candidate_pool
+                                updated_recommendations = (
+                                    st.session_state.recommendations
+                                )
+                                displayed_tracks = set(
+                                    zip(
+                                        updated_recommendations.select("track_name")
+                                        .to_series()
+                                        .to_list(),
+                                        updated_recommendations.select("artist_name")
+                                        .to_series()
+                                        .to_list(),
+                                    )
+                                )
+                                if "excluded_in_session" in st.session_state:
+                                    displayed_tracks.update(
+                                        st.session_state.excluded_in_session
+                                    )
+
+                                excluded_artists_set = (
+                                    st.session_state.excluded_artists_in_session
+                                )
+
+                                # Find replacement tracks
+                                replacements = []
+                                for row in pool.iter_rows(named=True):
+                                    if len(replacements) >= tracks_removed:
+                                        break
+                                    track_key = (row["track_name"], row["artist_name"])
+                                    if (
+                                        track_key not in displayed_tracks
+                                        and row["artist_name"]
+                                        not in excluded_artists_set
+                                    ):
+                                        replacements.append(row)
+                                        displayed_tracks.add(track_key)
+
+                                if replacements:
+                                    replacement_df = pl.DataFrame(
+                                        replacements,
+                                        schema=pool.schema,
+                                    ).select(st.session_state.recommendations.columns)
+                                    st.session_state.recommendations = pl.concat(
+                                        [
+                                            st.session_state.recommendations,
+                                            replacement_df,
+                                        ]
+                                    )
+                                    st.success(
+                                        f"✅ Blocked '{selected_artist}' and replaced {len(replacements)}/{tracks_removed} tracks"
+                                    )
+                                else:
+                                    st.success(
+                                        f"✅ Blocked '{selected_artist}' ({tracks_removed} tracks removed)"
+                                    )
+                            else:
+                                st.success(f"✅ Blocked '{selected_artist}'")
+
+                            st.session_state.active_exclusion_tab = "Artists"
+                            st.rerun()
+
+                        except Exception as e:
+                            st.error(f"Error blocking artist: {e}")
+                else:
+                    st.info("No artists in current recommendations.")
+
+            with col2:
+                st.subheader("Restore Blocked")
+                if n_excluded_artists > 0:
+                    st.write("Currently blocked artists:")
+
+                    # Show compact list of blocked artists
+                    display_excluded_artists = excluded_artists_collected.select(
+                        pl.col("artist_name").alias("Artist")
+                    )
+                    st.dataframe(
+                        display_excluded_artists, width="content", hide_index=True
+                    )
+
+                    # Restore functionality
+                    artist_to_revert_options = (
+                        excluded_artists_collected.select("artist_name")
+                        .to_series()
+                        .to_list()
+                    )
+
+                    selected_artist_to_revert = st.selectbox(
+                        "Select artist to restore",
+                        options=artist_to_revert_options,
+                        key="artist_to_revert",
+                    )
+
+                    if st.button(
+                        "✅ Restore Artist", type="secondary", key="restore_artist_btn"
+                    ):
+                        try:
+                            remove_excluded_artist(
+                                username=username,
+                                artist_name=selected_artist_to_revert,
+                            )
+                            st.success(
+                                f"✅ Restored '{selected_artist_to_revert}' - tracks will appear in future recommendations."
+                            )
+                            st.session_state.active_exclusion_tab = "Artists"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error restoring artist: {e}")
+                else:
+                    st.info("No blocked artists yet.")
 
     # Playlist creation section
     if (
@@ -573,6 +749,144 @@ def main():
     ):
         st.divider()
         st.subheader("🎵 Create Playlist")
+
+        # Check YouTube authentication status
+        auth_status = YouTubePlaylistGenerator.get_auth_status()
+        needs_auth = YouTubePlaylistGenerator.needs_authentication()
+
+        if needs_auth:
+            st.warning(
+                "⚠️ **YouTube authentication required**\n\n"
+                "Your YouTube credentials are missing or expired. "
+                "Configure client credentials in .env, then run OAuth flow below."
+            )
+
+            # Show credential status
+            with st.expander("🔧 Credential Status", expanded=True):
+                st.markdown("**YouTube Data API**")
+                if auth_status["youtube"]["has_client"]:
+                    if auth_status["youtube"]["has_tokens"]:
+                        st.success("✅ Client + tokens configured")
+                    else:
+                        st.warning("⚠️ Client configured, needs OAuth flow")
+                else:
+                    st.info(
+                        "ℹ️ Not configured (set YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET)"
+                    )
+
+            # OAuth flow - two step process using session state
+            st.markdown("---")
+            st.markdown("**Step 1: Start OAuth flow**")
+
+            youtube_creds = load_youtube_creds()
+            if youtube_creds and youtube_creds.has_client_creds():
+                if st.button("🔐 Start YouTube API OAuth", type="primary"):
+                    device_info, _ = run_youtube_oauth(
+                        youtube_creds.client_id, youtube_creds.client_secret
+                    )
+                    if device_info:
+                        st.session_state["youtube_device_info"] = device_info
+                        st.session_state["youtube_client_id"] = youtube_creds.client_id
+                        st.session_state["youtube_client_secret"] = (
+                            youtube_creds.client_secret
+                        )
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to start OAuth flow")
+
+            # Show pending OAuth flow
+            if "youtube_device_info" in st.session_state:
+                device_info = st.session_state["youtube_device_info"]
+                st.markdown("---")
+                st.markdown("**Step 2: Authorize YouTube API**")
+                st.info(f"👉 Go to: **{device_info['verification_url']}**")
+                st.info(f"👉 Enter code: **{device_info['user_code']}**")
+                st.warning("After authorizing in your browser, click the button below:")
+
+                if st.button("✅ I've authorized - get tokens", key="poll_youtube"):
+                    try:
+                        token_info = poll_device_token(
+                            st.session_state["youtube_client_id"],
+                            st.session_state["youtube_client_secret"],
+                            device_info["device_code"],
+                        )
+                        if token_info:
+                            st.success("✅ YouTube API authentication successful!")
+                            st.info("Add these to your .env file:")
+                            st.code(
+                                f"YOUTUBE_ACCESS_TOKEN={token_info.get('access_token', '')}\n"
+                                f"YOUTUBE_REFRESH_TOKEN={token_info.get('refresh_token', '')}",
+                                language="bash",
+                            )
+                            del st.session_state["youtube_device_info"]
+                            del st.session_state["youtube_client_id"]
+                            del st.session_state["youtube_client_secret"]
+                        else:
+                            st.warning(
+                                "⏳ Authorization pending. Complete the flow in your browser and try again."
+                            )
+                    except Exception as e:
+                        st.error(f"❌ OAuth failed: {e}")
+                        del st.session_state["youtube_device_info"]
+
+        else:
+            st.info("ℹ️ Using YouTube Data API", icon="📊")
+
+            # Option to re-authenticate if tokens are expired/invalid
+            with st.expander("🔧 Re-authenticate (if tokens expired)"):
+                st.caption(
+                    "Use this if you see `invalid_grant` errors when creating playlists."
+                )
+
+                if "reauth_youtube_device" in st.session_state:
+                    device_info = st.session_state["reauth_youtube_device"]
+                    st.info(f"👉 Go to: **{device_info['verification_url']}**")
+                    st.info(f"👉 Enter code: **{device_info['user_code']}**")
+                    st.warning("After authorizing, click below:")
+
+                    if st.button(
+                        "✅ I've authorized - get tokens", key="poll_reauth_youtube"
+                    ):
+                        try:
+                            token_info = poll_device_token(
+                                st.session_state["reauth_youtube_client_id"],
+                                st.session_state["reauth_youtube_client_secret"],
+                                device_info["device_code"],
+                            )
+                            if token_info:
+                                st.success("✅ YouTube API authentication successful!")
+                                st.code(
+                                    f"YOUTUBE_ACCESS_TOKEN={token_info.get('access_token', '')}\n"
+                                    f"YOUTUBE_REFRESH_TOKEN={token_info.get('refresh_token', '')}",
+                                    language="bash",
+                                )
+                                del st.session_state["reauth_youtube_device"]
+                            else:
+                                st.warning(
+                                    "⏳ Authorization pending. Try again after completing the flow."
+                                )
+                        except Exception as e:
+                            st.error(f"❌ OAuth failed: {e}")
+                            del st.session_state["reauth_youtube_device"]
+
+                else:
+                    youtube_creds = load_youtube_creds()
+                    if youtube_creds and youtube_creds.has_client_creds():
+                        if st.button(
+                            "🔐 Re-authenticate YouTube API", key="reauth_youtube"
+                        ):
+                            device_info, _ = run_youtube_oauth(
+                                youtube_creds.client_id, youtube_creds.client_secret
+                            )
+                            if device_info:
+                                st.session_state["reauth_youtube_device"] = device_info
+                                st.session_state["reauth_youtube_client_id"] = (
+                                    youtube_creds.client_id
+                                )
+                                st.session_state["reauth_youtube_client_secret"] = (
+                                    youtube_creds.client_secret
+                                )
+                                st.rerun()
 
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -585,12 +899,14 @@ def main():
         with col2:
             privacy = st.selectbox(
                 "Privacy",
-                options=["unlisted", "private", "public"],
+                options=["public", "private", "unlisted"],
                 index=0,
                 key="privacy_selector",
             )
 
-        if st.button("🎬 Create YouTube Music Playlist", type="secondary"):
+        if st.button(
+            "🎬 Create YouTube Music Playlist", type="secondary", disabled=needs_auth
+        ):
             try:
                 # Log playlist creation attempt with column info
                 recommendations = st.session_state.recommendations
@@ -603,13 +919,13 @@ def main():
                     f"Tracks with youtube_url: {recommendations['youtube_url'].is_not_null().sum()}"
                 )
 
-                generator = YouTubePlaylistGenerator()
+                playlist_generator = YouTubePlaylistGenerator()
 
                 # Authenticate silently (uses stored credentials)
-                if not generator.authenticate():
+                if not playlist_generator.authenticate():
                     st.error(
-                        "YouTube authentication not configured. "
-                        "Please contact the app administrator."
+                        "❌ YouTube authentication failed.\n\n"
+                        "Your credentials may have expired. Please re-authenticate using the button above."
                     )
                     st.stop()
 
@@ -618,7 +934,7 @@ def main():
                 status_text = st.empty()
 
                 settings = st.session_state.playlist_settings
-                result = generator.create_playlist_from_tracks(
+                result = playlist_generator.create_playlist_from_tracks(
                     tracks_df=st.session_state.recommendations,
                     playlist_title=playlist_name,
                     playlist_description=f"Generated by Music Recommendation System\nDiscovery weight: {settings['discovery_weight']}\nSystems: {'Tags' if settings['use_tags'] else ''} {'Artists' if settings['use_artists'] else ''} {'Deep Cuts' if settings['use_deep_cuts'] else ''}",
@@ -696,7 +1012,13 @@ def main():
 
                 # Show user-friendly error message based on error type
                 error_str = str(e)
-                if "quotaExceeded" in error_str or "403" in error_str:
+                if "invalid_grant" in error_str:
+                    st.warning(
+                        "**Authentication expired!**\n\n"
+                        "Your refresh token is no longer valid. "
+                        "Please re-authenticate using the 'Authenticate with YouTube' button above."
+                    )
+                elif "quotaExceeded" in error_str or "403" in error_str:
                     st.warning(
                         "**YouTube API quota exceeded!**\n\n"
                         "Quota resets at midnight Pacific Time. "
@@ -706,13 +1028,11 @@ def main():
                     st.warning(
                         "**Authentication issue.**\n\n"
                         "Your YouTube credentials may have expired. "
-                        "Contact the administrator."
+                        "Please re-authenticate using the button above."
                     )
 
                 # Show full traceback in expander
                 with st.expander("Show technical details"):
-                    import traceback
-
                     st.code(traceback.format_exc())
 
 

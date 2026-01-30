@@ -141,3 +141,82 @@ def read_excluded_artists(username: str) -> pl.LazyFrame:
                 "excluded_at": pl.Datetime(time_zone="UTC"),
             }
         )
+
+
+def remove_excluded_track(
+    username: str, track_id: str, track_name: str, artist_name: str
+) -> dict:
+    """
+    Remove a track exclusion from the gold layer excluded_recommendations table.
+
+    This allows users to revert exclusions made by mistake or no longer wanted.
+
+    Args:
+        username: Username who excluded the track
+        track_id: Track identifier
+        track_name: Track name
+        artist_name: Artist name
+
+    Returns:
+        Metadata dict from the write operation
+    """
+    gold_io = PolarsDeltaIOManager("gold")
+
+    try:
+        # Read current exclusions
+        current_exclusions = gold_io.read_delta("excluded_recommendations").collect()
+
+        # Filter out the track to remove
+        remaining_exclusions = current_exclusions.filter(
+            ~(
+                (pl.col("username") == username)
+                & (pl.col("track_id") == track_id)
+                & (pl.col("track_name") == track_name)
+                & (pl.col("artist_name") == artist_name)
+            )
+        )
+
+        # Overwrite the table with remaining exclusions
+        return gold_io.write_delta(
+            df=remaining_exclusions,
+            table_name="excluded_recommendations",
+            mode="overwrite",
+        )
+    except Exception:
+        # Table doesn't exist, nothing to remove
+        return {}
+
+
+def remove_excluded_artist(username: str, artist_name: str) -> dict:
+    """
+    Remove an artist exclusion from the gold layer excluded_artists table.
+
+    This allows users to revert artist exclusions made by mistake or no longer wanted.
+
+    Args:
+        username: Username who excluded the artist
+        artist_name: Artist name to un-exclude
+
+    Returns:
+        Metadata dict from the write operation
+    """
+    gold_io = PolarsDeltaIOManager("gold")
+
+    try:
+        # Read current exclusions
+        current_exclusions = gold_io.read_delta("excluded_artists").collect()
+
+        # Filter out the artist to remove
+        remaining_exclusions = current_exclusions.filter(
+            ~((pl.col("username") == username) & (pl.col("artist_name") == artist_name))
+        )
+
+        # Overwrite the table with remaining exclusions
+        return gold_io.write_delta(
+            df=remaining_exclusions,
+            table_name="excluded_artists",
+            mode="overwrite",
+        )
+    except Exception:
+        # Table doesn't exist, nothing to remove
+        return {}

@@ -4,7 +4,11 @@ import polars as pl
 import pytest
 from unittest.mock import MagicMock, patch
 from googleapiclient.errors import HttpError
-from music_airflow.app.youtube_playlist import YouTubePlaylistGenerator
+from music_airflow.app.youtube_playlist import (
+    YouTubePlaylistGenerator,
+    OAuthCredentials,
+    load_youtube_creds,
+)
 
 
 @pytest.fixture
@@ -537,3 +541,54 @@ def test_create_playlist_updates_existing(mock_sleep, sample_tracks_with_urls):
     # Should delete existing and create new one
     mock_playlists_delete.execute.assert_called_once()
     assert result["playlist_id"] == "PLnew123"
+
+
+# Tests for credential loading
+
+
+class TestOAuthCredentials:
+    """Tests for OAuthCredentials dataclass."""
+
+    def test_has_client_creds_with_both(self):
+        """Test has_client_creds returns True when client_id and client_secret present."""
+        creds = OAuthCredentials(client_id="id", client_secret="secret")
+        assert creds.has_client_creds() is True
+
+    def test_has_client_creds_missing_id(self):
+        """Test has_client_creds returns False when client_id missing."""
+        creds = OAuthCredentials(client_id="", client_secret="secret")
+        assert creds.has_client_creds() is False
+
+    def test_has_client_creds_missing_secret(self):
+        """Test has_client_creds returns False when client_secret missing."""
+        creds = OAuthCredentials(client_id="id", client_secret="")
+        assert creds.has_client_creds() is False
+
+    def test_has_tokens_with_refresh_token(self):
+        """Test has_tokens returns True when refresh_token present."""
+        creds = OAuthCredentials(
+            client_id="id", client_secret="secret", refresh_token="refresh"
+        )
+        assert creds.has_tokens() is True
+
+    def test_has_tokens_without_refresh(self):
+        """Test has_tokens returns False when no refresh_token."""
+        creds = OAuthCredentials(client_id="id", client_secret="secret")
+        assert creds.has_tokens() is False
+
+
+class TestCredentialLoading:
+    """Tests for credential loading functions."""
+
+    @patch.dict(
+        "os.environ",
+        {"YOUTUBE_CLIENT_ID": "env_id", "YOUTUBE_CLIENT_SECRET": "env_secret"},
+    )
+    @patch("music_airflow.app.youtube_playlist.st")
+    def test_load_youtube_creds_from_env(self, mock_st):
+        """Test loading YouTube credentials from environment variables."""
+        mock_st.secrets = {}
+
+        creds = load_youtube_creds()
+
+        assert creds is not None

@@ -28,24 +28,47 @@ uv run streamlit run src/music_airflow/app/streamlit_app.py
 
 The app will be available at http://localhost:8501
 
-### 3. Oauth setup on GCP for Youtube API and Streamlit Cloud Deployment
+### 3. YouTube Playlist Integration (OAuth Setup)
 
-Create a streamlit community cloud app.
-In GCP, create a project, enable youtube v3 api, create oauth credentials for web app with streamlit cloud url.
-Run the app locally first as above and authenticate to get the token.
-Copy the token from the `.youtube_token.json` file.
-On streamlit cloud, add the following to secrets toml:
+The app supports creating YouTube playlists from recommendations using the YouTube Data API v3.
+
+**Note:** The API has daily quota limits (10,000 units/day). Each search costs 100 units, playlist creation costs 50 units.
+
+#### GCP Setup
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a project and enable the **YouTube Data API v3**
+3. Go to **Credentials** → **Create Credentials** → **OAuth client ID**
+4. Choose **Desktop app** (for local) or **Web application** (for Streamlit Cloud)
+5. For web apps, add authorized redirect URIs:
+   - `http://localhost:8501` (local development)
+   - Your Streamlit Cloud URL
+
+#### Local Setup (.env)
+
+Add OAuth client credentials to your `.env` file:
+
+```bash
+YOUTUBE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+YOUTUBE_CLIENT_SECRET=your-client-secret
+```
+
+Then run the app and click **"🔐 Start YouTube API OAuth"** to complete the OAuth flow. The app will display the access and refresh tokens to add to your `.env`:
+
+```bash
+YOUTUBE_ACCESS_TOKEN=your-access-token
+YOUTUBE_REFRESH_TOKEN=your-refresh-token
+```
+
+#### Streamlit Cloud Deployment
+
+Add credentials as flat keys in Streamlit secrets (Settings → Secrets):
 
 ```toml
-[youtube]
-client_id = "ID"
-client_secret = "SECRET"
+YOUTUBE_CLIENT_ID = "your-client-id.apps.googleusercontent.com"
+YOUTUBE_CLIENT_SECRET = "your-client-secret"
+YOUTUBE_ACCESS_TOKEN = "your-access-token"
+YOUTUBE_REFRESH_TOKEN = "your-refresh-token"
+```
 
-[youtube_token]
-# Copy from .youtube_token.json after one-time authentication locally
-token = "TOKEN"
-refresh_token = ""
-token_uri = "https://oauth2.googleapis.com/token"
-client_id = "ID"
-client_secret = "SECRET"
-scopes = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+**Note:** If tokens expire (you see `invalid_grant` errors), re-run the OAuth flow locally and update the tokens.
