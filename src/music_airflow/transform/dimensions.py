@@ -157,6 +157,11 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
     Returns:
         Transformed LazyFrame with flattened columns
     """
+    # Check input schema for streaming links BEFORE transformations
+    input_schema_names = raw_tracks.collect_schema().names()
+    has_youtube = "youtube_url" in input_schema_names
+    has_spotify = "spotify_url" in input_schema_names
+
     df = raw_tracks.with_columns(
         [
             # Basic info
@@ -188,16 +193,16 @@ def _transform_tracks_raw_to_structured(raw_tracks: pl.LazyFrame) -> pl.LazyFram
     )
 
     # Add streaming links if available (enriched in bronze extraction)
-    # Use pl.when to handle cases where columns don't exist
-    if "youtube_url" in df.collect_schema().names():
-        df = df.with_columns(pl.col("youtube_url").alias("youtube_url"))
+    # Cast to String to avoid Null type issues when all values are null
+    if has_youtube:
+        df = df.with_columns(pl.col("youtube_url").cast(pl.String).alias("youtube_url"))
     else:
-        df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("youtube_url"))
+        df = df.with_columns(pl.lit(None, dtype=pl.String).alias("youtube_url"))
 
-    if "spotify_url" in df.collect_schema().names():
-        df = df.with_columns(pl.col("spotify_url").alias("spotify_url"))
+    if has_spotify:
+        df = df.with_columns(pl.col("spotify_url").cast(pl.String).alias("spotify_url"))
     else:
-        df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("spotify_url"))
+        df = df.with_columns(pl.lit(None, dtype=pl.String).alias("spotify_url"))
 
     df = df.select(
         [
@@ -345,11 +350,11 @@ def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
         pl.max("playcount").alias("playcount"),
     ]
 
-    # Add streaming URLs if they exist
+    # Add streaming URLs if they exist - cast to ensure proper type
     if has_youtube:
-        agg_list.append(pl.first("youtube_url").alias("youtube_url"))
+        agg_list.append(pl.first("youtube_url").cast(pl.String).alias("youtube_url"))
     if has_spotify:
-        agg_list.append(pl.first("spotify_url").alias("spotify_url"))
+        agg_list.append(pl.first("spotify_url").cast(pl.String).alias("spotify_url"))
 
     # Group by canonical track_id
     deduplicated = sorted_tracks.group_by("track_id").agg(agg_list)

@@ -350,6 +350,8 @@ class TestMergeCandidateSources:
                 "artist_name": ["Artist B", "Artist C"],
                 "artist_id": ["b1", "c1"],
                 "album_name": ["Album Y", "Album X"],
+                "duration_ms": [180000, 240000],
+                "tags": ["rock,indie", "rock,pop"],
                 "listeners": [5000, 6000],
                 "playcount": [10000, 6000],
                 "youtube_url": [

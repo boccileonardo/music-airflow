@@ -151,15 +151,18 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
     track_urls = [track.get("url", "") for track in tracks_data if track.get("url")]
 
     async with LastFMScraper() as scraper:
-        streaming_links = await scraper.get_streaming_links_batch(track_urls)
+        streaming_links_list = await scraper.get_streaming_links_batch(track_urls)
+
+    # Build mapping from URL to streaming links
+    streaming_links = dict(zip(track_urls, streaming_links_list))
 
     # Merge streaming links into track data
     for idx, track in enumerate(tracks_data):
         track_url = track.get("url", "")
         if track_url and track_url in streaming_links:
             links = streaming_links[track_url]
-            track["youtube_url"] = links.get("youtube")
-            track["spotify_url"] = links.get("spotify")
+            track["youtube_url"] = links.get("youtube_url")
+            track["spotify_url"] = links.get("spotify_url")
         else:
             track["youtube_url"] = None
             track["spotify_url"] = None

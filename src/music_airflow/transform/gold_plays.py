@@ -42,7 +42,48 @@ def compute_artist_play_counts(execution_date: datetime) -> dict[str, Any]:
     # Read silver tables
     io_manager = PolarsDeltaIOManager(medallion_layer="silver")
     plays_lf = io_manager.read_delta("plays")
-    dim_users_lf = io_manager.read_delta("dim_users")
+
+    # Handle case when dim_users doesn't exist (bootstrapping)
+    if io_manager.table_exists("dim_users"):
+        dim_users_lf = io_manager.read_delta("dim_users")
+    else:
+        # Create fallback with default half-life for all users
+        from music_airflow.transform.dimensions import MIN_HALF_LIFE_DAYS
+
+        users_lf = plays_lf.select("username").unique()
+        dim_users_lf = users_lf.with_columns(
+            pl.lit(MIN_HALF_LIFE_DAYS).alias("user_half_life_days")
+        )
+
+    # Handle case when tracks/artists don't exist (bootstrapping)
+    if not io_manager.table_exists("tracks") or not io_manager.table_exists("artists"):
+        # Return empty result - cannot compute artist aggregations without dimensions
+        gold_io_manager = PolarsDeltaIOManager(medallion_layer="gold")
+        empty_df = pl.DataFrame(
+            schema={
+                "username": pl.String,
+                "artist_id": pl.String,
+                "artist_name": pl.String,
+                "play_count": pl.Int64,
+                "first_played_on": pl.Datetime("us", "UTC"),
+                "last_played_on": pl.Datetime("us", "UTC"),
+                "recency_score": pl.Float64,
+                "days_since_last_play": pl.Int32,
+            }
+        )
+        write_metadata = gold_io_manager.write_delta(
+            empty_df,
+            table_name="artist_play_count",
+            mode="overwrite",
+            partition_by="username",
+        )
+        return {
+            **write_metadata,
+            "execution_date": execution_date.isoformat(),
+            "skipped": True,
+            "reason": "tracks or artists table not yet available",
+        }
+
     tracks_lf = io_manager.read_delta("tracks")
     artists_lf = io_manager.read_delta("artists")
 
@@ -95,7 +136,18 @@ def compute_track_play_counts(execution_date: datetime) -> dict[str, Any]:
     # Read silver tables
     io_manager = PolarsDeltaIOManager(medallion_layer="silver")
     plays_lf: pl.LazyFrame = io_manager.read_delta("plays")  # type: ignore[assignment]
-    dim_users_lf: pl.LazyFrame = io_manager.read_delta("dim_users")  # type: ignore[assignment]
+
+    # Handle case when dim_users doesn't exist (bootstrapping)
+    if io_manager.table_exists("dim_users"):
+        dim_users_lf: pl.LazyFrame = io_manager.read_delta("dim_users")  # type: ignore[assignment]
+    else:
+        # Create fallback with default half-life for all users
+        from music_airflow.transform.dimensions import MIN_HALF_LIFE_DAYS
+
+        users_lf = plays_lf.select("username").unique()
+        dim_users_lf = users_lf.with_columns(
+            pl.lit(MIN_HALF_LIFE_DAYS).alias("user_half_life_days")
+        )
 
     # Compute aggregations with per-user recency measures
     gold_lf = _compute_track_aggregations(plays_lf, dim_users_lf, execution_date)

@@ -19,65 +19,61 @@ logging.basicConfig(
 
 @st.cache_data
 def load_track_candidates(username: str) -> pl.LazyFrame:
-    """Load track candidates from Delta table with streaming links."""
-    # Load candidates from gold table
+    """Load track candidates from gold table - presentation-ready data."""
     gold_io = PolarsDeltaIOManager("gold")
-    silver_io = PolarsDeltaIOManager("silver")
+    return gold_io.read_delta("track_candidates").filter(pl.col("username") == username)
 
-    candidates = gold_io.read_delta("track_candidates").filter(
-        pl.col("username") == username
-    )
 
-    # Join with tracks dimension for metadata (tags, duration, URLs, etc.)
-    # Note: Some tracks may not have enrichment yet (1-7 day delay after generation)
-    # We handle this gracefully with a left join
-    tracks_dim = silver_io.read_delta("tracks")
+@st.cache_data
+def load_user_statistics(username: str) -> dict:
+    """Load user play statistics from gold aggregation tables."""
+    gold_io = PolarsDeltaIOManager("gold")
 
-    candidates = (
-        candidates.join(
-            tracks_dim.select(
-                [
-                    "track_id",
-                    "album_name",
-                    "duration_ms",
-                    "tags",
-                    "youtube_url",
-                    "spotify_url",
-                ]
-            ),
-            on="track_id",
-            how="left",
-            suffix="_enriched",
+    stats = {}
+
+    # Load track play counts
+    try:
+        track_plays = (
+            gold_io.read_delta("track_play_count")
+            .filter(pl.col("username") == username)
+            .collect()
         )
-        .sort("score", "recommended_at", descending=True)
-        .group_by("track_id")  # Deduplicate by track_id, keep highest score
-        .first()
-        .with_columns(
-            [
-                # Parse track_id to get track_name and artist_name
-                pl.col("track_id").str.split("|").list.get(0).alias("track_name"),
-                pl.col("track_id").str.split("|").list.get(1).alias("artist_name"),
-            ]
+        stats["total_tracks_played"] = len(track_plays)
+        stats["total_plays"] = track_plays["play_count"].sum()
+    except Exception:
+        stats["total_tracks_played"] = 0
+        stats["total_plays"] = 0
+
+    # Load artist play counts
+    try:
+        artist_plays = (
+            gold_io.read_delta("artist_play_count")
+            .filter(pl.col("username") == username)
+            .collect()
         )
-        .select(
-            [
-                "track_id",
-                "track_name",
-                "artist_name",
-                "album_name",
-                "score",
-                "similar_artist",
-                "similar_tag",
-                "deep_cut_same_artist",
-                "old_favorite",
-                "youtube_url",
-                "spotify_url",
-                "tags",
-                "duration_ms",
-            ]
+        stats["total_artists_played"] = len(artist_plays)
+    except Exception:
+        stats["total_artists_played"] = 0
+
+    return stats
+
+
+@st.cache_data
+def load_top_artists(username: str, limit: int = 10) -> pl.DataFrame:
+    """Load top artists by play count."""
+    gold_io = PolarsDeltaIOManager("gold")
+
+    try:
+        artist_plays = (
+            gold_io.read_delta("artist_play_count")
+            .filter(
+                (pl.col("username") == username) & pl.col("artist_name").is_not_null()
+            )
+            .collect()
         )
-    )
-    return candidates
+        return artist_plays.sort("play_count", descending=True).head(limit)
+    except Exception:
+        return pl.DataFrame(schema={"artist_name": pl.String, "play_count": pl.Int64})
 
 
 def filter_candidates(
@@ -130,11 +126,17 @@ def filter_candidates(
         )
 
     # discovery_weight: 0 = all old favorites, 1 = all new discoveries
+    # Apply blending: weight both categories and keep the base score component
     candidates = candidates.with_columns(
-        pl.when(pl.col("old_favorite"))
-        .then(pl.col("score") * (1 - discovery_weight))
-        .otherwise(pl.col("score") * discovery_weight)
-        .alias("weighted_score")
+        (
+            pl.when(pl.col("old_favorite"))
+            .then(
+                pl.col("score") * (1.1 - discovery_weight)
+            )  # Old favorites: 1.1x at weight=0, 0.1x at weight=1
+            .otherwise(
+                pl.col("score") * (0.1 + discovery_weight)
+            )  # New discoveries: 0.1x at weight=0, 1.1x at weight=1
+        ).alias("weighted_score")
     )
 
     return candidates
@@ -144,6 +146,35 @@ def main():
     st.title("🎵 Music Recommendation System")
 
     username = st.selectbox("username", options=LAST_FM_USERNAMES)
+
+    # Display user statistics
+    with st.spinner("Loading statistics..."):
+        stats = load_user_statistics(username)
+
+    # Statistics in columns
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Plays", f"{stats['total_plays']:,}")
+    with col2:
+        st.metric("Unique Tracks", f"{stats['total_tracks_played']:,}")
+    with col3:
+        st.metric("Unique Artists", f"{stats['total_artists_played']:,}")
+
+    # Top Artists section
+    st.header("🎤 Top Artists")
+    with st.spinner("Loading top artists..."):
+        top_artists = load_top_artists(username, limit=10)
+
+    if len(top_artists) > 0:
+        # Display as a table
+        display_df = (
+            top_artists.with_columns(pl.col("play_count").alias("Plays"))
+            .select(["artist_name", "Plays"])
+            .rename({"artist_name": "Artist"})
+        )
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No artist play data available yet.")
 
     st.header("Recommendation Settings")
 
@@ -204,10 +235,14 @@ def main():
                 )
 
                 # Filter out tracks from the same artist exceeding max allowed per artist
+                # Use row_number within each artist group, ordered by weighted_score descending
                 candidates = (
-                    candidates.sort("score", descending=True)
-                    .with_columns(rank=pl.row_index().over("artist_name"))
-                    .filter(pl.col("rank") < max_songs_per_artist)
+                    candidates.sort("weighted_score", descending=True)
+                    .with_columns(
+                        artist_rank=pl.int_range(pl.len()).over("artist_name")
+                    )
+                    .filter(pl.col("artist_rank") < max_songs_per_artist)
+                    .drop("artist_rank")  # Remove the temporary ranking column
                 )
 
                 # Take exactly the requested number of recommendations
@@ -235,8 +270,27 @@ def main():
                     }
                     # Store the available pool of candidates for replacements
                     # Gold table is already deduplicated, so just fetch more tracks
+                    # Note: candidates still has artist_rank column at this point, need to drop it
                     st.session_state.candidate_pool = (
-                        candidates.sort("weighted_score", descending=True)
+                        candidates.select(
+                            [
+                                "track_id",
+                                "track_name",
+                                "artist_name",
+                                "album_name",
+                                "score",
+                                "similar_artist",
+                                "similar_tag",
+                                "deep_cut_same_artist",
+                                "old_favorite",
+                                "youtube_url",
+                                "spotify_url",
+                                "tags",
+                                "duration_ms",
+                                "weighted_score",
+                            ]
+                        )
+                        .sort("weighted_score", descending=True)
                         .limit(n_recommendations * 3)  # Get 3x for replacement pool
                         .collect()
                     )
@@ -268,16 +322,20 @@ def main():
 
         # Use display names from joined data
         display_recommendations = (
-            recommendations.group_by("track_name", "artist_name")
-            .first()
+            recommendations.sort("weighted_score", descending=True)
             .with_columns(
-                pct_score=pl.col("weighted_score") / (pl.col("weighted_score").max())
+                # Normalize score: best song = 100%, rest scale down
+                ((pl.col("weighted_score") / pl.col("weighted_score").max()) * 100)
+                .round(1)
+                .alias("normalized_score")
             )
+            .group_by("track_name", "artist_name")
+            .first()
             .select(
                 [
                     pl.col("track_name").alias("Track"),
                     pl.col("artist_name").alias("Artist"),
-                    pl.col("pct_score").alias("Score").round(1),
+                    pl.col("normalized_score").alias("Score"),
                     pl.col("old_favorite").alias("Old Favorite"),
                     pl.col("similar_artist").alias("From Similar Artist"),
                     pl.col("similar_tag").alias("From Similar Tag"),

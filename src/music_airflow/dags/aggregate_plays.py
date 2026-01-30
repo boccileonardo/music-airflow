@@ -17,11 +17,12 @@ import datetime as dt
 from typing import Any
 from music_airflow.utils.constants import DAG_START_DATE
 from airflow.sdk import Asset, dag, task
+from airflow.sdk.definitions.asset import AssetAny
 
 # Assets consumed by this DAG - triggers when any of these are updated
-plays_asset = Asset("delta://data/silver/plays")
 dim_users_asset = Asset("delta://data/silver/dim_users")
 artists_asset = Asset("delta://data/silver/artists")
+tracks_asset = Asset("delta://data/silver/tracks")
 
 # Assets produced by this DAG
 artist_play_count_asset = Asset("delta://data/gold/artist_play_count")
@@ -29,11 +30,11 @@ track_play_count_asset = Asset("delta://data/gold/track_play_count")
 
 
 @dag(
-    schedule=[
-        plays_asset,
+    schedule=AssetAny(
         dim_users_asset,
         artists_asset,
-    ],  # Run when any input asset is updated
+        tracks_asset,
+    ),  # Run when any dimension output is updated
     start_date=DAG_START_DATE,
     catchup=False,  # Only process latest date
     max_active_runs=1,
@@ -44,7 +45,7 @@ def gold_play_aggregations():
     """
     Compute gold layer aggregate fact tables with recency measures.
 
-    Reads silver plays, dim_users, and artists to create:
+    Reads dim_users, artists, and tracks dimensions to create:
     - artist_play_count (username, artist, artist_id, counts, recency)
     - track_play_count (username, track, track_id, counts, recency)
     """
@@ -52,7 +53,7 @@ def gold_play_aggregations():
     @task(
         multiple_outputs=False,
         outlets=[artist_play_count_asset],
-        inlets=[plays_asset, dim_users_asset, artists_asset],
+        inlets=[dim_users_asset, artists_asset],
     )
     def compute_artist_aggregations() -> dict[str, Any]:
         """
@@ -86,7 +87,7 @@ def gold_play_aggregations():
     @task(
         multiple_outputs=False,
         outlets=[track_play_count_asset],
-        inlets=[plays_asset, dim_users_asset],
+        inlets=[dim_users_asset, tracks_asset],
     )
     def compute_track_aggregations() -> dict[str, Any]:
         """

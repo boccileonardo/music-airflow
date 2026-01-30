@@ -318,6 +318,19 @@ class PolarsDeltaIOManager:
 
         return result
 
+    def table_exists(self, table_name: str) -> bool:
+        """
+        Check if a Delta table exists.
+
+        Args:
+            table_name: Table name (relative to medallion layer directory)
+
+        Returns:
+            True if table exists, False otherwise
+        """
+        path = self.base_dir / table_name
+        return path.exists() and (path / "_delta_log").exists()
+
     def read_delta(self, table_name: str, **kwargs) -> pl.LazyFrame:
         """
         Read DataFrame or LazyFrame from Delta Lake.

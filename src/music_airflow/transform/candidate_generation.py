@@ -183,12 +183,29 @@ async def generate_similar_artist_candidates(
         }
 
     # Load user's artist play counts for scoring
-    artist_play_counts_lf = (
-        delta_mgr_gold.read_delta("artist_play_count")
-        .filter(pl.col("username") == username)
-        .select(["artist_id", "play_count"])
-        .rename({"play_count": "user_artist_play_count"})
-    )
+    # Try gold table first (optimized), fall back to computing from silver/plays on bootstrap
+    try:
+        artist_play_counts_lf = (
+            delta_mgr_gold.read_delta("artist_play_count")
+            .filter(pl.col("username") == username)
+            .select(["artist_id", "play_count"])
+            .rename({"play_count": "user_artist_play_count"})
+        )
+    except (FileNotFoundError, Exception) as e:
+        # Gold table doesn't exist yet (bootstrap) - compute from silver/plays
+        logger.info(
+            f"Gold artist_play_count not available ({type(e).__name__}), "
+            f"computing from silver/plays for {username}"
+        )
+        artist_play_counts_lf = (
+            plays_lf.select(["track_id"])
+            .join(
+                tracks_lf.select(["track_id", "artist_id"]), on="track_id", how="left"
+            )
+            .filter(pl.col("artist_id").is_not_null())
+            .group_by("artist_id")
+            .agg(pl.len().alias("user_artist_play_count"))
+        )
 
     # Get unique artists user has played (id + name + play count)
     played_artists = (
@@ -704,12 +721,12 @@ async def generate_similar_tag_candidates(
             )
         )
 
-    # Write to silver Delta table (overwrite for this user since we process full tag profile)
+    # Write to silver Delta table with merge to prevent duplicates
     write_meta = delta_mgr_silver.write_delta(
         df,
         table_name="candidate_similar_tag",
         mode="merge",
-        predicate="s.username = t.username",
+        predicate="s.track_id = t.track_id AND s.username = t.username",
         partition_by="username",
     )
 
@@ -787,12 +804,31 @@ async def generate_deep_cut_candidates(
         }
 
     # Load user's artist play counts from gold table
-    artist_play_counts_lf = (
-        delta_mgr_gold.read_delta("artist_play_count")
-        .filter(pl.col("username") == username)
-        .select(["artist_id", "play_count"])
-        .rename({"play_count": "user_artist_play_count"})
-    )
+    # Try gold table first (optimized), fall back to computing from silver/plays on bootstrap
+    try:
+        artist_play_counts_lf = (
+            delta_mgr_gold.read_delta("artist_play_count")
+            .filter(pl.col("username") == username)
+            .select(["artist_id", "play_count"])
+            .rename({"play_count": "user_artist_play_count"})
+        )
+    except (FileNotFoundError, Exception) as e:
+        # Gold table doesn't exist yet (bootstrap) - compute from silver/plays
+        logger.info(
+            f"Gold artist_play_count not available ({type(e).__name__}), "
+            f"computing from silver/plays for {username}"
+        )
+        # Compute play counts by aggregating plays, no need for tracks dimension
+        tracks_lf = delta_mgr_silver.read_delta("tracks")
+        artist_play_counts_lf = (
+            plays_lf.select(["track_id"])
+            .join(
+                tracks_lf.select(["track_id", "artist_id"]), on="track_id", how="left"
+            )
+            .filter(pl.col("artist_id").is_not_null())
+            .group_by("artist_id")
+            .agg(pl.len().alias("user_artist_play_count"))
+        )
 
     # Get user's top artists by play count (id + name + play count from gold)
     # Filter to only artists with valid data
@@ -1073,21 +1109,32 @@ def generate_old_favorites_candidates(
         pl.col("username") == username
     )
 
-    # Load user dimension to get per-user half-life
-    dim_users_lf = delta_mgr_silver.read_delta("dim_users")
-    user_half_life = (
-        dim_users_lf.filter(pl.col("username") == username)
-        .select("user_half_life_days")
-        .collect()
-    )
-
-    if len(user_half_life) == 0:
-        logger.warning(
-            f"No user dimension found for {username}, using default half-life"
+    # Load user dimension to get per-user half-life (if exists)
+    if delta_mgr_silver.table_exists("dim_users"):
+        dim_users_lf = delta_mgr_silver.read_delta("dim_users")
+        user_half_life = (
+            dim_users_lf.filter(pl.col("username") == username)
+            .select("user_half_life_days")
+            .collect()
         )
-        half_life_days = 30.0  # MIN_HALF_LIFE_DAYS from dimensions.py
+
+        if len(user_half_life) == 0:
+            logger.warning(
+                f"No user dimension found for {username}, using default half-life"
+            )
+            from music_airflow.transform.dimensions import MIN_HALF_LIFE_DAYS
+
+            half_life_days = MIN_HALF_LIFE_DAYS
+        else:
+            half_life_days = float(user_half_life["user_half_life_days"].item())
     else:
-        half_life_days = float(user_half_life["user_half_life_days"].item())
+        # Dimensions table doesn't exist yet (bootstrapping)
+        logger.info(
+            f"dim_users table does not exist, using default half-life for {username}"
+        )
+        from music_airflow.transform.dimensions import MIN_HALF_LIFE_DAYS
+
+        half_life_days = MIN_HALF_LIFE_DAYS
 
     # Get tracks with play statistics
     now = datetime.now(timezone.utc)
@@ -1146,7 +1193,7 @@ def generate_old_favorites_candidates(
         candidates,
         table_name="candidate_old_favorites",
         mode="merge",
-        predicate="s.username = t.username",
+        predicate="s.track_id = t.track_id AND s.username = t.username",
         partition_by="username",
     )
 
@@ -1175,8 +1222,9 @@ def merge_candidate_sources(
     to top N tracks, filters out tracks user has already played (except old_favorites),
     and deduplicates tracks that appear in multiple sources.
 
-    Note: Metadata columns (track_name, artist_name, etc.) are NOT included in the gold
-    table, as recommendations may not exist in dimension tables yet.
+    Note: Metadata columns (track_name, artist_name, album_name, duration_ms, tags, etc.)
+    ARE included in the gold table for presentation-ready data. New tracks that don't exist
+    in dimension tables yet will have NULL values for enrichment columns.
 
     Saves result to data/gold/track_candidates/ Delta table.
 
@@ -1234,6 +1282,22 @@ def merge_candidate_sources(
     ):
         """Normalize scores using percentile ranks, limit to top N, optionally filter played tracks."""
         filtered = source_lf.filter(pl.col("username") == username)
+
+        # Check if source has track_name/artist_name columns
+        # old_favorites doesn't have these - need to join with tracks dimension
+        source_columns = filtered.collect_schema().names()
+        has_track_metadata = (
+            "track_name" in source_columns and "artist_name" in source_columns
+        )
+
+        if not has_track_metadata:
+            # Join with tracks dimension to get metadata
+            # During bootstrapping, tracks_dim_lf will be empty schema, so tracks without metadata
+            filtered = filtered.join(
+                tracks_dim_lf.select(["track_id", "track_name", "artist_name"]),
+                on="track_id",
+                how="left",
+            )
 
         # Filter out already-played tracks (except for old_favorites which ARE played tracks)
         if filter_played:
@@ -1330,7 +1394,7 @@ def merge_candidate_sources(
     # New tracks discovered in candidates will be enriched by the
     # dimension update DAG which reads track_name/artist_name from gold/track_candidates.
 
-    # Join with tracks dimension to add streaming links
+    # Join with tracks dimension to add streaming links and metadata
     # Keep candidate track_name/artist_name (from API) for new tracks,
     # use dimension values (enriched) for existing tracks
     tracks_with_links = tracks_dim_lf.select(
@@ -1338,6 +1402,9 @@ def merge_candidate_sources(
             "track_id",
             "track_name",
             "artist_name",
+            "album_name",
+            "duration_ms",
+            "tags",
             "youtube_url",
             "spotify_url",
         ]
@@ -1359,6 +1426,10 @@ def merge_candidate_sources(
                 pl.coalesce([pl.col("artist_name_dim"), pl.col("artist_name")]).alias(
                     "artist_name"
                 ),
+                # Keep dimension enrichment columns (will be NULL for new tracks)
+                pl.col("album_name").alias("album_name"),
+                pl.col("duration_ms").alias("duration_ms"),
+                pl.col("tags").alias("tags"),
             ]
         )
         .drop(["track_name_dim", "artist_name_dim"])

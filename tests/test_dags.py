@@ -134,14 +134,18 @@ class TestGoldPlayAggregationsDag:
         assert "compute_track_aggregations" in task_ids
 
     def test_asset_dependency(self, dag_bag):
-        """Test that DAG depends on plays asset."""
+        """Test that DAG depends on dimension assets."""
         dag = dag_bag.get_dag("gold_play_aggregations")
 
-        # Check that DAG is triggered by plays asset
+        # Check that DAG is triggered by dimension assets
         assert dag.schedule is not None
-        # For Airflow 3.0 asset scheduling
+        # For Airflow 3.0 asset scheduling - should depend on dimensions
         schedule_str = str(dag.schedule)
-        assert "plays" in schedule_str.lower() or "asset" in schedule_str.lower()
+        assert (
+            "artists" in schedule_str.lower()
+            or "tracks" in schedule_str.lower()
+            or "dim_users" in schedule_str.lower()
+        )
 
     def test_tasks_run_in_parallel(self, dag_bag):
         """Test that aggregation tasks have no dependencies (can run in parallel)."""
@@ -164,7 +168,7 @@ class TestLastFmDimensionsDag:
 
         assert dag is not None
         assert isinstance(dag.schedule, list)
-        assert len(dag.schedule) == 2  # plays + candidates
+        assert len(dag.schedule) == 1  # candidates only
         assert dag.catchup is False
         assert "dimensions" in dag.tags
 

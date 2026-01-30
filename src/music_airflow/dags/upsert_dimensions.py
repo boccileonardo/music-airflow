@@ -30,13 +30,11 @@ artists_asset = Asset("delta://data/silver/artists")
 dim_users_asset = Asset("delta://data/silver/dim_users")
 
 # Assets consumed by this DAG
-plays_asset = Asset("delta://data/silver/plays")
 candidates_asset = Asset("delta://data/gold/track_candidates")
 
 
 @dag(
     schedule=[
-        plays_asset,
         candidates_asset,
     ],  # Single-cycle flow: plays → candidates → dimensions
     start_date=DAG_START_DATE,
@@ -121,7 +119,7 @@ def lastfm_dimensions():
 
         return transform_artists_to_silver(fetch_metadata)
 
-    @task(multiple_outputs=False, outlets=[dim_users_asset], inlets=[plays_asset])
+    @task(multiple_outputs=False, outlets=[dim_users_asset])
     def compute_dim_users() -> dict[str, Any]:
         """
         Compute user dimension table with listening profile metadata.

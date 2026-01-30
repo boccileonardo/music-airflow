@@ -4,7 +4,7 @@ Personalized music recommendation engine using Apache Airflow, Last.fm data, and
 
 ## Architecture
 
-[System Architecture](06-complete-architecture.md) - Complete pipeline overview with DAG orchestration, data layers, and key techniques.
+[System Architecture](complete-architecture.md) - Complete pipeline overview with DAG orchestration, data layers, and key techniques.
 
 ## Quick Reference
 
@@ -20,10 +20,10 @@ Last.fm API → Bronze (JSON) → Silver (Delta) → Gold (Aggregations) → Str
 |-----|----------|---------|
 | lastfm_plays | @daily | Extract listening history, trigger candidate generation |
 | candidate_generation | Asset-triggered (plays) | Generate recommendations, trigger dimensions |
-| lastfm_dimensions | Asset-triggered (plays + candidates) | Extract track/artist metadata with streaming links |
-| gold_play_aggregations | Asset-triggered (plays + dimensions) | Compute recency scores |
+| lastfm_dimensions | Asset-triggered (candidates) | Extract track/artist metadata with streaming links |
+| gold_play_aggregations | Asset-triggered (dimensions OR) | Compute recency scores |
 
-**Flow**: plays → candidates → dimensions (single-cycle enrichment) → aggregations
+**Flow**: plays → candidates → dimensions → aggregations
 
 ### Key Tables
 

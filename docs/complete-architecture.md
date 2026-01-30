@@ -75,12 +75,10 @@ graph TB
 
     S1 --> S4
 
-    S1 --> G1
     S2 --> G1
     S3 --> G1
     S4 --> G1
 
-    S1 --> G2
     S4 --> G2
 
     G3 --> APP
@@ -93,9 +91,7 @@ graph TB
 graph LR
     D1[lastfm_plays<br/>@daily] -->|plays asset| D2[candidate_generation<br/>asset-triggered]
     D2 -->|candidates asset| D3[lastfm_dimensions<br/>asset-triggered]
-    D1 -->|plays asset| D3
-    D3 -->|artists/tracks/users| D4[gold_play_aggregations<br/>asset-triggered]
-    D1 -->|plays asset| D4
+    D3 -->|artists OR tracks OR users| D4[gold_play_aggregations<br/>asset-triggered]
 
     D4 -->|artist_play_count asset| APP[Streamlit App]
     D4 -->|track_play_count asset| APP
@@ -116,16 +112,17 @@ graph LR
 - Writes to gold/track_candidates
 - Triggers dimensions DAG
 
-**lastfm_dimensions** (asset-triggered by plays + candidates):
+**lastfm_dimensions** (asset-triggered by candidates):
 
-- Discovers new tracks from plays and candidates
+- Discovers new tracks from candidates
 - Fetches metadata from Last.fm API
 - Enriches with YouTube/Spotify streaming links via web scraping
-- Computes user profiles with half-life values
+- Computes user profiles with half-life values from plays data
 - Single-cycle enrichment: New tracks discovered by candidates are enriched in the same daily run
 
-**gold_play_aggregations** (asset-triggered by plays + dimensions):
+**gold_play_aggregations** (asset-triggered by any dimension output):
 
+- Triggered when any dimension asset updates (dim_users OR artists OR tracks)
 - Computes play statistics with exponential decay recency scores
 - Full refresh since scores are time-dependent
 
