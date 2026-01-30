@@ -1453,7 +1453,7 @@ def merge_candidate_sources(
     )
 
     # Write gold candidate table (includes both enriched and unenriched tracks)
-    df = merged_deduped.collect()  # type: ignore[attr-defined]
+    df = merged_deduped.collect()
     write_meta = delta_mgr_gold.write_delta(
         df,
         table_name="track_candidates",

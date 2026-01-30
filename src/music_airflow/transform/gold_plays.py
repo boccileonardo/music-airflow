@@ -135,11 +135,11 @@ def compute_track_play_counts(execution_date: datetime) -> dict[str, Any]:
     """
     # Read silver tables
     io_manager = PolarsDeltaIOManager(medallion_layer="silver")
-    plays_lf: pl.LazyFrame = io_manager.read_delta("plays")  # type: ignore[assignment]
+    plays_lf: pl.LazyFrame = io_manager.read_delta("plays")
 
     # Handle case when dim_users doesn't exist (bootstrapping)
     if io_manager.table_exists("dim_users"):
-        dim_users_lf: pl.LazyFrame = io_manager.read_delta("dim_users")  # type: ignore[assignment]
+        dim_users_lf: pl.LazyFrame = io_manager.read_delta("dim_users")
     else:
         # Create fallback with default half-life for all users
         from music_airflow.transform.dimensions import MIN_HALF_LIFE_DAYS

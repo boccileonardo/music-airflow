@@ -225,7 +225,7 @@ def candidate_generation():
     )
 
     # Final summary
-    consolidate_results([gold_results])  # type: ignore[arg-type]
+    consolidate_results([gold_results])
 
 
 candidate_generation()

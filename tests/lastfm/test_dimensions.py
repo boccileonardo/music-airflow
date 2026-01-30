@@ -225,7 +225,7 @@ class TestExtractTracksToBronze:
         # Use a simple counter approach
         call_count = [0]
 
-        def get_io_manager(medallion_layer: str):  # type: ignore[misc]
+        def get_io_manager(medallion_layer: str):
             call_count[0] += 1
             if call_count[0] == 1:  # First call - plays
                 return mock_plays_io
