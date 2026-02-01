@@ -55,8 +55,8 @@ def _cleanup_played_candidates(
     from deltalake.exceptions import TableNotFoundError
 
     try:
-        table_path = str(delta_mgr.base_dir / table_name)
-        dt = DeltaTable(table_path)
+        table_uri = delta_mgr._get_table_uri(table_name)
+        dt = DeltaTable(table_uri, storage_options=delta_mgr.storage_options)
 
         # Count candidates before cleanup
         existing_df = (

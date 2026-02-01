@@ -3,11 +3,42 @@ IO Manager for handling Polars DataFrame/LazyFrame and JSON read/write operation
 
 This module provides centralized interfaces for Parquet, Delta, and JSON I/O operations.
 Supports both DataFrame and LazyFrame with automatic collection when needed.
+Supports both local storage and Google Cloud Storage (GCS) for Delta tables.
+
+GCS Configuration:
+    Set the GCS_BUCKET_URI in .env file to enable cloud storage.
+    Example: GCS_BUCKET_URI=gs://my-bucket/data
+
+    Authentication uses Application Default Credentials (ADC):
+    - Locally: Run `gcloud auth application-default login`
+    - On GCP: Automatically uses service account credentials
+
+    Alternatively, set GOOGLE_APPLICATION_CREDENTIALS to path of a service account JSON.
 """
 
+import os
 from pathlib import Path
 from typing import Any, Literal
+
+from dotenv import load_dotenv
 import polars as pl
+
+load_dotenv()
+
+
+def get_gcs_storage_options() -> dict[str, str] | None:
+    """
+    Get GCS storage options for delta-rs.
+
+    Supports:
+    - Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS env var)
+    - No explicit config if running on GCP (uses instance credentials)
+    """
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if creds_path:
+        return {"google_service_account": creds_path}
+    # Let delta-rs auto-detect ADC (works with `gcloud auth application-default login`)
+    return None
 
 
 class JSONIOManager:
@@ -15,6 +46,8 @@ class JSONIOManager:
     Manager for reading and writing JSON files.
 
     Uses Polars native JSON I/O for efficient reading.
+    Supports both local storage and Google Cloud Storage (GCS).
+
     Methods:
         write_json: Write list/dict data to JSON format.
         read_json: Read JSON file using Polars read_json (returns LazyFrame).
@@ -32,9 +65,36 @@ class JSONIOManager:
                 f"medallion_layer must be 'bronze', 'silver', or 'gold', got '{medallion_layer}'"
             )
         self.medallion_layer = medallion_layer
-        self.base_dir = (
-            Path(__file__).parent.parent.parent.parent / "data" / medallion_layer
-        )
+
+        # Check for GCS configuration
+        gcs_bucket_uri = os.getenv("GCS_BUCKET_URI")
+        if gcs_bucket_uri:
+            self.base_uri = f"{gcs_bucket_uri.rstrip('/')}/{medallion_layer}"
+            self.is_cloud = True
+        else:
+            self.base_uri = str(
+                Path(__file__).parent.parent.parent.parent / "data" / medallion_layer
+            )
+            self.is_cloud = False
+
+    @property
+    def base_dir(self) -> Path:
+        """Return base directory as Path (for local storage only)."""
+        if self.is_cloud:
+            raise ValueError("base_dir not available for cloud storage. Use base_uri.")
+        return Path(self.base_uri)
+
+    @base_dir.setter
+    def base_dir(self, value: Path) -> None:
+        """Set base directory (for testing)."""
+        self.base_uri = str(value)
+        self.is_cloud = False
+
+    def _get_file_uri(self, filename: str) -> str:
+        """Get full URI for a file."""
+        if self.is_cloud:
+            return f"{self.base_uri}/{filename}"
+        return str(Path(self.base_uri) / filename)
 
     def write_json(self, data: list | dict, filename: str, **kwargs) -> dict[str, Any]:
         """
@@ -50,11 +110,19 @@ class JSONIOManager:
         """
         import json
 
-        path = self.base_dir / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
+        file_uri = self._get_file_uri(filename)
 
-        with open(path, "w") as f:
-            json.dump(data, f, **kwargs)
+        if self.is_cloud:
+            import gcsfs
+
+            fs = gcsfs.GCSFileSystem()
+            with fs.open(file_uri, "w") as f:
+                json.dump(data, f, **kwargs)
+        else:
+            path = Path(file_uri)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(data, f, **kwargs)
 
         # Calculate record count
         if isinstance(data, list):
@@ -65,11 +133,12 @@ class JSONIOManager:
             record_count = 0
 
         return {
-            "path": str(path.absolute()),
+            "path": file_uri,
             "filename": filename,
             "rows": record_count,
             "format": "json",
             "medallion_layer": self.medallion_layer,
+            "storage": "gcs" if self.is_cloud else "local",
         }
 
     def read_json(self, filename: str, **kwargs) -> pl.LazyFrame:
@@ -83,8 +152,19 @@ class JSONIOManager:
         Returns:
             Polars LazyFrame
         """
-        path = self.base_dir / filename
-        return pl.read_json(path, **kwargs).lazy()
+        file_uri = self._get_file_uri(filename)
+
+        if self.is_cloud:
+            import gcsfs
+
+            fs = gcsfs.GCSFileSystem()
+            with fs.open(file_uri, "r") as f:
+                import json
+
+                data = json.load(f)
+            return pl.DataFrame(data).lazy()
+        else:
+            return pl.read_json(file_uri, **kwargs).lazy()
 
 
 class PolarsParquetIOManager:
@@ -188,6 +268,11 @@ class PolarsDeltaIOManager:
 
     Automatically handles LazyFrame collection (Delta Lake requires materialized DataFrames).
     Supports merge operations for upserts with partition key optimization.
+    Supports both local storage and Google Cloud Storage (GCS).
+
+    Storage Configuration:
+        - Local: Default, stores in ./data/{medallion_layer}/
+        - GCS: Set GCS_BUCKET_URI env var (e.g., gs://my-bucket/data)
 
     Methods:
         write_delta: Write DataFrame or LazyFrame to Delta Lake with merge/upsert support.
@@ -206,9 +291,27 @@ class PolarsDeltaIOManager:
                 f"medallion_layer must be 'bronze', 'silver', or 'gold', got '{medallion_layer}'"
             )
         self.medallion_layer = medallion_layer
-        self.base_dir = (
-            Path(__file__).parent.parent.parent.parent / "data" / medallion_layer
-        )
+
+        # Check for GCS configuration
+        gcs_bucket_uri = os.getenv("GCS_BUCKET_URI")
+        if gcs_bucket_uri:
+            # GCS storage: gs://bucket-name/path -> gs://bucket-name/path/{layer}
+            self.base_uri = f"{gcs_bucket_uri.rstrip('/')}/{medallion_layer}"
+            self.is_cloud = True
+            self.storage_options = get_gcs_storage_options()
+        else:
+            # Local storage fallback
+            self.base_uri = str(
+                Path(__file__).parent.parent.parent.parent / "data" / medallion_layer
+            )
+            self.is_cloud = False
+            self.storage_options = None
+
+    def _get_table_uri(self, table_name: str) -> str:
+        """Get the full URI for a table."""
+        if self.is_cloud:
+            return f"{self.base_uri}/{table_name}"
+        return str(Path(self.base_uri) / table_name)
 
     def write_delta(
         self,
@@ -241,8 +344,11 @@ class PolarsDeltaIOManager:
             except Exception:
                 df = df.collect()
 
-        path = self.base_dir / table_name
-        path.mkdir(parents=True, exist_ok=True)
+        table_uri = self._get_table_uri(table_name)
+
+        # For local storage, ensure directory exists
+        if not self.is_cloud:
+            Path(table_uri).mkdir(parents=True, exist_ok=True)
 
         # Prepare delta_write_options
         delta_write_options = kwargs.pop("delta_write_options", {})
@@ -250,7 +356,7 @@ class PolarsDeltaIOManager:
             delta_write_options["partition_by"] = partition_by
 
         # Check if table exists
-        table_exists = (path / "_delta_log").exists()
+        table_exists = self._table_exists_at_uri(table_uri)
         merge_metrics = None
 
         if mode == "merge":
@@ -260,11 +366,12 @@ class PolarsDeltaIOManager:
             # If table doesn't exist, create it with initial write
             if not table_exists:
                 df.write_delta(
-                    str(path),
+                    table_uri,
                     mode="overwrite",
                     delta_write_options=delta_write_options
                     if delta_write_options
                     else None,
+                    storage_options=self.storage_options,
                     **kwargs,
                 )
             else:
@@ -278,9 +385,10 @@ class PolarsDeltaIOManager:
                 # Perform merge operation and capture metrics
                 merge_metrics = (
                     df.write_delta(
-                        str(path),
+                        table_uri,
                         mode="merge",
                         delta_merge_options=delta_merge_options,
+                        storage_options=self.storage_options,
                         **kwargs,
                     )
                     .when_matched_update_all()
@@ -290,11 +398,12 @@ class PolarsDeltaIOManager:
         else:
             # Direct write for append/overwrite/error modes
             df.write_delta(
-                str(path),
+                table_uri,
                 mode=mode,
                 delta_write_options=delta_write_options
                 if delta_write_options
                 else None,
+                storage_options=self.storage_options,
                 **kwargs,
             )
 
@@ -303,13 +412,14 @@ class PolarsDeltaIOManager:
         schema = {name: str(dtype) for name, dtype in df.schema.items()}
 
         result = {
-            "path": str(path.absolute()),
+            "path": table_uri,
             "table_name": table_name,
             "rows": rows,
             "schema": schema,
             "format": "delta",
             "medallion_layer": self.medallion_layer,
             "mode": mode,
+            "storage": "gcs" if self.is_cloud else "local",
         }
 
         # Add merge metrics if available
@@ -317,6 +427,22 @@ class PolarsDeltaIOManager:
             result["merge_metrics"] = merge_metrics
 
         return result
+
+    def _table_exists_at_uri(self, table_uri: str) -> bool:
+        """Check if a Delta table exists at the given URI."""
+        if self.is_cloud:
+            # For GCS, try to read table metadata
+            try:
+                from deltalake import DeltaTable
+
+                DeltaTable(table_uri, storage_options=self.storage_options)
+                return True
+            except Exception:
+                return False
+        else:
+            # Local path check
+            path = Path(table_uri)
+            return path.exists() and (path / "_delta_log").exists()
 
     def table_exists(self, table_name: str) -> bool:
         """
@@ -328,8 +454,8 @@ class PolarsDeltaIOManager:
         Returns:
             True if table exists, False otherwise
         """
-        path = self.base_dir / table_name
-        return path.exists() and (path / "_delta_log").exists()
+        table_uri = self._get_table_uri(table_name)
+        return self._table_exists_at_uri(table_uri)
 
     def read_delta(self, table_name: str, **kwargs) -> pl.LazyFrame:
         """
@@ -337,11 +463,10 @@ class PolarsDeltaIOManager:
 
         Args:
             table_name: Table name (relative to medallion layer directory)
-            lazy: If True (default), return LazyFrame. If False, return DataFrame.
-            **kwargs: Additional arguments passed to pl.scan_delta() or pl.read_delta()
+            **kwargs: Additional arguments passed to pl.scan_delta()
 
         Returns:
-            Polars LazyFrame (default) or DataFrame
+            Polars LazyFrame
         """
-        path = self.base_dir / table_name
-        return pl.scan_delta(str(path), **kwargs)
+        table_uri = self._get_table_uri(table_name)
+        return pl.scan_delta(table_uri, storage_options=self.storage_options, **kwargs)

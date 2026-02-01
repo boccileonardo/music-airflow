@@ -5,7 +5,9 @@ Tests JSONIOManager, PolarsParquetIOManager, and PolarsDeltaIOManager
 for reading, writing, and merging data.
 """
 
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 import polars as pl
 import pytest
@@ -14,6 +16,7 @@ from music_airflow.utils.polars_io_manager import (
     JSONIOManager,
     PolarsParquetIOManager,
     PolarsDeltaIOManager,
+    get_gcs_storage_options,
 )
 
 
@@ -26,6 +29,12 @@ def test_data_dir(tmp_path: Path) -> Path:
     (data_dir / "silver").mkdir()
     (data_dir / "gold").mkdir()
     return data_dir
+
+
+@pytest.fixture(autouse=True)
+def clear_gcs_env(monkeypatch):
+    """Clear GCS environment variables for all tests."""
+    monkeypatch.delenv("GCS_BUCKET_URI", raising=False)
 
 
 class TestJSONIOManager:
@@ -181,7 +190,7 @@ class TestPolarsDeltaIOManager:
     def test_write_delta_overwrite(self, test_data_dir):
         """Test writing a DataFrame to Delta with overwrite mode."""
         manager = PolarsDeltaIOManager(medallion_layer="silver")
-        manager.base_dir = test_data_dir / "silver"
+        manager.base_uri = str(test_data_dir / "silver")
 
         df = pl.DataFrame({"id": [1, 2, 3], "value": ["a", "b", "c"]})
         result = manager.write_delta(df, "test_table", mode="overwrite")
@@ -192,6 +201,7 @@ class TestPolarsDeltaIOManager:
         assert result["mode"] == "overwrite"
         assert result["table_name"] == "test_table"
         assert "id" in result["schema"]
+        assert result["storage"] == "local"
 
         # Verify Delta table exists
         delta_log = Path(result["path"]) / "_delta_log"
@@ -200,7 +210,7 @@ class TestPolarsDeltaIOManager:
     def test_write_delta_lazyframe(self, test_data_dir):
         """Test writing a LazyFrame to Delta."""
         manager = PolarsDeltaIOManager(medallion_layer="silver")
-        manager.base_dir = test_data_dir / "silver"
+        manager.base_uri = str(test_data_dir / "silver")
 
         df = pl.LazyFrame({"id": [1, 2, 3], "value": ["a", "b", "c"]})
         result = manager.write_delta(df, "test_table", mode="overwrite")
@@ -211,7 +221,7 @@ class TestPolarsDeltaIOManager:
     def test_write_delta_merge_initial(self, test_data_dir):
         """Test merge mode with initial write (table doesn't exist)."""
         manager = PolarsDeltaIOManager(medallion_layer="silver")
-        manager.base_dir = test_data_dir / "silver"
+        manager.base_uri = str(test_data_dir / "silver")
 
         df = pl.DataFrame({"id": [1, 2], "value": ["a", "b"]})
         result = manager.write_delta(
@@ -229,7 +239,7 @@ class TestPolarsDeltaIOManager:
     def test_write_delta_merge_requires_predicate(self, test_data_dir):
         """Test that merge mode requires a predicate."""
         manager = PolarsDeltaIOManager(medallion_layer="silver")
-        manager.base_dir = test_data_dir / "silver"
+        manager.base_uri = str(test_data_dir / "silver")
 
         df = pl.DataFrame({"id": [1, 2], "value": ["a", "b"]})
 
@@ -239,7 +249,7 @@ class TestPolarsDeltaIOManager:
     def test_write_delta_merge_update_and_insert(self, test_data_dir):
         """Test merge with updates and inserts."""
         manager = PolarsDeltaIOManager(medallion_layer="silver")
-        manager.base_dir = test_data_dir / "silver"
+        manager.base_uri = str(test_data_dir / "silver")
 
         # Initial data
         df1 = pl.DataFrame({"id": [1, 2], "value": ["a", "b"]})
@@ -268,7 +278,7 @@ class TestPolarsDeltaIOManager:
     def test_write_delta_with_partitioning(self, test_data_dir):
         """Test writing Delta with partitioning."""
         manager = PolarsDeltaIOManager(medallion_layer="silver")
-        manager.base_dir = test_data_dir / "silver"
+        manager.base_uri = str(test_data_dir / "silver")
 
         df = pl.DataFrame(
             {
@@ -291,7 +301,7 @@ class TestPolarsDeltaIOManager:
     def test_read_delta(self, test_data_dir):
         """Test reading Delta table."""
         manager = PolarsDeltaIOManager(medallion_layer="silver")
-        manager.base_dir = test_data_dir / "silver"
+        manager.base_uri = str(test_data_dir / "silver")
 
         # Write data first
         df = pl.DataFrame({"id": [1, 2, 3], "value": ["a", "b", "c"]})
@@ -308,7 +318,7 @@ class TestPolarsDeltaIOManager:
     def test_write_delta_append(self, test_data_dir):
         """Test appending to Delta table."""
         manager = PolarsDeltaIOManager(medallion_layer="silver")
-        manager.base_dir = test_data_dir / "silver"
+        manager.base_uri = str(test_data_dir / "silver")
 
         # Initial data
         df1 = pl.DataFrame({"id": [1, 2], "value": ["a", "b"]})
@@ -323,3 +333,55 @@ class TestPolarsDeltaIOManager:
         # Verify final count
         final_df = pl.read_delta(str(test_data_dir / "silver" / "test_table"))
         assert len(final_df) == 4
+
+    def test_table_exists(self, test_data_dir):
+        """Test table_exists method."""
+        manager = PolarsDeltaIOManager(medallion_layer="silver")
+        manager.base_uri = str(test_data_dir / "silver")
+
+        # Table doesn't exist yet
+        assert not manager.table_exists("test_table")
+
+        # Create table
+        df = pl.DataFrame({"id": [1, 2]})
+        manager.write_delta(df, "test_table", mode="overwrite")
+
+        # Now it exists
+        assert manager.table_exists("test_table")
+
+    def test_gcs_configuration(self):
+        """Test GCS configuration via environment variable."""
+        with patch.dict(os.environ, {"GCS_BUCKET_URI": "gs://my-bucket/data"}):
+            manager = PolarsDeltaIOManager(medallion_layer="silver")
+            assert manager.is_cloud
+            assert manager.base_uri == "gs://my-bucket/data/silver"
+            assert manager._get_table_uri("test") == "gs://my-bucket/data/silver/test"
+
+    def test_local_configuration_default(self):
+        """Test local configuration when GCS_BUCKET_URI is not set."""
+        with patch.dict(os.environ, {}, clear=True):
+            # Remove GCS_BUCKET_URI if present
+            os.environ.pop("GCS_BUCKET_URI", None)
+            manager = PolarsDeltaIOManager(medallion_layer="gold")
+            assert not manager.is_cloud
+            assert "gold" in manager.base_uri
+            assert manager.storage_options is None
+
+
+class TestGCSStorageOptions:
+    """Test GCS storage options helper."""
+
+    def test_with_service_account_env(self):
+        """Test storage options with GOOGLE_APPLICATION_CREDENTIALS set."""
+        with patch.dict(
+            os.environ, {"GOOGLE_APPLICATION_CREDENTIALS": "/path/to/creds.json"}
+        ):
+            options = get_gcs_storage_options()
+            assert options == {"google_service_account": "/path/to/creds.json"}
+
+    def test_without_service_account_env(self):
+        """Test storage options without GOOGLE_APPLICATION_CREDENTIALS."""
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+            options = get_gcs_storage_options()
+            assert options is None

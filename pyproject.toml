@@ -21,6 +21,7 @@ dependencies = [
   "apache-airflow-providers-fab",
   "beautifulsoup4>=4.14.3",
   "deltalake>=1.2.1",
+  "gcsfs>=2026.1",
   "google-api-python-client>=2.187",
   "google-auth-oauthlib>=1.2.3",
   "polars>=1.36.1",

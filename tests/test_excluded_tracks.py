@@ -21,7 +21,7 @@ def temp_gold_dir(tmp_path, monkeypatch):
     gold_dir = tmp_path / "data" / "gold"
     gold_dir.mkdir(parents=True, exist_ok=True)
 
-    # Monkey-patch the base_dir in PolarsDeltaIOManager
+    # Monkey-patch the __init__ in PolarsDeltaIOManager
     original_init = PolarsDeltaIOManager.__init__
 
     def mock_init(self, medallion_layer: str = "silver"):
@@ -30,7 +30,9 @@ def temp_gold_dir(tmp_path, monkeypatch):
                 f"medallion_layer must be 'bronze', 'silver', or 'gold', got '{medallion_layer}'"
             )
         self.medallion_layer = medallion_layer
-        self.base_dir = tmp_path / "data" / medallion_layer
+        self.base_uri = str(tmp_path / "data" / medallion_layer)
+        self.is_cloud = False
+        self.storage_options = None
 
     monkeypatch.setattr(PolarsDeltaIOManager, "__init__", mock_init)
 

@@ -24,12 +24,12 @@ from music_airflow.transform.candidate_generation import (
 
 @pytest.fixture
 def patched_delta_io(test_data_dir):
-    """Provide patched IO managers with base_dir pointing to test_data_dir subfolders."""
+    """Provide patched IO managers with base_uri pointing to test_data_dir subfolders."""
     silver_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-    silver_mgr.base_dir = test_data_dir / "silver"
+    silver_mgr.base_uri = str(test_data_dir / "silver")
 
     gold_mgr = PolarsDeltaIOManager(medallion_layer="gold")
-    gold_mgr.base_dir = test_data_dir / "gold"
+    gold_mgr.base_uri = str(test_data_dir / "gold")
 
     def factory(layer: str = "silver"):
         if layer == "gold":

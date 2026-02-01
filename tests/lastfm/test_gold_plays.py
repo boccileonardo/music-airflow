@@ -362,7 +362,7 @@ class TestComputeArtistPlayCountsIntegration:
             # Create mock that returns real managers with test paths
             def create_io_manager(medallion_layer):
                 mgr = PolarsDeltaIOManager(medallion_layer=medallion_layer)
-                mgr.base_dir = test_data_dir / medallion_layer
+                mgr.base_uri = str(test_data_dir / medallion_layer)
                 return mgr
 
             mock_io.side_effect = create_io_manager
@@ -459,7 +459,7 @@ class TestComputeTrackPlayCountsIntegration:
             # Create mock that returns real managers with test paths
             def create_io_manager(medallion_layer):
                 mgr = PolarsDeltaIOManager(medallion_layer=medallion_layer)
-                mgr.base_dir = test_data_dir / medallion_layer
+                mgr.base_uri = str(test_data_dir / medallion_layer)
                 return mgr
 
             mock_io.side_effect = create_io_manager
