@@ -1,6 +1,17 @@
 # Last.FM Music Recommender with Airflow and Streamlit
 
-Use Airflow to collect liked and recently played songs in the music platforms I use (yt music and deezer) from last.fm and have a recommender system that supports various modes (favorites, discover new, etc.) in a streamlit app.
+Use Airflow to collect liked and recently played songs from last.fm, and have a recommender system that supports various modes (old favorites, discover based on tags, artist similarity or deep cuts from loved artists), all displayed in a streamlit app.
+Uses Airflow 3.0 assets, Polars for data processing, publish to playlists via Youtube Data API.
+
+![Airflow Asset Graph](assets/airflow_assets.png "Airflow Asset Graph")
+
+---
+
+![Airflow DAGs Screenshot](assets/airflow_dags.png "Airflow DAGs Screenshot")
+
+---
+
+![Streamlit App Screenshot](assets/streamlit.png "Streamlit App Screenshot")
 
 ## Quickstart
 
