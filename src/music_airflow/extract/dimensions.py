@@ -16,6 +16,8 @@ from deltalake.exceptions import TableNotFoundError
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager, JSONIOManager
 from music_airflow.utils.lastfm_scraper import LastFMScraper
+from music_airflow.utils.text_normalization import normalize_text
+from music_airflow.utils.ytmusic_search import search_youtube_url
 import polars as pl
 
 
@@ -100,7 +102,7 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
 
     print(f"Fetching metadata for {track_count} new tracks...")
 
-    # Fetch metadata for new tracks
+    # Fetch metadata for new tracks and search for popular versions
     async with LastFMClient() as client:
         # Create all track info tasks
         track_tasks = [
@@ -138,29 +140,57 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
                 )
                 continue
 
-    success_count = len(tracks_data)
-    print(f"Successfully fetched {success_count}/{track_count} tracks")
+        success_count = len(tracks_data)
+        print(f"Successfully fetched {success_count}/{track_count} tracks")
 
-    if not tracks_data:
-        raise AirflowSkipException(
-            f"No track metadata successfully fetched (0/{track_count} succeeded)"
-        )
+        if not tracks_data:
+            raise AirflowSkipException(
+                f"No track metadata successfully fetched (0/{track_count} succeeded)"
+            )
 
-    # Enrich with streaming links from Last.fm track pages
+        # Find the most popular version of each track for streaming links
+        # The track from get_track_info may be an obscure remaster with no YouTube link
+        # We search using NORMALIZED names to find the canonical version (most listeners)
+        print(f"Finding popular versions for {len(tracks_data)} tracks...")
+
+        search_tasks = [
+            client.search_track(
+                track=normalize_text(track.get("name", "")),
+                artist=normalize_text(track.get("artist", {}).get("name", "")),
+                limit=1,
+            )
+            for track in tracks_data
+        ]
+        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+    # Build mapping from original track to popular version URL
+    popular_urls: list[str] = []
+    for idx, result in enumerate(search_results):
+        original_url = tracks_data[idx].get("url", "")
+        if isinstance(result, Exception) or not result:
+            # Fall back to original URL
+            popular_urls.append(original_url)
+        elif isinstance(result, list) and len(result) > 0:
+            # Use the most popular version's URL
+            popular_urls.append(result[0].get("url", original_url))
+        else:
+            popular_urls.append(original_url)
+
+    # Enrich with streaming links from the popular version's Last.fm page
     print(f"Fetching streaming links for {len(tracks_data)} tracks...")
-    track_urls = [track.get("url", "") for track in tracks_data if track.get("url")]
+    valid_urls = [url for url in popular_urls if url]
 
     async with LastFMScraper() as scraper:
-        streaming_links_list = await scraper.get_streaming_links_batch(track_urls)
+        streaming_links_list = await scraper.get_streaming_links_batch(valid_urls)
 
     # Build mapping from URL to streaming links
-    streaming_links = dict(zip(track_urls, streaming_links_list))
+    streaming_links = dict(zip(valid_urls, streaming_links_list))
 
-    # Merge streaming links into track data
+    # Merge streaming links into track data using popular version URLs
     for idx, track in enumerate(tracks_data):
-        track_url = track.get("url", "")
-        if track_url and track_url in streaming_links:
-            links = streaming_links[track_url]
+        popular_url = popular_urls[idx]
+        if popular_url and popular_url in streaming_links:
+            links = streaming_links[popular_url]
             track["youtube_url"] = links.get("youtube_url")
             track["spotify_url"] = links.get("spotify_url")
         else:
@@ -171,6 +201,29 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
         1 for t in tracks_data if t.get("youtube_url") or t.get("spotify_url")
     )
     print(f"Enriched {enriched_count}/{len(tracks_data)} tracks with streaming links")
+
+    # Fallback: Use YTMusic search for tracks without YouTube URLs
+    # Use NORMALIZED names to find canonical versions, not obscure remasters
+    missing_youtube = [
+        (idx, t) for idx, t in enumerate(tracks_data) if not t.get("youtube_url")
+    ]
+    if missing_youtube:
+        print(
+            f"Searching YTMusic for {len(missing_youtube)} tracks without YouTube URLs..."
+        )
+        ytmusic_found = 0
+        for idx, track in missing_youtube:
+            track_name = normalize_text(track.get("name", ""))
+            artist_name = normalize_text(track.get("artist", {}).get("name", ""))
+            if track_name and artist_name:
+                youtube_url = search_youtube_url(track_name, artist_name)
+                if youtube_url:
+                    track["youtube_url"] = youtube_url
+                    ytmusic_found += 1
+        print(f"Found {ytmusic_found}/{len(missing_youtube)} tracks via YTMusic search")
+
+    final_youtube_count = sum(1 for t in tracks_data if t.get("youtube_url"))
+    print(f"Final YouTube coverage: {final_youtube_count}/{len(tracks_data)} tracks")
 
     # Save to bronze as JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

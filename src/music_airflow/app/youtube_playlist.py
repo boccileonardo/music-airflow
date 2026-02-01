@@ -2,6 +2,8 @@
 YouTube playlist generation for music recommendations.
 
 Creates YouTube playlists from track recommendations using YouTube Data API v3.
+Uses YouTube Music API (ytmusicapi) for searching to find audio versions
+instead of music videos, avoiding quota usage for search operations.
 
 Authentication:
 --------------
@@ -10,7 +12,8 @@ Run OAuth flow from Streamlit UI to get tokens
 Tokens stored in YOUTUBE_ACCESS_TOKEN and YOUTUBE_REFRESH_TOKEN
 
 Note: YouTube Data API has quota limits (10,000 units/day).
-Each search costs 100 units, playlist creation costs 50 units.
+Playlist creation costs 50 units per insert.
+Search now uses ytmusicapi (no quota cost) instead of YouTube Data API.
 """
 
 import logging
@@ -28,6 +31,7 @@ from googleapiclient.errors import HttpError
 import polars as pl
 import requests
 import streamlit as st
+from ytmusicapi import YTMusic
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +166,18 @@ class YouTubePlaylistGenerator:
 
     def __init__(self):
         self.youtube: Optional[Resource] = None
+        self.ytmusic: Optional[YTMusic] = None
         self.search_cache: dict[str, Optional[str]] = {}
+        self._init_ytmusic()
+
+    def _init_ytmusic(self) -> None:
+        """Initialize YTMusic client for unauthenticated search."""
+        try:
+            self.ytmusic = YTMusic()
+            logger.info("YTMusic client initialized for search")
+        except Exception as e:
+            logger.warning(f"Failed to initialize YTMusic: {e}")
+            self.ytmusic = None
 
     def authenticate(self) -> bool:
         """Authenticate with YouTube Data API."""
@@ -234,14 +249,99 @@ class YouTubePlaylistGenerator:
         status = YouTubePlaylistGenerator.get_auth_status()
         return not status["youtube"]["has_tokens"]
 
+    def search_track_ytmusic(self, track_name: str, artist_name: str) -> Optional[str]:
+        """
+        Search for a track using YTMusic API (no quota cost).
+
+        Prioritizes songs (audio-only) over videos to avoid music videos,
+        live performances, and other non-audio content.
+
+        Args:
+            track_name: Track name to search
+            artist_name: Artist name for context
+
+        Returns:
+            Video ID if found, None otherwise
+        """
+        if not self.ytmusic:
+            return None
+
+        query = f"{track_name} {artist_name}"
+
+        try:
+            # Search for songs (audio-only, not videos)
+            results = self.ytmusic.search(query, filter="songs", limit=5)
+
+            if results:
+                # Return first song result - these are audio versions
+                video_id = results[0].get("videoId")
+                if video_id:
+                    logger.debug(
+                        f"YTMusic found song: {results[0].get('title')} by {results[0].get('artists', [{}])[0].get('name', 'Unknown')}"
+                    )
+                    return video_id
+
+            # Fallback: search without filter but prefer audio
+            results = self.ytmusic.search(query, limit=10)
+            for result in results:
+                result_type = result.get("resultType", "")
+                # Prefer songs over videos
+                if result_type == "song":
+                    video_id = result.get("videoId")
+                    if video_id:
+                        return video_id
+
+            # Last resort: any result with a video ID
+            for result in results:
+                video_id = result.get("videoId")
+                if video_id:
+                    return video_id
+
+        except Exception as e:
+            logger.warning(f"YTMusic search error for '{query}': {e}")
+
+        return None
+
     def search_track(
         self, track_name: str, artist_name: str, max_results: int = 5
     ) -> Optional[str]:
-        """Search for a track and return video ID."""
+        """
+        Search for a track and return video ID.
+
+        Uses YTMusic API first (no quota cost, prefers audio versions),
+        falls back to YouTube Data API if needed.
+        """
         query = f"{track_name} {artist_name}"
 
         if query in self.search_cache:
             return self.search_cache[query]
+
+        # Try YTMusic first (no quota, prefers audio)
+        video_id = self.search_track_ytmusic(track_name, artist_name)
+        if video_id:
+            self.search_cache[query] = video_id
+            return video_id
+
+        # Fallback to YouTube Data API (uses quota)
+        if self.youtube:
+            video_id = self._search_track_youtube_api(
+                track_name, artist_name, max_results
+            )
+            self.search_cache[query] = video_id
+            return video_id
+
+        self.search_cache[query] = None
+        return None
+
+    def _search_track_youtube_api(
+        self, track_name: str, artist_name: str, max_results: int = 5
+    ) -> Optional[str]:
+        """
+        Fallback search using YouTube Data API (costs 100 quota units).
+
+        Only used if YTMusic search fails.
+        """
+        query = f"{track_name} {artist_name}"
 
         music_video_keywords = [
             "official video",
@@ -251,8 +351,11 @@ class YouTubePlaylistGenerator:
             "(mv)",
             "official music video",
             "videoclip",
+            "live",
+            "concert",
+            "performance",
         ]
-        audio_keywords = ["audio", "lyric", "lyrics"]
+        audio_keywords = ["audio", "lyric", "lyrics", "topic"]
 
         try:
             response = (
@@ -269,15 +372,12 @@ class YouTubePlaylistGenerator:
 
             items = response.get("items", [])
             if not items:
-                self.search_cache[query] = None
                 return None
 
-            # Prefer Topic channels
+            # Prefer Topic channels (auto-generated audio-only)
             for item in items:
                 if "- Topic" in item["snippet"]["channelTitle"]:
-                    video_id = item["id"]["videoId"]
-                    self.search_cache[query] = video_id
-                    return video_id
+                    return item["id"]["videoId"]
 
             # Prefer audio versions
             for item in items:
@@ -285,33 +385,25 @@ class YouTubePlaylistGenerator:
                 if any(kw in title for kw in music_video_keywords):
                     continue
                 if any(kw in title for kw in audio_keywords):
-                    video_id = item["id"]["videoId"]
-                    self.search_cache[query] = video_id
-                    return video_id
+                    return item["id"]["videoId"]
 
             # First non-music-video
             for item in items:
                 title = item["snippet"]["title"].lower()
                 if not any(kw in title for kw in music_video_keywords):
-                    video_id = item["id"]["videoId"]
-                    self.search_cache[query] = video_id
-                    return video_id
+                    return item["id"]["videoId"]
 
             # Fallback to first result
-            video_id = items[0]["id"]["videoId"]
-            self.search_cache[query] = video_id
-            return video_id
+            return items[0]["id"]["videoId"]
 
         except HttpError as e:
             if e.resp.status == 403 and "quotaExceeded" in str(e):
                 logger.error("YouTube API quota exceeded")
             else:
                 logger.error(f"Search error: {e}")
-            self.search_cache[query] = None
             return None
         except Exception as e:
             logger.error(f"Search error: {e}")
-            self.search_cache[query] = None
             return None
 
     def find_playlist_by_title(self, title: str) -> Optional[str]:
@@ -438,8 +530,10 @@ class YouTubePlaylistGenerator:
         if not playlist_id:
             return None
 
-        # Collect tracks with video IDs
+        # Collect tracks with video IDs from stored URLs
+        # URLs should be populated during dimension extraction (including YTMusic fallback)
         tracks_to_add = []
+        tracks_missing_url = []
         for row in tracks_df.iter_rows(named=True):
             track_name = row.get("track_name", "Unknown")
             artist_name = row.get("artist_name", "Unknown")
@@ -449,11 +543,16 @@ class YouTubePlaylistGenerator:
             if has_urls and row.get("youtube_url"):
                 video_id = self._extract_video_id(row["youtube_url"])
 
-            if not video_id and self.youtube:
-                video_id = self.search_track(track_name, artist_name)
-
             if video_id:
                 tracks_to_add.append((video_id, track_label))
+            else:
+                tracks_missing_url.append(track_label)
+
+        if tracks_missing_url:
+            logger.warning(
+                f"{len(tracks_missing_url)} tracks missing YouTube URLs - "
+                "re-run dimension extraction to populate"
+            )
 
         # Add tracks
         tracks_added = 0
@@ -483,6 +582,7 @@ class YouTubePlaylistGenerator:
             "playlist_url": f"https://music.youtube.com/playlist?list={playlist_id}",
             "tracks_added": tracks_added,
             "tracks_not_found": tracks_not_found,
+            "tracks_missing_url": tracks_missing_url,
         }
 
         if quota_exceeded:

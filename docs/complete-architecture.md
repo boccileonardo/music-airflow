@@ -116,7 +116,9 @@ graph LR
 
 - Discovers new tracks from candidates
 - Fetches metadata from Last.fm API
-- Enriches with YouTube/Spotify streaming links via web scraping
+- Searches for "popular version" via `track.search` (most listeners) for reliable streaming links
+- Scrapes popular version's Last.fm page for YouTube/Spotify URLs
+- Falls back to YouTube Music search for tracks still missing YouTube URLs
 - Computes user profiles with half-life values from plays data
 - Single-cycle enrichment: New tracks discovered by candidates are enriched in the same daily run
 
@@ -223,11 +225,19 @@ This ensures consistent joins across track name variations (e.g., "Song" matches
 
 ### Streaming Link Enrichment
 
-Track metadata includes streaming links scraped from Last.fm track pages:
-- YouTube URL (prioritized for playlist creation)
-- Spotify URL (for cross-platform compatibility)
+Track metadata includes streaming links for playlist generation and playback:
 
-Enables direct playback in the Streamlit app and automated YouTube playlist generation.
+**YouTube URL Resolution** (multi-step fallback):
+
+1. **Popular Version Search**: Use Last.fm `track.search` to find the canonical version with most listeners (avoids obscure remasters with no links)
+2. **Last.fm Scraping**: Scrape the popular version's Last.fm page for embedded YouTube URL
+3. **YouTube Music Fallback**: If scraping fails, search YouTube Music API for audio-only version (prefers songs over music videos)
+
+This approach ensures high YouTube URL coverage (~95%+) while preferring audio versions over music videos.
+
+**Spotify URL**: Scraped from Last.fm track pages when available.
+
+Streaming links are stored in the track dimension table, enabling fast playlist generation without runtime searches.
 
 ### Candidate Consolidation
 

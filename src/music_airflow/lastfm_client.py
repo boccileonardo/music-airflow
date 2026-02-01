@@ -498,6 +498,50 @@ class LastFMClient:
 
         return matches
 
+    async def search_track(
+        self, track: str, artist: str | None = None, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """
+        Search for tracks on Last.fm and return matches sorted by relevance.
+
+        This is useful for finding the most popular version of a track
+        when you have a normalized track name. Results are sorted by listeners
+        count descending, so the first result is typically the "canonical" version.
+
+        Args:
+            track: Track name to search for
+            artist: Optional artist name to narrow search
+            limit: Maximum number of results to return (default 5)
+
+        Returns:
+            List of track match dicts. Each includes 'name', 'artist', 'url', 'listeners'.
+            Sorted by listeners (most popular first).
+
+        Example:
+            >>> results = await client.search_track("Hotel California", artist="Eagles")
+            >>> popular_url = results[0]["url"]  # Most popular version's Last.fm URL
+        """
+        params = {
+            "method": "track.search",
+            "track": track,
+            "api_key": self.api_key,
+            "format": "json",
+            "limit": limit,
+        }
+
+        if artist:
+            params["artist"] = artist
+
+        response_data = await self._make_request(params)
+        results = response_data.get("results") or {}
+        trackmatches = results.get("trackmatches") or {}
+        matches = trackmatches.get("track") or []
+
+        if isinstance(matches, dict):
+            matches = [matches]
+
+        return matches
+
     async def get_similar_tags(self, tag: str) -> list[dict[str, Any]]:
         """
         Get similar tags to a given tag.

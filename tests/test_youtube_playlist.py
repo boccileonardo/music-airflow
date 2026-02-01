@@ -48,9 +48,135 @@ def sample_tracks_with_urls():
     )
 
 
+class TestYTMusicSearch:
+    """Tests for YTMusic-based search functionality."""
+
+    def test_search_track_ytmusic_returns_song(self):
+        """Test YTMusic search prioritizes songs over videos."""
+        generator = YouTubePlaylistGenerator()
+
+        mock_ytmusic = MagicMock()
+        mock_ytmusic.search.return_value = [
+            {
+                "videoId": "audio_video_id",
+                "title": "Bohemian Rhapsody",
+                "artists": [{"name": "Queen"}],
+                "resultType": "song",
+            }
+        ]
+        generator.ytmusic = mock_ytmusic
+
+        video_id = generator.search_track_ytmusic("Bohemian Rhapsody", "Queen")
+
+        assert video_id == "audio_video_id"
+        mock_ytmusic.search.assert_called_once_with(
+            "Bohemian Rhapsody Queen", filter="songs", limit=5
+        )
+
+    def test_search_track_ytmusic_fallback_no_filter(self):
+        """Test YTMusic fallback to unfiltered search if no songs found."""
+        generator = YouTubePlaylistGenerator()
+
+        mock_ytmusic = MagicMock()
+        # First call (filtered songs) returns empty
+        # Second call (unfiltered) returns results
+        mock_ytmusic.search.side_effect = [
+            [],  # No songs
+            [
+                {
+                    "videoId": "fallback_id",
+                    "title": "Song Name",
+                    "resultType": "song",
+                }
+            ],
+        ]
+        generator.ytmusic = mock_ytmusic
+
+        video_id = generator.search_track_ytmusic("Song Name", "Artist")
+
+        assert video_id == "fallback_id"
+        assert mock_ytmusic.search.call_count == 2
+
+    def test_search_track_ytmusic_none_when_no_client(self):
+        """Test search returns None when YTMusic client not available."""
+        generator = YouTubePlaylistGenerator()
+        generator.ytmusic = None
+
+        video_id = generator.search_track_ytmusic("Track", "Artist")
+
+        assert video_id is None
+
+    def test_search_track_ytmusic_handles_exception(self):
+        """Test YTMusic search handles exceptions gracefully."""
+        generator = YouTubePlaylistGenerator()
+
+        mock_ytmusic = MagicMock()
+        mock_ytmusic.search.side_effect = Exception("API Error")
+        generator.ytmusic = mock_ytmusic
+
+        video_id = generator.search_track_ytmusic("Track", "Artist")
+
+        assert video_id is None
+
+
+class TestSearchTrackIntegration:
+    """Tests for integrated search_track method."""
+
+    def test_search_track_uses_ytmusic_first(self):
+        """Test that search_track tries YTMusic before YouTube Data API."""
+        generator = YouTubePlaylistGenerator()
+
+        mock_ytmusic = MagicMock()
+        mock_ytmusic.search.return_value = [
+            {"videoId": "ytmusic_id", "title": "Song", "resultType": "song"}
+        ]
+        generator.ytmusic = mock_ytmusic
+
+        mock_youtube = MagicMock()
+        generator.youtube = mock_youtube
+
+        video_id = generator.search_track("Song", "Artist")
+
+        assert video_id == "ytmusic_id"
+        # YouTube API should not be called
+        mock_youtube.search.assert_not_called()
+
+    def test_search_track_falls_back_to_youtube_api(self):
+        """Test fallback to YouTube Data API when YTMusic fails."""
+        generator = YouTubePlaylistGenerator()
+
+        # YTMusic returns nothing
+        mock_ytmusic = MagicMock()
+        mock_ytmusic.search.return_value = []
+        generator.ytmusic = mock_ytmusic
+
+        # YouTube API returns result
+        mock_youtube = MagicMock()
+        mock_search = MagicMock()
+        mock_list = MagicMock()
+        mock_youtube.search.return_value = mock_search
+        mock_search.list.return_value = mock_list
+        mock_list.execute.return_value = {
+            "items": [
+                {
+                    "id": {"videoId": "youtube_api_id"},
+                    "snippet": {"title": "Song", "channelTitle": "Artist - Topic"},
+                }
+            ]
+        }
+        generator.youtube = mock_youtube
+
+        video_id = generator.search_track("Song", "Artist")
+
+        assert video_id == "youtube_api_id"
+
+
 def test_search_track_success():
-    """Test successful track search."""
+    """Test successful track search via YouTube API fallback."""
     generator = YouTubePlaylistGenerator()
+
+    # Disable YTMusic to test YouTube API path
+    generator.ytmusic = None
 
     # Mock the YouTube API service
     mock_youtube = MagicMock()
@@ -80,8 +206,11 @@ def test_search_track_success():
 
 
 def test_search_track_prioritizes_topic_channel():
-    """Test that Topic channels are prioritized."""
+    """Test that Topic channels are prioritized in YouTube API fallback."""
     generator = YouTubePlaylistGenerator()
+
+    # Disable YTMusic
+    generator.ytmusic = None
 
     mock_youtube = MagicMock()
     mock_search = MagicMock()
@@ -114,8 +243,11 @@ def test_search_track_prioritizes_topic_channel():
 
 
 def test_search_track_filters_music_videos():
-    """Test that music videos are filtered out when possible."""
+    """Test that music videos are filtered out when possible in YouTube API fallback."""
     generator = YouTubePlaylistGenerator()
+
+    # Disable YTMusic
+    generator.ytmusic = None
 
     mock_youtube = MagicMock()
     mock_search = MagicMock()
@@ -148,9 +280,15 @@ def test_search_track_filters_music_videos():
 
 
 def test_search_track_no_results():
-    """Test track search with no results."""
+    """Test track search with no results from both YTMusic and YouTube API."""
     generator = YouTubePlaylistGenerator()
 
+    # YTMusic returns nothing
+    mock_ytmusic = MagicMock()
+    mock_ytmusic.search.return_value = []
+    generator.ytmusic = mock_ytmusic
+
+    # YouTube API also returns nothing
     mock_youtube = MagicMock()
     mock_search = MagicMock()
     mock_list = MagicMock()
@@ -170,27 +308,14 @@ def test_search_track_uses_cache():
     """Test that search results are cached."""
     generator = YouTubePlaylistGenerator()
 
-    mock_youtube = MagicMock()
-    mock_search = MagicMock()
-    mock_list = MagicMock()
+    # YTMusic returns result
+    mock_ytmusic = MagicMock()
+    mock_ytmusic.search.return_value = [
+        {"videoId": "test_id", "title": "Test Track", "resultType": "song"}
+    ]
+    generator.ytmusic = mock_ytmusic
 
-    mock_youtube.search.return_value = mock_search
-    mock_search.list.return_value = mock_list
-    mock_list.execute.return_value = {
-        "items": [
-            {
-                "id": {"videoId": "test_id"},
-                "snippet": {
-                    "title": "Test Track",
-                    "channelTitle": "Test Artist - Topic",
-                },
-            }
-        ]
-    }
-
-    generator.youtube = mock_youtube
-
-    # First call - should hit API
+    # First call - should hit YTMusic
     video_id1 = generator.search_track("Test Track", "Test Artist")
     assert video_id1 == "test_id"
 
@@ -198,8 +323,8 @@ def test_search_track_uses_cache():
     video_id2 = generator.search_track("Test Track", "Test Artist")
     assert video_id2 == "test_id"
 
-    # API should only be called once
-    mock_list.execute.assert_called_once()
+    # YTMusic should only be called once (second call uses cache)
+    assert mock_ytmusic.search.call_count == 1
 
 
 def test_create_playlist_success():
@@ -443,11 +568,11 @@ def test_create_playlist_from_urls(mock_sleep, sample_tracks_with_urls):
 
 
 @patch("time.sleep")  # Mock sleep to speed up tests
-def test_create_playlist_from_search(mock_sleep, sample_tracks):
-    """Test creating playlist by searching for tracks."""
+def test_create_playlist_tracks_without_urls(mock_sleep, sample_tracks):
+    """Test creating playlist when tracks don't have youtube_url - they should be skipped."""
     generator = YouTubePlaylistGenerator()
 
-    # Mock YouTube API
+    # Mock YouTube API (for playlist operations)
     mock_youtube = MagicMock()
     generator.youtube = mock_youtube
 
@@ -461,25 +586,7 @@ def test_create_playlist_from_search(mock_sleep, sample_tracks):
     mock_playlists_insert.execute.return_value = {"id": "PLnew123"}
     mock_youtube.playlists.return_value.insert.return_value = mock_playlists_insert
 
-    # Mock search_track
-    mock_search_list = MagicMock()
-    mock_search_list.execute.return_value = {
-        "items": [
-            {
-                "id": {"videoId": "test_vid"},
-                "snippet": {"title": "Track", "channelTitle": "Artist - Topic"},
-            }
-        ]
-    }
-    mock_youtube.search.return_value.list.return_value = mock_search_list
-
-    # Mock add_video_to_playlist
-    mock_playlist_items_insert = MagicMock()
-    mock_playlist_items_insert.execute.return_value = {}
-    mock_youtube.playlistItems.return_value.insert.return_value = (
-        mock_playlist_items_insert
-    )
-
+    # sample_tracks doesn't have youtube_url column, so all tracks should be missing
     result = generator.create_playlist_from_tracks(
         tracks_df=sample_tracks,
         playlist_title="Test Playlist",
@@ -489,12 +596,10 @@ def test_create_playlist_from_search(mock_sleep, sample_tracks):
 
     assert result is not None
     assert result["playlist_id"] == "PLnew123"
-    assert result["tracks_added"] == 3
-    assert len(result["tracks_not_found"]) == 0
-
-    # Should search 3 times and insert 3 times
-    assert mock_search_list.execute.call_count == 3
-    assert mock_playlist_items_insert.execute.call_count == 3
+    # No tracks added since none have youtube_url
+    assert result["tracks_added"] == 0
+    # All 3 tracks should be in missing_url list
+    assert len(result["tracks_missing_url"]) == 3
 
 
 @patch("time.sleep")  # Mock sleep to speed up tests

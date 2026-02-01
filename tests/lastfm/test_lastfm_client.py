@@ -341,3 +341,115 @@ class TestGetUserInfo:
 
             call_args = mock_request.call_args[0][0]
             assert call_args["user"] == "default_user"
+
+
+class TestSearchTrack:
+    """Test search_track method."""
+
+    @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
+    async def test_basic_search(self, mock_request):
+        """Test basic track search."""
+        mock_request.return_value = {
+            "results": {
+                "trackmatches": {
+                    "track": [
+                        {
+                            "name": "Hotel California",
+                            "artist": "Eagles",
+                            "url": "https://www.last.fm/music/Eagles/_/Hotel+California",
+                            "listeners": "1500000",
+                        },
+                        {
+                            "name": "Hotel California - 2013 Remaster",
+                            "artist": "Eagles",
+                            "url": "https://www.last.fm/music/Eagles/_/Hotel+California+-+2013+Remaster",
+                            "listeners": "50000",
+                        },
+                    ]
+                }
+            }
+        }
+
+        client = LastFMClient(api_key="test_key")
+        results = await client.search_track("Hotel California", artist="Eagles")
+
+        assert len(results) == 2
+        assert results[0]["name"] == "Hotel California"
+        assert results[0]["listeners"] == "1500000"
+        # First result should be the most popular (canonical) version
+
+    @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
+    async def test_search_without_artist(self, mock_request):
+        """Test track search without artist filter."""
+        mock_request.return_value = {
+            "results": {
+                "trackmatches": {
+                    "track": [
+                        {
+                            "name": "Yesterday",
+                            "artist": "The Beatles",
+                            "url": "https://www.last.fm/music/The+Beatles/_/Yesterday",
+                            "listeners": "2000000",
+                        },
+                    ]
+                }
+            }
+        }
+
+        client = LastFMClient(api_key="test_key")
+        results = await client.search_track("Yesterday")
+
+        # Verify artist parameter was not included
+        call_args = mock_request.call_args[0][0]
+        assert "artist" not in call_args
+        assert call_args["track"] == "Yesterday"
+        assert len(results) == 1
+
+    @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
+    async def test_single_result_response(self, mock_request):
+        """Test handling single result (dict instead of list)."""
+        mock_request.return_value = {
+            "results": {
+                "trackmatches": {
+                    "track": {
+                        "name": "Creep",
+                        "artist": "Radiohead",
+                        "url": "https://www.last.fm/music/Radiohead/_/Creep",
+                        "listeners": "1000000",
+                    }
+                }
+            }
+        }
+
+        client = LastFMClient(api_key="test_key")
+        results = await client.search_track("Creep", artist="Radiohead")
+
+        assert len(results) == 1
+        assert results[0]["name"] == "Creep"
+
+    @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
+    async def test_empty_results(self, mock_request):
+        """Test handling no search results."""
+        mock_request.return_value = {"results": {"trackmatches": {"track": []}}}
+
+        client = LastFMClient(api_key="test_key")
+        results = await client.search_track("NonexistentTrack12345")
+
+        assert len(results) == 0
+
+    @patch.object(LastFMClient, "_make_request")
+    @pytest.mark.asyncio
+    async def test_limit_parameter(self, mock_request):
+        """Test that limit parameter is passed correctly."""
+        mock_request.return_value = {"results": {"trackmatches": {"track": []}}}
+
+        client = LastFMClient(api_key="test_key")
+        await client.search_track("Test", limit=10)
+
+        call_args = mock_request.call_args[0][0]
+        assert call_args["limit"] == 10
+        assert call_args["method"] == "track.search"

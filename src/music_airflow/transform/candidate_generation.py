@@ -33,6 +33,67 @@ __all__ = [
 ]
 
 
+def _cleanup_played_candidates(
+    delta_mgr: PolarsDeltaIOManager,
+    table_name: str,
+    username: str,
+    played_track_ids_set: set[str],
+) -> int:
+    """
+    Remove candidates that have been played from a silver candidate table.
+
+    Args:
+        delta_mgr: IO manager for the silver layer
+        table_name: Name of the candidate table to clean up
+        username: Target user
+        played_track_ids_set: Set of track_ids that have been played
+
+    Returns:
+        Number of candidates removed
+    """
+    from deltalake import DeltaTable
+    from deltalake.exceptions import TableNotFoundError
+
+    try:
+        table_path = str(delta_mgr.base_dir / table_name)
+        dt = DeltaTable(table_path)
+
+        # Count candidates before cleanup
+        existing_df = (
+            delta_mgr.read_delta(table_name)
+            .filter(pl.col("username") == username)
+            .select("track_id")
+            .collect()
+        )
+        existing_track_ids = set(existing_df["track_id"].to_list())
+
+        # Find candidates that have been played
+        candidates_to_remove = existing_track_ids & played_track_ids_set
+
+        if not candidates_to_remove:
+            return 0
+
+        # Delete played candidates using Delta merge with delete
+        # Convert to list for SQL predicate
+        track_ids_to_delete = list(candidates_to_remove)
+
+        # Build delete predicate - escape single quotes in track IDs
+        escaped_ids = [tid.replace("'", "''") for tid in track_ids_to_delete]
+        track_ids_sql = ", ".join([f"'{tid}'" for tid in escaped_ids])
+        delete_predicate = f"username = '{username}' AND track_id IN ({track_ids_sql})"
+
+        dt.delete(predicate=delete_predicate)
+
+        logger.info(
+            f"Cleaned up {len(candidates_to_remove)} played candidates "
+            f"from {table_name} for {username}"
+        )
+        return len(candidates_to_remove)
+
+    except (TableNotFoundError, FileNotFoundError):
+        return 0
+
+
 async def _gather_with_progress(
     tasks: list,
     description: str,
@@ -450,9 +511,17 @@ async def generate_similar_artist_candidates(
         partition_by="username",
     )
 
+    # Cleanup: remove any candidates that have been played since being recommended
+    removed_count = _cleanup_played_candidates(
+        delta_mgr_silver,
+        "candidate_similar_artist",
+        username,
+        played_track_ids_set,
+    )
+
     return {
         "path": write_meta["path"],
-        "rows": write_meta["rows"],
+        "rows": write_meta["rows"] - removed_count,
         "table_name": write_meta["table_name"],
     }
 
@@ -730,9 +799,17 @@ async def generate_similar_tag_candidates(
         partition_by="username",
     )
 
+    # Cleanup: remove any candidates that have been played since being recommended
+    removed_count = _cleanup_played_candidates(
+        delta_mgr_silver,
+        "candidate_similar_tag",
+        username,
+        played_track_ids_set,
+    )
+
     return {
         "path": write_meta["path"],
-        "rows": write_meta["rows"],
+        "rows": write_meta["rows"] - removed_count,
         "table_name": write_meta["table_name"],
     }
 
@@ -1060,9 +1137,17 @@ async def generate_deep_cut_candidates(
         partition_by="username",
     )
 
+    # Cleanup: remove any candidates that have been played since being recommended
+    removed_count = _cleanup_played_candidates(
+        delta_mgr_silver,
+        "candidate_deep_cut",
+        username,
+        played_track_ids_set,
+    )
+
     return {
         "path": write_meta["path"],
-        "rows": write_meta["rows"],
+        "rows": write_meta["rows"] - removed_count,
         "table_name": write_meta["table_name"],
     }
 
@@ -1170,7 +1255,9 @@ def generate_old_favorites_candidates(
         f"(not played in {min_days_since_last_play}+ days)"
     )
 
-    # Write to silver Delta table (overwrite per user)
+    # Write to silver Delta table
+    # Use overwrite mode because old_favorites is recomputed fresh each run:
+    # tracks that were recently played should be removed, not accumulated
     if len(candidates) == 0:
         # Create empty DataFrame with correct schema
         candidates = pl.DataFrame(
@@ -1186,8 +1273,7 @@ def generate_old_favorites_candidates(
     write_meta = delta_mgr_silver.write_delta(
         candidates,
         table_name="candidate_old_favorites",
-        mode="merge",
-        predicate="s.track_id = t.track_id AND s.username = t.username",
+        mode="overwrite",
         partition_by="username",
     )
 

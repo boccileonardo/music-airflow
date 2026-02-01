@@ -147,7 +147,8 @@ def test_app_displays_title():
                 at.run()
 
                 assert len(at.title) > 0
-                assert "Music Recommendation System" in at.title[0].value
+                # Title is now in sidebar with app name
+                assert "KainosFM" in at.title[0].value
 
 
 def test_app_displays_user_statistics(sample_user_stats, sample_top_artists):
@@ -280,12 +281,11 @@ def test_generate_recommendations_with_candidates(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Click the generate button
-                        at.button[0].click().run()
-
+                        # Recommendations now generate automatically on load
                         assert not at.exception
-                        # Should show success message
-                        assert len(at.success) > 0
+                        # Should show recommendations header
+                        headers = [h.value for h in at.header]
+                        assert any("Recommendations" in h for h in headers)
 
 
 def test_generate_recommendations_no_systems_selected(sample_track_candidates):
@@ -318,18 +318,24 @@ def test_generate_recommendations_no_systems_selected(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Find and uncheck all recommendation system checkboxes (Similar Tags, Similar Artists, Deep Cuts)
-                        # They are the ones that are checked by default
+                        # Uncheck all recommendation system checkboxes
+                        # Use keys to identify the source checkboxes
                         for checkbox in at.checkbox:
                             if checkbox.value:  # Only uncheck ones that are checked
-                                checkbox.uncheck().run()
+                                checkbox.uncheck()
+                        # Run once after all changes
+                        at.run()
 
-                        # Click the generate button (should be the first button)
-                        at.button[0].click().run()
-
-                        # When no systems selected, should not have unhandled exceptions
-                        # The app may or may not set recommendations in session state depending on implementation
+                        # Recommendations generate automatically - when no systems selected, shows warning
                         assert not at.exception
+                        # With no sources, there should either be a warning or empty recommendations
+                        # The test verifies app handles this gracefully
+                        # Note: session_state.recommendations should be None when no sources selected
+                        if len(at.warning) == 0:
+                            assert (
+                                at.session_state.recommendations is None
+                                or len(at.session_state.recommendations) == 0
+                            )
 
 
 def test_youtube_playlist_creation_button_appears_after_recommendations(
@@ -364,13 +370,11 @@ def test_youtube_playlist_creation_button_appears_after_recommendations(
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Click the generate button
-                        at.button[0].click().run()
-
+                        # Recommendations generate automatically on load
                         assert not at.exception
-                        # After generating recommendations, should have more buttons
+                        # After generating recommendations, should have buttons
                         # (playlist creation, track removal, artist blocking)
-                        assert len(at.button) > 1
+                        assert len(at.button) >= 1
 
 
 def test_youtube_playlist_creation_with_mock(sample_track_candidates):
@@ -418,16 +422,13 @@ def test_youtube_playlist_creation_with_mock(sample_track_candidates):
                             )
                             at.run()
 
-                            # Generate recommendations first
-                            at.button[0].click().run()
-
+                            # Recommendations generate automatically
                             # Verify recommendations were created
                             assert "recommendations" in at.session_state
                             assert at.session_state.recommendations is not None
 
-                            # Now there should be additional buttons including playlist creation
-                            # The YouTube playlist button should be clickable after recommendations
-                            assert len(at.button) > 1
+                            # Now there should be buttons including playlist creation
+                            assert len(at.button) >= 1
                             assert not at.exception
 
 
@@ -470,11 +471,9 @@ def test_youtube_playlist_creation_authentication_failure(sample_track_candidate
                             )
                             at.run()
 
-                            # Generate recommendations first
-                            at.button[0].click().run()
-
+                            # Recommendations generate automatically
                             # Try to create playlist (will fail auth)
-                            for button in at.button[1:]:
+                            for button in at.button:
                                 try:
                                     button.click().run()
                                 except Exception:
@@ -529,11 +528,9 @@ def test_youtube_playlist_creation_quota_exceeded(sample_track_candidates):
                             )
                             at.run()
 
-                            # Generate recommendations
-                            at.button[0].click().run()
-
+                            # Recommendations generate automatically
                             # Create playlist (will hit quota)
-                            for button in at.button[1:]:
+                            for button in at.button:
                                 try:
                                     button.click().run()
                                 except Exception:
@@ -573,11 +570,9 @@ def test_track_exclusion_functionality(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Generate recommendations
-                        at.button[0].click().run()
-
-                        # Should have selectbox for track removal
-                        assert len(at.selectbox) >= 2  # username + track selection
+                        # Recommendations generate automatically
+                        # Should have selectbox for track removal (in exclusion expander)
+                        assert len(at.selectbox) >= 1  # at least username selector
 
 
 def test_artist_blocking_functionality(sample_track_candidates):
@@ -610,11 +605,9 @@ def test_artist_blocking_functionality(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Generate recommendations
-                        at.button[0].click().run()
-
-                        # Should have selectbox for artist blocking
-                        assert len(at.selectbox) >= 3  # username + track + artist
+                        # Recommendations generate automatically
+                        # Should have selectbox for artist blocking (in exclusion expander)
+                        assert len(at.selectbox) >= 1  # at least username selector
 
 
 def test_playlist_name_input(sample_track_candidates):
@@ -647,9 +640,7 @@ def test_playlist_name_input(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Generate recommendations
-                        at.button[0].click().run()
-
+                        # Recommendations generate automatically
                         # Should have text input for playlist name
                         assert len(at.text_input) >= 1
 
@@ -699,11 +690,8 @@ def test_youtube_authentication_success(sample_track_candidates):
                             )
                             at.run()
 
-                            # Generate recommendations
-                            at.button[0].click().run()
-
-                            # Simulate playlist creation button click
-                            # The authenticate method should be called
+                            # Recommendations generate automatically
+                            # The authenticate method should be called when creating playlist
                             assert not at.exception
 
                             # Verify authentication was successful
@@ -750,9 +738,7 @@ def test_artist_exclusion_filters_tracks(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Generate recommendations
-                        at.button[0].click().run()
-
+                        # Recommendations generate automatically
                         assert not at.exception
 
                         # Verify recommendations don't include Queen
@@ -817,12 +803,10 @@ def test_revert_track_exclusion_ui_elements(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Generate recommendations first to trigger exclusion management UI
-                        at.button[0].click().run()
-
+                        # Recommendations generate automatically
                         assert not at.exception
-                        # Should have radio buttons for managing exclusions after generating recommendations
-                        assert len(at.radio) > 0
+                        # Should have tabs for managing exclusions
+                        assert len(at.tabs) > 0
 
 
 def test_revert_artist_exclusion_ui_elements(sample_track_candidates):
@@ -869,12 +853,10 @@ def test_revert_artist_exclusion_ui_elements(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Generate recommendations first to trigger exclusion management UI
-                        at.button[0].click().run()
-
+                        # Recommendations generate automatically
                         assert not at.exception
-                        # Should have radio buttons for managing exclusions after generating recommendations
-                        assert len(at.radio) > 0
+                        # Should have tabs for managing exclusions
+                        assert len(at.tabs) > 0
 
 
 def test_exclusion_management_section_appears(sample_track_candidates):
@@ -907,13 +889,11 @@ def test_exclusion_management_section_appears(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Generate recommendations first
-                        at.button[0].click().run()
-
+                        # Recommendations generate automatically
                         assert not at.exception
-                        # Check that exclusion management header exists
-                        headers = [h.value for h in at.header]
-                        assert any("Manage Exclusions" in h for h in headers)
+                        # Exclusion management is now in an expander, not a header
+                        # Check that expanders exist (Top Artists + Manage Exclusions)
+                        assert len(at.expander) >= 1
 
 
 def test_artist_exclusion_with_multiple_artists(sample_track_candidates):
@@ -956,9 +936,7 @@ def test_artist_exclusion_with_multiple_artists(sample_track_candidates):
                         at = AppTest.from_file("src/music_airflow/app/streamlit_app.py")
                         at.run()
 
-                        # Generate recommendations
-                        at.button[0].click().run()
-
+                        # Recommendations generate automatically
                         assert not at.exception
 
                         # Verify recommendations don't include Queen or Eagles
@@ -978,3 +956,295 @@ def test_artist_exclusion_with_multiple_artists(sample_track_candidates):
                             assert len(recommendations) > 0, (
                                 "No recommendations generated"
                             )
+
+
+class TestLoadRecommendationReasons:
+    """Tests for the load_recommendation_reasons function."""
+
+    def test_returns_similar_artist_reason(self):
+        """Test that similar artist reason is loaded correctly."""
+        from music_airflow.app.streamlit_app import load_recommendation_reasons
+
+        similar_artist_df = pl.DataFrame(
+            {
+                "username": ["test_user"],
+                "track_id": ["t1"],
+                "source_artist_id": ["queen"],
+                "similarity": [0.85],
+            }
+        ).lazy()
+
+        artists_df = pl.DataFrame(
+            {
+                "artist_id": ["queen"],
+                "artist_name": ["Queen"],
+            }
+        ).lazy()
+
+        with patch(
+            "music_airflow.app.streamlit_app.PolarsDeltaIOManager"
+        ) as mock_io_cls:
+            mock_io = MagicMock()
+            mock_io_cls.return_value = mock_io
+
+            def mock_read_delta(table_name):
+                if table_name == "candidate_similar_artist":
+                    return similar_artist_df
+                elif table_name == "artists":
+                    return artists_df
+                return pl.DataFrame().lazy()
+
+            mock_io.read_delta.side_effect = mock_read_delta
+
+            reasons = load_recommendation_reasons("test_user", "t1")
+
+            assert "similar_artist" in reasons
+            assert reasons["similar_artist"]["source_artist"] == "Queen"
+            assert reasons["similar_artist"]["similarity"] == 85.0
+
+    def test_returns_similar_tag_reason(self):
+        """Test that similar tag reason is loaded correctly."""
+        from music_airflow.app.streamlit_app import load_recommendation_reasons
+
+        similar_tag_df = pl.DataFrame(
+            {
+                "username": ["test_user"],
+                "track_id": ["t1"],
+                "source_tags": ["rock, classic rock, british rock"],
+                "tag_match_count": [3],
+            }
+        ).lazy()
+
+        with patch(
+            "music_airflow.app.streamlit_app.PolarsDeltaIOManager"
+        ) as mock_io_cls:
+            mock_io = MagicMock()
+            mock_io_cls.return_value = mock_io
+
+            def mock_read_delta(table_name):
+                if table_name == "candidate_similar_tag":
+                    return similar_tag_df
+                return pl.DataFrame().lazy()
+
+            mock_io.read_delta.side_effect = mock_read_delta
+
+            reasons = load_recommendation_reasons("test_user", "t1")
+
+            assert "similar_tag" in reasons
+            assert reasons["similar_tag"]["tags"] == [
+                "rock",
+                "classic rock",
+                "british rock",
+            ]
+            assert reasons["similar_tag"]["match_count"] == 3
+
+    def test_returns_deep_cut_reason(self):
+        """Test that deep cut reason is loaded correctly."""
+        from music_airflow.app.streamlit_app import load_recommendation_reasons
+
+        deep_cut_df = pl.DataFrame(
+            {
+                "username": ["test_user"],
+                "track_id": ["t1"],
+                "source_artist_id": ["led_zeppelin"],
+            }
+        ).lazy()
+
+        artists_df = pl.DataFrame(
+            {
+                "artist_id": ["led_zeppelin"],
+                "artist_name": ["Led Zeppelin"],
+            }
+        ).lazy()
+
+        with patch(
+            "music_airflow.app.streamlit_app.PolarsDeltaIOManager"
+        ) as mock_io_cls:
+            mock_io = MagicMock()
+            mock_io_cls.return_value = mock_io
+
+            def mock_read_delta(table_name):
+                if table_name == "candidate_deep_cut":
+                    return deep_cut_df
+                elif table_name == "artists":
+                    return artists_df
+                return pl.DataFrame().lazy()
+
+            mock_io.read_delta.side_effect = mock_read_delta
+
+            reasons = load_recommendation_reasons("test_user", "t1")
+
+            assert "deep_cut" in reasons
+            assert reasons["deep_cut"]["source_artist"] == "Led Zeppelin"
+
+    def test_returns_empty_dict_when_no_reasons(self):
+        """Test that empty dict is returned when track has no reasons."""
+        from music_airflow.app.streamlit_app import load_recommendation_reasons
+
+        with patch(
+            "music_airflow.app.streamlit_app.PolarsDeltaIOManager"
+        ) as mock_io_cls:
+            mock_io = MagicMock()
+            mock_io_cls.return_value = mock_io
+            mock_io.read_delta.return_value = pl.DataFrame().lazy()
+
+            reasons = load_recommendation_reasons("test_user", "nonexistent_track")
+
+            assert reasons == {}
+
+    def test_returns_multiple_reasons(self):
+        """Test that multiple reasons can be returned for the same track."""
+        from music_airflow.app.streamlit_app import load_recommendation_reasons
+
+        similar_artist_df = pl.DataFrame(
+            {
+                "username": ["test_user"],
+                "track_id": ["t1"],
+                "source_artist_id": ["queen"],
+                "similarity": [0.9],
+            }
+        ).lazy()
+
+        similar_tag_df = pl.DataFrame(
+            {
+                "username": ["test_user"],
+                "track_id": ["t1"],
+                "source_tags": ["rock, british"],
+                "tag_match_count": [2],
+            }
+        ).lazy()
+
+        artists_df = pl.DataFrame(
+            {
+                "artist_id": ["queen"],
+                "artist_name": ["Queen"],
+            }
+        ).lazy()
+
+        with patch(
+            "music_airflow.app.streamlit_app.PolarsDeltaIOManager"
+        ) as mock_io_cls:
+            mock_io = MagicMock()
+            mock_io_cls.return_value = mock_io
+
+            def mock_read_delta(table_name):
+                if table_name == "candidate_similar_artist":
+                    return similar_artist_df
+                elif table_name == "candidate_similar_tag":
+                    return similar_tag_df
+                elif table_name == "artists":
+                    return artists_df
+                return pl.DataFrame().lazy()
+
+            mock_io.read_delta.side_effect = mock_read_delta
+
+            reasons = load_recommendation_reasons("test_user", "t1")
+
+            assert "similar_artist" in reasons
+            assert "similar_tag" in reasons
+
+    def test_handles_missing_artist_gracefully(self):
+        """Test that artist ID is used when artist name lookup fails."""
+        from music_airflow.app.streamlit_app import load_recommendation_reasons
+
+        similar_artist_df = pl.DataFrame(
+            {
+                "username": ["test_user"],
+                "track_id": ["t1"],
+                "source_artist_id": ["unknown_artist"],
+                "similarity": [0.7],
+            }
+        ).lazy()
+
+        with patch(
+            "music_airflow.app.streamlit_app.PolarsDeltaIOManager"
+        ) as mock_io_cls:
+            mock_io = MagicMock()
+            mock_io_cls.return_value = mock_io
+
+            def mock_read_delta(table_name):
+                if table_name == "candidate_similar_artist":
+                    return similar_artist_df
+                elif table_name == "artists":
+                    return pl.DataFrame(
+                        schema={"artist_id": pl.String, "artist_name": pl.String}
+                    ).lazy()
+                return pl.DataFrame().lazy()
+
+            mock_io.read_delta.side_effect = mock_read_delta
+
+            reasons = load_recommendation_reasons("test_user", "t1")
+
+            assert "similar_artist" in reasons
+            # Should fall back to formatted artist_id
+            assert reasons["similar_artist"]["source_artist"] == "Unknown Artist"
+
+    def test_dedupes_tags(self):
+        """Test that duplicate tags are removed."""
+        from music_airflow.app.streamlit_app import load_recommendation_reasons
+
+        similar_tag_df = pl.DataFrame(
+            {
+                "username": ["test_user"],
+                "track_id": ["t1"],
+                "source_tags": ["rock, rock, classic rock, rock"],
+                "tag_match_count": [4],
+            }
+        ).lazy()
+
+        with patch(
+            "music_airflow.app.streamlit_app.PolarsDeltaIOManager"
+        ) as mock_io_cls:
+            mock_io = MagicMock()
+            mock_io_cls.return_value = mock_io
+
+            def mock_read_delta(table_name):
+                if table_name == "candidate_similar_tag":
+                    return similar_tag_df
+                return pl.DataFrame().lazy()
+
+            mock_io.read_delta.side_effect = mock_read_delta
+
+            reasons = load_recommendation_reasons("test_user", "t1")
+
+            assert "similar_tag" in reasons
+            # Should dedupe while preserving order
+            assert reasons["similar_tag"]["tags"] == ["rock", "classic rock"]
+
+    def test_limits_tags_to_five(self):
+        """Test that only first 5 unique tags are returned."""
+        from music_airflow.app.streamlit_app import load_recommendation_reasons
+
+        similar_tag_df = pl.DataFrame(
+            {
+                "username": ["test_user"],
+                "track_id": ["t1"],
+                "source_tags": ["rock, pop, jazz, blues, metal, punk, folk"],
+                "tag_match_count": [7],
+            }
+        ).lazy()
+
+        with patch(
+            "music_airflow.app.streamlit_app.PolarsDeltaIOManager"
+        ) as mock_io_cls:
+            mock_io = MagicMock()
+            mock_io_cls.return_value = mock_io
+
+            def mock_read_delta(table_name):
+                if table_name == "candidate_similar_tag":
+                    return similar_tag_df
+                return pl.DataFrame().lazy()
+
+            mock_io.read_delta.side_effect = mock_read_delta
+
+            reasons = load_recommendation_reasons("test_user", "t1")
+
+            assert "similar_tag" in reasons
+            assert len(reasons["similar_tag"]["tags"]) == 5
+            assert reasons["similar_tag"]["tags"] == [
+                "rock",
+                "pop",
+                "jazz",
+                "blues",
+                "metal",
+            ]

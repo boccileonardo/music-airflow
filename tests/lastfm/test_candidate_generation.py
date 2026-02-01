@@ -97,7 +97,78 @@ def _write_silver_base_tables(patched_delta_io):
 
 class TestSimilarArtistCandidates:
     @pytest.mark.asyncio
-    async def test_generates_and_filters(self, test_data_dir, patched_delta_io):
+    async def test_cleanup_removes_played_candidates(
+        self, test_data_dir, patched_delta_io
+    ):
+        """Test that candidates are removed from silver table after being played."""
+        _write_silver_base_tables(patched_delta_io)
+
+        # Pre-populate candidate table with a track that will be "played"
+        existing_candidates = pl.DataFrame(
+            {
+                "username": ["user1", "user1"],
+                "track_id": ["played track|artist x", "unplayed track|artist y"],
+                "track_name": ["Played Track", "Unplayed Track"],
+                "artist_name": ["Artist X", "Artist Y"],
+                "similarity": [0.8, 0.7],
+                "score": [100.0, 90.0],
+                "source_artist_id": ["x1", "y1"],
+            }
+        )
+        patched_delta_io("silver").write_delta(
+            existing_candidates,
+            table_name="candidate_similar_artist",
+            mode="overwrite",
+        )
+
+        # Update plays to include the "played" track
+        plays_df = pl.DataFrame(
+            {
+                "username": ["user1", "user1"],
+                "track_id": ["known|artist a", "played track|artist x"],
+            }
+        )
+        patched_delta_io("silver").write_delta(
+            plays_df, table_name="plays", mode="overwrite"
+        )
+
+        with (
+            patch(
+                "music_airflow.transform.candidate_generation.LastFMClient"
+            ) as MockClient,
+            patch(
+                "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
+            ) as MockDeltaIO,
+        ):
+            from unittest.mock import AsyncMock
+
+            client = MockClient.return_value
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
+            # Return empty results - no new candidates
+            client.get_similar_artists = AsyncMock(return_value=[])
+            client.get_artist_top_tracks = AsyncMock(return_value=[])
+
+            MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
+                medallion_layer
+            )
+
+            await generate_similar_artist_candidates(
+                username="user1",
+                artist_sample_rate=1.0,
+            )
+
+        # Check that played track was removed from candidates
+        df = pl.read_delta(str(test_data_dir / "silver" / "candidate_similar_artist"))
+        remaining_tracks = df["track_id"].to_list()
+        assert "played track|artist x" not in remaining_tracks
+        assert "unplayed track|artist y" in remaining_tracks
+
+    @pytest.mark.asyncio
+    async def test_generates_and_filters_original(
+        self, test_data_dir, patched_delta_io
+    ):
+        """Test that candidate generation correctly filters existing plays and low-listener tracks."""
         _write_silver_base_tables(patched_delta_io)
 
         with (

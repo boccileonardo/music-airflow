@@ -266,6 +266,27 @@ class TestExtractTracksToBronze:
                 },
             ]
         )
+        # Mock search_track to return popular versions (used for streaming link lookup)
+        mock_client.search_track = AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "name": "Track A",
+                        "artist": "Artist X",
+                        "url": "url1",
+                        "listeners": "5000",
+                    }
+                ],
+                [
+                    {
+                        "name": "Track B",
+                        "artist": "Artist Y",
+                        "url": "url2",
+                        "listeners": "3000",
+                    }
+                ],
+            ]
+        )
         mock_client_class.return_value = mock_client
 
         # Mock JSON IO
