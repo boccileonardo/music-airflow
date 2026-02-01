@@ -485,7 +485,7 @@ class TestTransformTracksToSilver:
             json_mgr.base_dir = test_data_dir / "bronze"
 
             delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-            delta_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr.base_uri = str(test_data_dir / "silver")
 
             mock_json_io.return_value = json_mgr
             mock_delta_io.return_value = delta_mgr
@@ -552,7 +552,7 @@ class TestTransformArtistsToSilver:
             json_mgr.base_dir = test_data_dir / "bronze"
 
             delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-            delta_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr.base_uri = str(test_data_dir / "silver")
 
             mock_json_io.return_value = json_mgr
             mock_delta_io.return_value = delta_mgr

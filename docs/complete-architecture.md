@@ -117,8 +117,9 @@ graph LR
 - Discovers new tracks from candidates
 - Fetches metadata from Last.fm API
 - Searches for "popular version" via `track.search` (most listeners) for reliable streaming links
-- Scrapes popular version's Last.fm page for YouTube/Spotify URLs
-- Falls back to YouTube Music search for tracks still missing YouTube URLs
+- Uses YouTube Music API to find audio-only versions (faster, avoids music videos)
+- Falls back to scraping Last.fm page for missing YouTube URLs
+- Scrapes Last.fm page for Spotify URLs
 - Computes user profiles with half-life values from plays data
 - Single-cycle enrichment: New tracks discovered by candidates are enriched in the same daily run
 
@@ -227,13 +228,15 @@ This ensures consistent joins across track name variations (e.g., "Song" matches
 
 Track metadata includes streaming links for playlist generation and playback:
 
-**YouTube URL Resolution** (multi-step fallback):
+**YouTube URL Resolution** (multi-step with YTMusic primary):
 
 1. **Popular Version Search**: Use Last.fm `track.search` to find the canonical version with most listeners (avoids obscure remasters with no links)
-2. **Last.fm Scraping**: Scrape the popular version's Last.fm page for embedded YouTube URL
-3. **YouTube Music Fallback**: If scraping fails, search YouTube Music API for audio-only version (prefers songs over music videos)
+2. **YouTube Music API (Primary)**: Search YouTube Music for audio-only version using ytmusicapi (faster than scraping, filters songs over music videos)
+3. **Last.fm Scraping (Fallback)**: If YTMusic fails, scrape the popular version's Last.fm page for embedded YouTube URL
 
-This approach ensures high YouTube URL coverage (~95%+) while preferring audio versions over music videos.
+This approach ensures high YouTube URL coverage (~95%+) while preferring audio versions over music videos. YTMusic is primary because:
+- It's faster than HTTP scraping
+- It filters for audio-only content, avoiding music videos
 
 **Spotify URL**: Scraped from Last.fm track pages when available.
 

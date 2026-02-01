@@ -19,6 +19,9 @@ from music_airflow.utils.lastfm_scraper import LastFMScraper
 from music_airflow.utils.text_normalization import normalize_text
 from music_airflow.utils.ytmusic_search import search_youtube_url
 import polars as pl
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 async def extract_tracks_to_bronze() -> dict[str, Any]:
@@ -100,7 +103,7 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
     if track_count == 0:
         raise AirflowSkipException("No new tracks to fetch")
 
-    print(f"Fetching metadata for {track_count} new tracks...")
+    logger.info(f"Fetching metadata for {track_count} new tracks...")
 
     # Fetch metadata for new tracks and search for popular versions
     async with LastFMClient() as client:
@@ -113,21 +116,21 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
             for idx in range(track_count)
         ]
 
-        print(f"Fetching info for {track_count} tracks concurrently...")
+        logger.info(f"Fetching info for {track_count} tracks concurrently...")
         all_track_info = await asyncio.gather(*track_tasks, return_exceptions=True)
 
         # Process results
         tracks_data = []
         for idx, track_info in enumerate(all_track_info):
             if isinstance(track_info, Exception):
-                print(
+                logger.info(
                     f"Failed to fetch {track_names[idx]} by {artist_names[idx]}: {track_info}"
                 )
                 continue
 
             # Type guard: track_info is dict[str, Any] here
             if not isinstance(track_info, dict):
-                print(
+                logger.info(
                     f"Unexpected type for track {track_names[idx]}: {type(track_info)}"
                 )
                 continue
@@ -135,13 +138,13 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
             try:
                 tracks_data.append(track_info)
             except (ValueError, KeyError) as e:
-                print(
+                logger.info(
                     f"Failed to process {track_names[idx]} by {artist_names[idx]}: {e}"
                 )
                 continue
 
         success_count = len(tracks_data)
-        print(f"Successfully fetched {success_count}/{track_count} tracks")
+        logger.info(f"Successfully fetched {success_count}/{track_count} tracks")
 
         if not tracks_data:
             raise AirflowSkipException(
@@ -151,7 +154,7 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
         # Find the most popular version of each track for streaming links
         # The track from get_track_info may be an obscure remaster with no YouTube link
         # We search using NORMALIZED names to find the canonical version (most listeners)
-        print(f"Finding popular versions for {len(tracks_data)} tracks...")
+        logger.info(f"Finding popular versions for {len(tracks_data)} tracks...")
 
         search_tasks = [
             client.search_track(
@@ -163,75 +166,82 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
         ]
         search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
 
-    # Build mapping from original track to popular version URL
+    # Build mapping from original track to popular version URL (used for Last.fm fallback)
     popular_urls: list[str] = []
     for idx, result in enumerate(search_results):
         original_url = tracks_data[idx].get("url", "")
         if isinstance(result, Exception) or not result:
-            # Fall back to original URL
             popular_urls.append(original_url)
         elif isinstance(result, list) and len(result) > 0:
-            # Use the most popular version's URL
             popular_urls.append(result[0].get("url", original_url))
         else:
             popular_urls.append(original_url)
 
-    # Enrich with streaming links from the popular version's Last.fm page
-    print(f"Fetching streaming links for {len(tracks_data)} tracks...")
+    # Primary: Use YTMusic search for YouTube URLs (faster than scraping, better audio results)
+    # YTMusic filters for audio-only versions, avoiding music videos
+    logger.info(f"Searching YTMusic for {len(tracks_data)} tracks...")
+    ytmusic_found = 0
+    for idx, track in enumerate(tracks_data):
+        track_name = normalize_text(track.get("name", ""))
+        artist_name = normalize_text(track.get("artist", {}).get("name", ""))
+        if track_name and artist_name:
+            youtube_url = search_youtube_url(track_name, artist_name)
+            if youtube_url:
+                track["youtube_url"] = youtube_url
+                ytmusic_found += 1
+            else:
+                track["youtube_url"] = None
+        else:
+            track["youtube_url"] = None
+        track["spotify_url"] = None  # Will be populated from Last.fm scraping below
+    logger.info(f"Found {ytmusic_found}/{len(tracks_data)} tracks via YTMusic search")
+
+    # Fallback: Scrape Last.fm pages for tracks missing YouTube URLs + get Spotify URLs
+    # Last.fm pages sometimes have music video links, so we only use as fallback for YouTube
+    missing_youtube = [
+        (idx, t) for idx, t in enumerate(tracks_data) if not t.get("youtube_url")
+    ]
     valid_urls = [url for url in popular_urls if url]
 
+    logger.info(
+        f"Scraping Last.fm for {len(valid_urls)} tracks (Spotify + {len(missing_youtube)} missing YouTube)..."
+    )
     async with LastFMScraper() as scraper:
         streaming_links_list = await scraper.get_streaming_links_batch(valid_urls)
 
-    # Build mapping from URL to streaming links
     streaming_links = dict(zip(valid_urls, streaming_links_list))
 
-    # Merge streaming links into track data using popular version URLs
+    # Merge Last.fm streaming links: Spotify always, YouTube only if missing
+    lastfm_youtube_found = 0
+    spotify_found = 0
     for idx, track in enumerate(tracks_data):
         popular_url = popular_urls[idx]
         if popular_url and popular_url in streaming_links:
             links = streaming_links[popular_url]
-            track["youtube_url"] = links.get("youtube_url")
-            track["spotify_url"] = links.get("spotify_url")
-        else:
-            track["youtube_url"] = None
-            track["spotify_url"] = None
+            # Always take Spotify URL from Last.fm
+            if links.get("spotify_url"):
+                track["spotify_url"] = links["spotify_url"]
+                spotify_found += 1
+            # Only take YouTube URL if YTMusic didn't find one
+            if not track.get("youtube_url") and links.get("youtube_url"):
+                track["youtube_url"] = links["youtube_url"]
+                lastfm_youtube_found += 1
 
-    enriched_count = sum(
-        1 for t in tracks_data if t.get("youtube_url") or t.get("spotify_url")
+    logger.info(
+        f"Last.fm scraping: {spotify_found} Spotify URLs, {lastfm_youtube_found} YouTube fallbacks"
     )
-    print(f"Enriched {enriched_count}/{len(tracks_data)} tracks with streaming links")
-
-    # Fallback: Use YTMusic search for tracks without YouTube URLs
-    # Use NORMALIZED names to find canonical versions, not obscure remasters
-    missing_youtube = [
-        (idx, t) for idx, t in enumerate(tracks_data) if not t.get("youtube_url")
-    ]
-    if missing_youtube:
-        print(
-            f"Searching YTMusic for {len(missing_youtube)} tracks without YouTube URLs..."
-        )
-        ytmusic_found = 0
-        for idx, track in missing_youtube:
-            track_name = normalize_text(track.get("name", ""))
-            artist_name = normalize_text(track.get("artist", {}).get("name", ""))
-            if track_name and artist_name:
-                youtube_url = search_youtube_url(track_name, artist_name)
-                if youtube_url:
-                    track["youtube_url"] = youtube_url
-                    ytmusic_found += 1
-        print(f"Found {ytmusic_found}/{len(missing_youtube)} tracks via YTMusic search")
 
     final_youtube_count = sum(1 for t in tracks_data if t.get("youtube_url"))
-    print(f"Final YouTube coverage: {final_youtube_count}/{len(tracks_data)} tracks")
+    final_spotify_count = sum(1 for t in tracks_data if t.get("spotify_url"))
+    logger.info(
+        f"Final coverage: {final_youtube_count}/{len(tracks_data)} YouTube, {final_spotify_count}/{len(tracks_data)} Spotify"
+    )
 
     # Save to bronze as JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"tracks_{timestamp}.json"
 
     io_manager = JSONIOManager(medallion_layer="bronze")
-    tracks_path = io_manager.base_dir / "tracks"
-    tracks_path.mkdir(parents=True, exist_ok=True)
     metadata = io_manager.write_json(tracks_data, f"tracks/{filename}")
 
     return {
@@ -293,7 +303,7 @@ async def extract_artists_to_bronze() -> dict[str, Any]:
     if artist_count == 0:
         raise AirflowSkipException("No new artists to fetch")
 
-    print(f"Fetching metadata for {artist_count} new artists...")
+    logger.info(f"Fetching metadata for {artist_count} new artists...")
 
     # Fetch metadata for new artists
     async with LastFMClient() as client:
@@ -303,24 +313,26 @@ async def extract_artists_to_bronze() -> dict[str, Any]:
             for idx in range(artist_count)
         ]
 
-        print(f"Fetching info for {artist_count} artists concurrently...")
+        logger.info(f"Fetching info for {artist_count} artists concurrently...")
         all_artist_info = await asyncio.gather(*artist_tasks, return_exceptions=True)
 
         # Process results
         artists_data = []
         for idx, artist_info in enumerate(all_artist_info):
             if isinstance(artist_info, Exception):
-                print(f"Failed to fetch artist {artist_names[idx]}: {artist_info}")
+                logger.info(
+                    f"Failed to fetch artist {artist_names[idx]}: {artist_info}"
+                )
                 continue
 
             try:
                 artists_data.append(artist_info)
             except (ValueError, KeyError) as e:
-                print(f"Failed to process artist {artist_names[idx]}: {e}")
+                logger.info(f"Failed to process artist {artist_names[idx]}: {e}")
                 continue
 
     success_count = len(artists_data)
-    print(f"Successfully fetched {success_count}/{artist_count} artists")
+    logger.info(f"Successfully fetched {success_count}/{artist_count} artists")
 
     if not artists_data:
         raise AirflowSkipException(
@@ -332,8 +344,6 @@ async def extract_artists_to_bronze() -> dict[str, Any]:
     filename = f"artists_{timestamp}.json"
 
     io_manager = JSONIOManager(medallion_layer="bronze")
-    artists_path = io_manager.base_dir / "artists"
-    artists_path.mkdir(parents=True, exist_ok=True)
     metadata = io_manager.write_json(artists_data, f"artists/{filename}")
 
     return {

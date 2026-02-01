@@ -1,0 +1,4 @@
+- unit tests for streamlit app
+- auth to spotify via spotipy for song search and spoti playlist creation
+- multi-user support
+- cloud hosting

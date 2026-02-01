@@ -54,9 +54,10 @@ def candidate_generation():
         Returns:
             List of usernames
         """
-        import polars as pl
+        from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
-        plays_lf = pl.scan_delta("data/silver/plays")
+        silver_io = PolarsDeltaIOManager(medallion_layer="silver")
+        plays_lf = silver_io.read_delta("plays")
         users = plays_lf.select("username").unique().collect(engine="streaming")
         return users["username"].to_list()
 

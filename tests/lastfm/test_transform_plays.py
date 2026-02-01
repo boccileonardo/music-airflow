@@ -197,7 +197,9 @@ class TestTransformPlaysRawToStructuredIntegration:
             json_mgr.base_dir = test_data_dir / "bronze"
 
             delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-            delta_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr.base_uri = str(test_data_dir / "silver")
+            delta_mgr.is_cloud = False
+            delta_mgr.storage_options = None
 
             mock_json_io.return_value = json_mgr
             mock_delta_io.return_value = delta_mgr
@@ -323,7 +325,9 @@ class TestTransformPlaysRawToStructuredIntegration:
             json_mgr.base_dir = test_data_dir / "bronze"
 
             delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-            delta_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr.base_uri = str(test_data_dir / "silver")
+            delta_mgr.is_cloud = False
+            delta_mgr.storage_options = None
 
             mock_json_io.return_value = json_mgr
             mock_delta_io.return_value = delta_mgr
@@ -399,7 +403,9 @@ class TestTransformPlaysRawToStructuredIntegration:
             json_mgr.base_dir = test_data_dir / "bronze"
 
             delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-            delta_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr.base_uri = str(test_data_dir / "silver")
+            delta_mgr.is_cloud = False
+            delta_mgr.storage_options = None
 
             mock_json_io.return_value = json_mgr
             mock_delta_io.return_value = delta_mgr
@@ -425,7 +431,7 @@ class TestDeltaMergeMetrics:
         from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
         delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-        delta_mgr.base_dir = test_data_dir / "silver"
+        delta_mgr.base_uri = str(test_data_dir / "silver")
 
         # Initial data
         df1 = pl.DataFrame(
@@ -487,7 +493,7 @@ class TestDeltaMergeMetrics:
         from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
         delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-        delta_mgr.base_dir = test_data_dir / "silver"
+        delta_mgr.base_uri = str(test_data_dir / "silver")
 
         # Create data for multiple users (partitions)
         df1 = pl.DataFrame(
@@ -595,7 +601,9 @@ class TestDeltaMergeMetrics:
             json_mgr.base_dir = test_data_dir / "bronze"
 
             delta_mgr = PolarsDeltaIOManager(medallion_layer="silver")
-            delta_mgr.base_dir = test_data_dir / "silver"
+            delta_mgr.base_uri = str(test_data_dir / "silver")
+            delta_mgr.is_cloud = False
+            delta_mgr.storage_options = None
 
             mock_json_io.return_value = json_mgr
             mock_delta_io.return_value = delta_mgr
