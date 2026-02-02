@@ -36,6 +36,148 @@ logging.basicConfig(
 INTERNAL_LIMIT = 300
 
 
+def get_cached_excluded_tracks(username: str) -> pl.DataFrame:
+    """Get excluded tracks from session_state cache or load from storage.
+
+    Uses local-first approach: changes are reflected instantly in session_state
+    and persisted to storage in background. The session_state is the source of truth
+    during the session.
+    """
+    cache_key = f"excluded_tracks_{username}"
+    if cache_key not in st.session_state:
+        try:
+            st.session_state[cache_key] = read_excluded_tracks(username).collect()
+        except Exception:
+            st.session_state[cache_key] = pl.DataFrame(
+                schema={
+                    "username": pl.String,
+                    "track_id": pl.String,
+                    "track_name": pl.String,
+                    "artist_name": pl.String,
+                    "excluded_at": pl.Datetime(time_zone="UTC"),
+                }
+            )
+    return st.session_state[cache_key]
+
+
+def get_cached_excluded_artists(username: str) -> pl.DataFrame:
+    """Get excluded artists from session_state cache or load from storage.
+
+    Uses local-first approach: changes are reflected instantly in session_state
+    and persisted to storage in background. The session_state is the source of truth
+    during the session.
+    """
+    cache_key = f"excluded_artists_{username}"
+    if cache_key not in st.session_state:
+        try:
+            st.session_state[cache_key] = read_excluded_artists(username).collect()
+        except Exception:
+            st.session_state[cache_key] = pl.DataFrame(
+                schema={
+                    "username": pl.String,
+                    "artist_name": pl.String,
+                    "excluded_at": pl.Datetime(time_zone="UTC"),
+                }
+            )
+    return st.session_state[cache_key]
+
+
+def add_excluded_track_local(
+    username: str, track_id: str, track_name: str, artist_name: str
+) -> None:
+    """Add an excluded track to the local cache and persist to storage.
+
+    Updates session_state immediately for instant UI feedback,
+    then writes to storage in the background.
+    """
+    import datetime as dt
+
+    cache_key = f"excluded_tracks_{username}"
+    current = get_cached_excluded_tracks(username)
+
+    # Add new row to local cache
+    new_row = pl.DataFrame(
+        {
+            "username": [username],
+            "track_id": [track_id],
+            "track_name": [track_name],
+            "artist_name": [artist_name],
+            "excluded_at": [dt.datetime.now(tz=dt.timezone.utc)],
+        }
+    )
+    st.session_state[cache_key] = pl.concat([current, new_row]).unique(
+        subset=["username", "track_id"]
+    )
+
+    # Persist to storage (fire-and-forget style)
+    write_excluded_track(username, track_id, track_name, artist_name)
+
+
+def remove_excluded_track_local(
+    username: str, track_id: str, track_name: str, artist_name: str
+) -> None:
+    """Remove an excluded track from local cache and storage.
+
+    Updates session_state immediately for instant UI feedback,
+    then writes to storage.
+    """
+    cache_key = f"excluded_tracks_{username}"
+    current = get_cached_excluded_tracks(username)
+
+    # Remove from local cache
+    st.session_state[cache_key] = current.filter(
+        ~((pl.col("username") == username) & (pl.col("track_id") == track_id))
+    )
+
+    # Persist to storage
+    remove_excluded_track(username, track_id, track_name, artist_name)
+
+
+def add_excluded_artist_local(username: str, artist_name: str) -> None:
+    """Add an excluded artist to the local cache and persist to storage.
+
+    Updates session_state immediately for instant UI feedback,
+    then writes to storage.
+    """
+    import datetime as dt
+
+    cache_key = f"excluded_artists_{username}"
+    current = get_cached_excluded_artists(username)
+
+    # Add new row to local cache
+    new_row = pl.DataFrame(
+        {
+            "username": [username],
+            "artist_name": [artist_name],
+            "excluded_at": [dt.datetime.now(tz=dt.timezone.utc)],
+        }
+    )
+    st.session_state[cache_key] = pl.concat([current, new_row]).unique(
+        subset=["username", "artist_name"]
+    )
+
+    # Persist to storage
+    write_excluded_artist(username, artist_name)
+
+
+def remove_excluded_artist_local(username: str, artist_name: str) -> None:
+    """Remove an excluded artist from local cache and storage.
+
+    Updates session_state immediately for instant UI feedback,
+    then writes to storage.
+    """
+    cache_key = f"excluded_artists_{username}"
+    current = get_cached_excluded_artists(username)
+
+    # Remove from local cache
+    st.session_state[cache_key] = current.filter(
+        ~((pl.col("username") == username) & (pl.col("artist_name") == artist_name))
+    )
+
+    # Persist to storage
+    remove_excluded_artist(username, artist_name)
+
+
 @st.cache_data(ttl=300)  # 5 minutes
 def load_track_candidates_cached(username: str) -> pl.DataFrame:
     """Load and cache track candidates from gold table."""
@@ -103,95 +245,40 @@ def load_top_artists(username: str, limit: int = 10) -> pl.DataFrame:
         return pl.DataFrame(schema={"artist_name": pl.String, "play_count": pl.Int64})
 
 
-def load_recommendation_reasons(username: str, track_id: str) -> dict:
-    """Load the 'why' data for a recommendation from silver candidate tables.
+def load_recommendation_reasons(track_row: dict) -> dict:
+    """Extract 'why' data from baked-in columns in gold table.
 
-    Returns a dict with keys: similar_artist, similar_tag, deep_cut, each containing
-    the source information if available.
+    The gold table now includes pre-computed "why" columns:
+    - why_similar_artist_name, why_similar_artist_pct
+    - why_similar_tags, why_tag_match_count
+    - why_deep_cut_artist
+
+    Returns a dict with keys: similar_artist, similar_tag, deep_cut,
+    each containing the source information if available.
     """
-    silver_io = PolarsDeltaIOManager("silver")
     reasons = {}
 
     # Check similar artist source
-    try:
-        similar_artist_df = (
-            silver_io.read_delta("candidate_similar_artist")
-            .filter((pl.col("username") == username) & (pl.col("track_id") == track_id))
-            .collect()
-        )
-        if len(similar_artist_df) > 0:
-            source_artist_id = similar_artist_df["source_artist_id"][0]
-            similarity = similar_artist_df["similarity"][0]
-            # Look up artist name from the artists dimension
-            try:
-                artists_df = (
-                    silver_io.read_delta("artists")
-                    .filter(pl.col("artist_id") == source_artist_id)
-                    .select("artist_name")
-                    .collect()
-                )
-                if len(artists_df) > 0:
-                    source_artist_name = artists_df["artist_name"][0]
-                else:
-                    source_artist_name = source_artist_id.replace("_", " ").title()
-            except Exception:
-                source_artist_name = source_artist_id.replace("_", " ").title()
-
-            reasons["similar_artist"] = {
-                "source_artist": source_artist_name,
-                "similarity": round(similarity * 100, 1),
-            }
-    except Exception:
-        pass
+    if track_row.get("why_similar_artist_name"):
+        reasons["similar_artist"] = {
+            "source_artist": track_row["why_similar_artist_name"],
+            "similarity": track_row.get("why_similar_artist_pct", 0),
+        }
 
     # Check similar tag source
-    try:
-        similar_tag_df = (
-            silver_io.read_delta("candidate_similar_tag")
-            .filter((pl.col("username") == username) & (pl.col("track_id") == track_id))
-            .collect()
-        )
-        if len(similar_tag_df) > 0:
-            source_tags = similar_tag_df["source_tags"][0]
-            tag_match_count = similar_tag_df["tag_match_count"][0]
-            # Parse and dedupe tags
-            tags = list(dict.fromkeys(t.strip() for t in source_tags.split(",")))[:5]
-            reasons["similar_tag"] = {
-                "tags": tags,
-                "match_count": tag_match_count,
-            }
-    except Exception:
-        pass
+    if track_row.get("why_similar_tags"):
+        source_tags = track_row["why_similar_tags"]
+        tags = list(dict.fromkeys(t.strip() for t in source_tags.split(",")))[:5]
+        reasons["similar_tag"] = {
+            "tags": tags,
+            "match_count": track_row.get("why_tag_match_count", 0),
+        }
 
     # Check deep cut source
-    try:
-        deep_cut_df = (
-            silver_io.read_delta("candidate_deep_cut")
-            .filter((pl.col("username") == username) & (pl.col("track_id") == track_id))
-            .collect()
-        )
-        if len(deep_cut_df) > 0:
-            source_artist_id = deep_cut_df["source_artist_id"][0]
-            # Look up artist name
-            try:
-                artists_df = (
-                    silver_io.read_delta("artists")
-                    .filter(pl.col("artist_id") == source_artist_id)
-                    .select("artist_name")
-                    .collect()
-                )
-                if len(artists_df) > 0:
-                    source_artist_name = artists_df["artist_name"][0]
-                else:
-                    source_artist_name = source_artist_id.replace("_", " ").title()
-            except Exception:
-                source_artist_name = source_artist_id.replace("_", " ").title()
-
-            reasons["deep_cut"] = {
-                "source_artist": source_artist_name,
-            }
-    except Exception:
-        pass
+    if track_row.get("why_deep_cut_artist"):
+        reasons["deep_cut"] = {
+            "source_artist": track_row["why_deep_cut_artist"],
+        }
 
     return reasons
 
@@ -373,9 +460,9 @@ def main():
             # Load candidates
             candidates = load_track_candidates(username)
 
-            # Load exclusions for this user
-            excluded_tracks = read_excluded_tracks(username)
-            excluded_artists = read_excluded_artists(username)
+            # Load exclusions for this user (cached in session_state)
+            excluded_tracks = get_cached_excluded_tracks(username).lazy()
+            excluded_artists = get_cached_excluded_artists(username).lazy()
 
             # Filter based on settings
             candidates = filter_candidates(
@@ -516,422 +603,395 @@ def main():
             },
         )
 
-        # Why this recommendation - track details
+        # Why this recommendation - track details (uses baked-in data, no extra queries)
         with st.expander("❓ Why was this recommended?", expanded=False):
-            with st.spinner("Loading recommendation details..."):
-                # Build track options for dropdown
-                track_options = {
-                    f"{row['track_name']} - {row['artist_name']}": row
-                    for row in recommendations.select(
-                        [
-                            "track_id",
-                            "track_name",
-                            "artist_name",
-                            "similar_artist",
-                            "similar_tag",
-                            "deep_cut_same_artist",
-                            "old_favorite",
-                        ]
-                    ).to_dicts()
-                }
+            # Build track options for dropdown - include all "why" columns
+            why_columns = [
+                "track_id",
+                "track_name",
+                "artist_name",
+                "similar_artist",
+                "similar_tag",
+                "deep_cut_same_artist",
+                "old_favorite",
+                "why_similar_artist_name",
+                "why_similar_artist_pct",
+                "why_similar_tags",
+                "why_tag_match_count",
+                "why_deep_cut_artist",
+            ]
+            # Filter to columns that exist in the DataFrame
+            available_columns = [c for c in why_columns if c in recommendations.columns]
+            track_options = {
+                f"{row['track_name']} - {row['artist_name']}": row
+                for row in recommendations.select(available_columns).to_dicts()
+            }
 
-                selected_track_display = st.selectbox(
-                    "Select a track to see why it was recommended",
-                    options=list(track_options.keys()),
-                    key="track_detail_select",
-                    label_visibility="collapsed",
-                )
+            selected_track_display = st.selectbox(
+                "Select a track to see why it was recommended",
+                options=list(track_options.keys()),
+                key="track_detail_select",
+                label_visibility="collapsed",
+            )
 
-                if selected_track_display:
-                    track_info = track_options[selected_track_display]
-                    track_id = track_info["track_id"]
+            if selected_track_display:
+                track_info = track_options[selected_track_display]
 
-                    st.markdown(f"### {track_info['track_name']}")
-                    st.caption(f"by {track_info['artist_name']}")
+                st.markdown(f"### {track_info['track_name']}")
+                st.caption(f"by {track_info['artist_name']}")
 
-                    # Load reasons from silver tables
-                    reasons = load_recommendation_reasons(username, track_id)
+                # Load reasons from baked-in columns (instant, no network call)
+                reasons = load_recommendation_reasons(track_info)
 
-                    # Display reasons based on which flags are true
-                    has_reasons = False
+                # Display reasons based on which flags are true
+                has_reasons = False
 
-                    if track_info["old_favorite"]:
-                        has_reasons = True
-                        st.info(
-                            "🔄 **Old Favorite** — You've played this before but not recently. Time to revisit!"
-                        )
+                if track_info.get("old_favorite"):
+                    has_reasons = True
+                    st.info(
+                        "🔄 **Old Favorite** — You've played this before but not recently. Time to revisit!"
+                    )
 
-                    if track_info["similar_artist"] and "similar_artist" in reasons:
-                        has_reasons = True
-                        r = reasons["similar_artist"]
-                        st.success(
-                            f"👥 **Similar Artist** — Recommended because you listen to **{r['source_artist']}** "
-                            f"({r['similarity']}% similarity)"
-                        )
+                if track_info.get("similar_artist") and "similar_artist" in reasons:
+                    has_reasons = True
+                    r = reasons["similar_artist"]
+                    st.success(
+                        f"👥 **Similar Artist** — Recommended because you listen to **{r['source_artist']}** "
+                        f"({r['similarity']}% similarity)"
+                    )
 
-                    if track_info["similar_tag"] and "similar_tag" in reasons:
-                        has_reasons = True
-                        r = reasons["similar_tag"]
-                        tags_str = ", ".join(f"*{t}*" for t in r["tags"])
-                        st.success(
-                            f"🏷️ **Similar Tags** — Matches {r['match_count']} of your favorite tags: {tags_str}"
-                        )
+                if track_info.get("similar_tag") and "similar_tag" in reasons:
+                    has_reasons = True
+                    r = reasons["similar_tag"]
+                    tags_str = ", ".join(f"*{t}*" for t in r["tags"])
+                    st.success(
+                        f"🏷️ **Similar Tags** — Matches {r['match_count']} of your favorite tags: {tags_str}"
+                    )
 
-                    if track_info["deep_cut_same_artist"] and "deep_cut" in reasons:
-                        has_reasons = True
-                        r = reasons["deep_cut"]
-                        st.success(
-                            f"💎 **Deep Cut** — A lesser-known track from **{r['source_artist']}**, one of your favorites"
-                        )
+                if track_info.get("deep_cut_same_artist") and "deep_cut" in reasons:
+                    has_reasons = True
+                    r = reasons["deep_cut"]
+                    st.success(
+                        f"💎 **Deep Cut** — A lesser-known track from **{r['source_artist']}**, one of your favorites"
+                    )
 
-                    if not has_reasons:
-                        st.caption(
-                            "Recommendation details not available for this track."
-                        )
+                if not has_reasons:
+                    st.caption("Recommendation details not available for this track.")
 
         # Exclusion Management - Simplified with tabs
         with st.expander("🚫 Manage Exclusions", expanded=False):
-            with st.spinner("Loading exclusions..."):
-                # Load current exclusions
-                excluded_tracks_df = read_excluded_tracks(username)
-                excluded_artists_df = read_excluded_artists(username)
+            # Load current exclusions (cached in session_state - instant)
+            excluded_tracks_collected = get_cached_excluded_tracks(username)
+            excluded_artists_collected = get_cached_excluded_artists(username)
+            n_excluded_tracks = len(excluded_tracks_collected)
+            n_excluded_artists = len(excluded_artists_collected)
 
-                try:
-                    excluded_tracks_collected = excluded_tracks_df.collect()
-                    n_excluded_tracks = len(excluded_tracks_collected)
-                except Exception:
-                    excluded_tracks_collected = pl.DataFrame()
-                    n_excluded_tracks = 0
+            tab_tracks, tab_artists = st.tabs(
+                [
+                    f"🎵 Tracks ({n_excluded_tracks})",
+                    f"🎤 Artists ({n_excluded_artists})",
+                ]
+            )
 
-                try:
-                    excluded_artists_collected = excluded_artists_df.collect()
-                    n_excluded_artists = len(excluded_artists_collected)
-                except Exception:
-                    excluded_artists_collected = pl.DataFrame()
-                    n_excluded_artists = 0
+            with tab_tracks:
+                # Get current track IDs for dropdown
+                current_tracks = recommendations.select(
+                    ["track_id", "track_name", "artist_name"]
+                ).to_dicts()
+                track_options = {
+                    f"{t['track_name']} - {t['artist_name']}": t for t in current_tracks
+                }
 
-                tab_tracks, tab_artists = st.tabs(
-                    [
-                        f"🎵 Tracks ({n_excluded_tracks})",
-                        f"🎤 Artists ({n_excluded_artists})",
-                    ]
-                )
+                if len(track_options) > 0:
+                    selected_track_display = st.selectbox(
+                        "Exclude a track from recommendations",
+                        options=list(track_options.keys()),
+                        key="track_to_remove",
+                    )
 
-                with tab_tracks:
-                    # Get current track IDs for dropdown
-                    current_tracks = recommendations.select(
-                        ["track_id", "track_name", "artist_name"]
-                    ).to_dicts()
-                    track_options = {
-                        f"{t['track_name']} - {t['artist_name']}": t
-                        for t in current_tracks
-                    }
+                    if st.button(
+                        "🗑️ Exclude Track", type="secondary", key="exclude_track_btn"
+                    ):
+                        selected_track = track_options[selected_track_display]
+                        track_id = selected_track["track_id"]
 
-                    if len(track_options) > 0:
-                        selected_track_display = st.selectbox(
-                            "Exclude a track from recommendations",
-                            options=list(track_options.keys()),
-                            key="track_to_remove",
-                        )
+                        try:
+                            # Update local cache immediately, persist to storage in background
+                            add_excluded_track_local(
+                                username=st.session_state.username,
+                                track_id=track_id,
+                                track_name=selected_track["track_name"],
+                                artist_name=selected_track["artist_name"],
+                            )
 
-                        if st.button(
-                            "🗑️ Exclude Track", type="secondary", key="exclude_track_btn"
-                        ):
-                            selected_track = track_options[selected_track_display]
-                            track_id = selected_track["track_id"]
+                            excluded_key = (
+                                selected_track["track_name"],
+                                selected_track["artist_name"],
+                            )
+                            if "excluded_in_session" not in st.session_state:
+                                st.session_state.excluded_in_session = set()
+                            st.session_state.excluded_in_session.add(excluded_key)
 
-                            try:
-                                write_excluded_track(
-                                    username=st.session_state.username,
-                                    track_id=track_id,
-                                    track_name=selected_track["track_name"],
-                                    artist_name=selected_track["artist_name"],
+                            st.session_state.recommendations = recommendations.filter(
+                                (pl.col("track_name") != selected_track["track_name"])
+                                | (
+                                    pl.col("artist_name")
+                                    != selected_track["artist_name"]
                                 )
+                            )
 
-                                excluded_key = (
-                                    selected_track["track_name"],
-                                    selected_track["artist_name"],
-                                )
-                                if "excluded_in_session" not in st.session_state:
-                                    st.session_state.excluded_in_session = set()
-                                st.session_state.excluded_in_session.add(excluded_key)
-
-                                st.session_state.recommendations = (
-                                    recommendations.filter(
-                                        (
-                                            pl.col("track_name")
-                                            != selected_track["track_name"]
-                                        )
-                                        | (
-                                            pl.col("artist_name")
-                                            != selected_track["artist_name"]
-                                        )
+                            # Find replacement from candidate pool
+                            if "candidate_pool" in st.session_state:
+                                displayed_tracks = set(
+                                    zip(
+                                        recommendations.select("track_name")
+                                        .to_series()
+                                        .to_list(),
+                                        recommendations.select("artist_name")
+                                        .to_series()
+                                        .to_list(),
                                     )
                                 )
+                                displayed_tracks.update(
+                                    st.session_state.excluded_in_session
+                                )
 
-                                # Find replacement from candidate pool
-                                if "candidate_pool" in st.session_state:
-                                    displayed_tracks = set(
-                                        zip(
-                                            recommendations.select("track_name")
-                                            .to_series()
-                                            .to_list(),
-                                            recommendations.select("artist_name")
-                                            .to_series()
-                                            .to_list(),
-                                        )
+                                pool = st.session_state.candidate_pool
+                                replacement = None
+                                for row in pool.iter_rows(named=True):
+                                    track_key = (
+                                        row["track_name"],
+                                        row["artist_name"],
                                     )
-                                    displayed_tracks.update(
-                                        st.session_state.excluded_in_session
+                                    if track_key not in displayed_tracks:
+                                        replacement = pool.filter(
+                                            (pl.col("track_name") == row["track_name"])
+                                            & (
+                                                pl.col("artist_name")
+                                                == row["artist_name"]
+                                            )
+                                        ).limit(1)
+                                        break
+
+                                if replacement is not None and len(replacement) > 0:
+                                    replacement = replacement.select(
+                                        st.session_state.recommendations.columns
                                     )
-
-                                    pool = st.session_state.candidate_pool
-                                    replacement = None
-                                    for row in pool.iter_rows(named=True):
-                                        track_key = (
-                                            row["track_name"],
-                                            row["artist_name"],
-                                        )
-                                        if track_key not in displayed_tracks:
-                                            replacement = pool.filter(
-                                                (
-                                                    pl.col("track_name")
-                                                    == row["track_name"]
-                                                )
-                                                & (
-                                                    pl.col("artist_name")
-                                                    == row["artist_name"]
-                                                )
-                                            ).limit(1)
-                                            break
-
-                                    if replacement is not None and len(replacement) > 0:
-                                        replacement = replacement.select(
-                                            st.session_state.recommendations.columns
-                                        )
-                                        st.session_state.recommendations = pl.concat(
-                                            [
-                                                st.session_state.recommendations,
-                                                replacement,
-                                            ]
-                                        )
-                                        st.toast(
-                                            f"Excluded and replaced with '{replacement['track_name'][0]}'"
-                                        )
-                                    else:
-                                        st.toast(
-                                            f"Excluded '{selected_track['track_name']}'"
-                                        )
+                                    st.session_state.recommendations = pl.concat(
+                                        [
+                                            st.session_state.recommendations,
+                                            replacement,
+                                        ]
+                                    )
+                                    st.toast(
+                                        f"Excluded and replaced with '{replacement['track_name'][0]}'"
+                                    )
                                 else:
                                     st.toast(
                                         f"Excluded '{selected_track['track_name']}'"
                                     )
+                            else:
+                                st.toast(f"Excluded '{selected_track['track_name']}'")
 
-                                st.rerun()
+                            st.rerun()
 
-                            except Exception as e:
-                                st.error(f"Error excluding track: {e}")
+                        except Exception as e:
+                            st.error(f"Error excluding track: {e}")
 
-                    # Restore excluded tracks
-                    if n_excluded_tracks > 0:
-                        st.caption("Previously excluded:")
-                        display_excluded_tracks = excluded_tracks_collected.select(
-                            [
-                                pl.col("track_name").alias("Track"),
-                                pl.col("artist_name").alias("Artist"),
+                # Restore excluded tracks
+                if n_excluded_tracks > 0:
+                    st.caption("Previously excluded:")
+                    display_excluded_tracks = excluded_tracks_collected.select(
+                        [
+                            pl.col("track_name").alias("Track"),
+                            pl.col("artist_name").alias("Artist"),
+                        ]
+                    )
+                    st.dataframe(
+                        display_excluded_tracks,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    track_to_revert_options = {
+                        f"{row['track_name']} - {row['artist_name']}": row
+                        for row in excluded_tracks_collected.to_dicts()
+                    }
+
+                    selected_track_to_revert = st.selectbox(
+                        "Restore a track",
+                        options=list(track_to_revert_options.keys()),
+                        key="track_to_revert",
+                    )
+
+                    if st.button(
+                        "✅ Restore", type="secondary", key="restore_track_btn"
+                    ):
+                        try:
+                            track_info = track_to_revert_options[
+                                selected_track_to_revert
                             ]
-                        )
-                        st.dataframe(
-                            display_excluded_tracks,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+                            # Update local cache immediately, persist to storage in background
+                            remove_excluded_track_local(
+                                username=username,
+                                track_id=track_info["track_id"],
+                                track_name=track_info["track_name"],
+                                artist_name=track_info["artist_name"],
+                            )
+                            st.toast(f"Restored '{track_info['track_name']}'")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error restoring track: {e}")
 
-                        track_to_revert_options = {
-                            f"{row['track_name']} - {row['artist_name']}": row
-                            for row in excluded_tracks_collected.to_dicts()
-                        }
+            with tab_artists:
+                # Get unique artists from current recommendations
+                current_artists = (
+                    recommendations.select("artist_name")
+                    .unique()
+                    .sort("artist_name")
+                    .to_series()
+                    .to_list()
+                )
 
-                        selected_track_to_revert = st.selectbox(
-                            "Restore a track",
-                            options=list(track_to_revert_options.keys()),
-                            key="track_to_revert",
-                        )
+                if len(current_artists) > 0:
+                    selected_artist = st.selectbox(
+                        "Block an artist (removes all their tracks)",
+                        options=current_artists,
+                        key="artist_to_block",
+                    )
 
-                        if st.button(
-                            "✅ Restore", type="secondary", key="restore_track_btn"
-                        ):
-                            try:
-                                track_info = track_to_revert_options[
-                                    selected_track_to_revert
-                                ]
-                                remove_excluded_track(
-                                    username=username,
-                                    track_id=track_info["track_id"],
-                                    track_name=track_info["track_name"],
-                                    artist_name=track_info["artist_name"],
+                    if st.button(
+                        "🚫 Block Artist", type="secondary", key="block_artist_btn"
+                    ):
+                        try:
+                            # Update local cache immediately, persist to storage in background
+                            add_excluded_artist_local(
+                                username=st.session_state.username,
+                                artist_name=selected_artist,
+                            )
+
+                            if "excluded_artists_in_session" not in st.session_state:
+                                st.session_state.excluded_artists_in_session = set()
+                            st.session_state.excluded_artists_in_session.add(
+                                selected_artist
+                            )
+
+                            tracks_removed = len(
+                                recommendations.filter(
+                                    pl.col("artist_name") == selected_artist
                                 )
-                                st.toast(f"Restored '{track_info['track_name']}'")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error restoring track: {e}")
+                            )
 
-                with tab_artists:
-                    # Get unique artists from current recommendations
-                    current_artists = (
-                        recommendations.select("artist_name")
-                        .unique()
-                        .sort("artist_name")
+                            st.session_state.recommendations = recommendations.filter(
+                                pl.col("artist_name") != selected_artist
+                            )
+
+                            # Try to replace removed tracks
+                            if (
+                                "candidate_pool" in st.session_state
+                                and tracks_removed > 0
+                            ):
+                                pool = st.session_state.candidate_pool
+                                updated_recommendations = (
+                                    st.session_state.recommendations
+                                )
+                                displayed_tracks = set(
+                                    zip(
+                                        updated_recommendations.select("track_name")
+                                        .to_series()
+                                        .to_list(),
+                                        updated_recommendations.select("artist_name")
+                                        .to_series()
+                                        .to_list(),
+                                    )
+                                )
+                                if "excluded_in_session" in st.session_state:
+                                    displayed_tracks.update(
+                                        st.session_state.excluded_in_session
+                                    )
+
+                                excluded_artists_set = (
+                                    st.session_state.excluded_artists_in_session
+                                )
+
+                                replacements = []
+                                for row in pool.iter_rows(named=True):
+                                    if len(replacements) >= tracks_removed:
+                                        break
+                                    track_key = (
+                                        row["track_name"],
+                                        row["artist_name"],
+                                    )
+                                    if (
+                                        track_key not in displayed_tracks
+                                        and row["artist_name"]
+                                        not in excluded_artists_set
+                                    ):
+                                        replacements.append(row)
+                                        displayed_tracks.add(track_key)
+
+                                if replacements:
+                                    replacement_df = pl.DataFrame(
+                                        replacements, schema=pool.schema
+                                    ).select(st.session_state.recommendations.columns)
+                                    st.session_state.recommendations = pl.concat(
+                                        [
+                                            st.session_state.recommendations,
+                                            replacement_df,
+                                        ]
+                                    )
+                                    st.toast(
+                                        f"Blocked '{selected_artist}' and replaced {len(replacements)} tracks"
+                                    )
+                                else:
+                                    st.toast(
+                                        f"Blocked '{selected_artist}' ({tracks_removed} tracks removed)"
+                                    )
+                            else:
+                                st.toast(f"Blocked '{selected_artist}'")
+
+                            st.rerun()
+
+                        except Exception as e:
+                            st.error(f"Error blocking artist: {e}")
+
+                # Restore blocked artists
+                if n_excluded_artists > 0:
+                    st.caption("Currently blocked:")
+                    display_excluded_artists = excluded_artists_collected.select(
+                        pl.col("artist_name").alias("Artist")
+                    )
+                    st.dataframe(
+                        display_excluded_artists,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    artist_to_revert_options = (
+                        excluded_artists_collected.select("artist_name")
                         .to_series()
                         .to_list()
                     )
 
-                    if len(current_artists) > 0:
-                        selected_artist = st.selectbox(
-                            "Block an artist (removes all their tracks)",
-                            options=current_artists,
-                            key="artist_to_block",
-                        )
+                    selected_artist_to_revert = st.selectbox(
+                        "Restore an artist",
+                        options=artist_to_revert_options,
+                        key="artist_to_revert",
+                    )
 
-                        if st.button(
-                            "🚫 Block Artist", type="secondary", key="block_artist_btn"
-                        ):
-                            try:
-                                write_excluded_artist(
-                                    username=st.session_state.username,
-                                    artist_name=selected_artist,
-                                )
-
-                                if (
-                                    "excluded_artists_in_session"
-                                    not in st.session_state
-                                ):
-                                    st.session_state.excluded_artists_in_session = set()
-                                st.session_state.excluded_artists_in_session.add(
-                                    selected_artist
-                                )
-
-                                tracks_removed = len(
-                                    recommendations.filter(
-                                        pl.col("artist_name") == selected_artist
-                                    )
-                                )
-
-                                st.session_state.recommendations = (
-                                    recommendations.filter(
-                                        pl.col("artist_name") != selected_artist
-                                    )
-                                )
-
-                                # Try to replace removed tracks
-                                if (
-                                    "candidate_pool" in st.session_state
-                                    and tracks_removed > 0
-                                ):
-                                    pool = st.session_state.candidate_pool
-                                    updated_recommendations = (
-                                        st.session_state.recommendations
-                                    )
-                                    displayed_tracks = set(
-                                        zip(
-                                            updated_recommendations.select("track_name")
-                                            .to_series()
-                                            .to_list(),
-                                            updated_recommendations.select(
-                                                "artist_name"
-                                            )
-                                            .to_series()
-                                            .to_list(),
-                                        )
-                                    )
-                                    if "excluded_in_session" in st.session_state:
-                                        displayed_tracks.update(
-                                            st.session_state.excluded_in_session
-                                        )
-
-                                    excluded_artists_set = (
-                                        st.session_state.excluded_artists_in_session
-                                    )
-
-                                    replacements = []
-                                    for row in pool.iter_rows(named=True):
-                                        if len(replacements) >= tracks_removed:
-                                            break
-                                        track_key = (
-                                            row["track_name"],
-                                            row["artist_name"],
-                                        )
-                                        if (
-                                            track_key not in displayed_tracks
-                                            and row["artist_name"]
-                                            not in excluded_artists_set
-                                        ):
-                                            replacements.append(row)
-                                            displayed_tracks.add(track_key)
-
-                                    if replacements:
-                                        replacement_df = pl.DataFrame(
-                                            replacements, schema=pool.schema
-                                        ).select(
-                                            st.session_state.recommendations.columns
-                                        )
-                                        st.session_state.recommendations = pl.concat(
-                                            [
-                                                st.session_state.recommendations,
-                                                replacement_df,
-                                            ]
-                                        )
-                                        st.toast(
-                                            f"Blocked '{selected_artist}' and replaced {len(replacements)} tracks"
-                                        )
-                                    else:
-                                        st.toast(
-                                            f"Blocked '{selected_artist}' ({tracks_removed} tracks removed)"
-                                        )
-                                else:
-                                    st.toast(f"Blocked '{selected_artist}'")
-
-                                st.rerun()
-
-                            except Exception as e:
-                                st.error(f"Error blocking artist: {e}")
-
-                    # Restore blocked artists
-                    if n_excluded_artists > 0:
-                        st.caption("Currently blocked:")
-                        display_excluded_artists = excluded_artists_collected.select(
-                            pl.col("artist_name").alias("Artist")
-                        )
-                        st.dataframe(
-                            display_excluded_artists,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-                        artist_to_revert_options = (
-                            excluded_artists_collected.select("artist_name")
-                            .to_series()
-                            .to_list()
-                        )
-
-                        selected_artist_to_revert = st.selectbox(
-                            "Restore an artist",
-                            options=artist_to_revert_options,
-                            key="artist_to_revert",
-                        )
-
-                        if st.button(
-                            "✅ Restore", type="secondary", key="restore_artist_btn"
-                        ):
-                            try:
-                                remove_excluded_artist(
-                                    username=username,
-                                    artist_name=selected_artist_to_revert,
-                                )
-                                st.toast(f"Restored '{selected_artist_to_revert}'")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error restoring artist: {e}")
+                    if st.button(
+                        "✅ Restore", type="secondary", key="restore_artist_btn"
+                    ):
+                        try:
+                            # Update local cache immediately, persist to storage in background
+                            remove_excluded_artist_local(
+                                username=username,
+                                artist_name=selected_artist_to_revert,
+                            )
+                            st.toast(f"Restored '{selected_artist_to_revert}'")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error restoring artist: {e}")
 
     with st.spinner("Setting up playlist export..."):
         # Playlist creation section

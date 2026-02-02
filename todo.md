@@ -1,3 +1,4 @@
 - unit tests for streamlit app
 - multi-user support
 - cloud hosting
+- database for gold layer instead of gcs
