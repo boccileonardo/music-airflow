@@ -2,9 +2,7 @@ from dotenv import load_dotenv
 import os
 import datetime as dt
 
-LAST_FM_USERNAMES = [
-    "lelopolel",
-]
+LAST_FM_USERNAMES = ["lelopolel", "Martazie"]
 
 load_dotenv()
 DAG_START_DATE = dt.datetime.strptime(
