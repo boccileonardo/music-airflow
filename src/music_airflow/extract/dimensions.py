@@ -18,6 +18,7 @@ from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager, JSONIOMa
 from music_airflow.utils.lastfm_scraper import LastFMScraper
 from music_airflow.utils.text_normalization import normalize_text
 from music_airflow.utils.ytmusic_search import search_youtube_url
+from music_airflow.utils.spotify_search import search_spotify_url, is_spotify_configured
 import polars as pl
 import logging
 
@@ -193,43 +194,71 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
                 track["youtube_url"] = None
         else:
             track["youtube_url"] = None
-        track["spotify_url"] = None  # Will be populated from Last.fm scraping below
+        track["spotify_url"] = (
+            None  # Will be populated from Spotify search or Last.fm fallback
+        )
     logger.info(f"Found {ytmusic_found}/{len(tracks_data)} tracks via YTMusic search")
 
-    # Fallback: Scrape Last.fm pages for tracks missing YouTube URLs + get Spotify URLs
+    # Primary for Spotify: Use Spotipy search (more reliable than Last.fm scraping)
+    spotify_configured = is_spotify_configured()
+    spotipy_found = 0
+    if spotify_configured:
+        logger.info(f"Searching Spotify for {len(tracks_data)} tracks...")
+        for idx, track in enumerate(tracks_data):
+            track_name = normalize_text(track.get("name", ""))
+            artist_name = normalize_text(track.get("artist", {}).get("name", ""))
+            if track_name and artist_name:
+                spotify_url = search_spotify_url(track_name, artist_name)
+                if spotify_url:
+                    track["spotify_url"] = spotify_url
+                    spotipy_found += 1
+        logger.info(
+            f"Found {spotipy_found}/{len(tracks_data)} tracks via Spotify search"
+        )
+    else:
+        logger.info("Spotify credentials not configured, will use Last.fm fallback")
+
+    # Fallback: Scrape Last.fm pages for tracks missing YouTube or Spotify URLs
     # Last.fm pages sometimes have music video links, so we only use as fallback for YouTube
     missing_youtube = [
         (idx, t) for idx, t in enumerate(tracks_data) if not t.get("youtube_url")
     ]
+    missing_spotify = [
+        (idx, t) for idx, t in enumerate(tracks_data) if not t.get("spotify_url")
+    ]
     valid_urls = [url for url in popular_urls if url]
 
-    logger.info(
-        f"Scraping Last.fm for {len(valid_urls)} tracks (Spotify + {len(missing_youtube)} missing YouTube)..."
-    )
-    async with LastFMScraper() as scraper:
-        streaming_links_list = await scraper.get_streaming_links_batch(valid_urls)
+    # Only scrape Last.fm if there are missing URLs
+    if missing_youtube or missing_spotify:
+        logger.info(
+            f"Scraping Last.fm for {len(valid_urls)} tracks ({len(missing_spotify)} missing Spotify, {len(missing_youtube)} missing YouTube)..."
+        )
+        async with LastFMScraper() as scraper:
+            streaming_links_list = await scraper.get_streaming_links_batch(valid_urls)
 
-    streaming_links = dict(zip(valid_urls, streaming_links_list))
+        streaming_links = dict(zip(valid_urls, streaming_links_list))
 
-    # Merge Last.fm streaming links: Spotify always, YouTube only if missing
-    lastfm_youtube_found = 0
-    spotify_found = 0
-    for idx, track in enumerate(tracks_data):
-        popular_url = popular_urls[idx]
-        if popular_url and popular_url in streaming_links:
-            links = streaming_links[popular_url]
-            # Always take Spotify URL from Last.fm
-            if links.get("spotify_url"):
-                track["spotify_url"] = links["spotify_url"]
-                spotify_found += 1
-            # Only take YouTube URL if YTMusic didn't find one
-            if not track.get("youtube_url") and links.get("youtube_url"):
-                track["youtube_url"] = links["youtube_url"]
-                lastfm_youtube_found += 1
+        # Merge Last.fm streaming links: Spotify/YouTube only if missing from primary search
+        lastfm_youtube_found = 0
+        lastfm_spotify_found = 0
+        for idx, track in enumerate(tracks_data):
+            popular_url = popular_urls[idx]
+            if popular_url and popular_url in streaming_links:
+                links = streaming_links[popular_url]
+                # Only take Spotify URL if Spotipy didn't find one
+                if not track.get("spotify_url") and links.get("spotify_url"):
+                    track["spotify_url"] = links["spotify_url"]
+                    lastfm_spotify_found += 1
+                # Only take YouTube URL if YTMusic didn't find one
+                if not track.get("youtube_url") and links.get("youtube_url"):
+                    track["youtube_url"] = links["youtube_url"]
+                    lastfm_youtube_found += 1
 
-    logger.info(
-        f"Last.fm scraping: {spotify_found} Spotify URLs, {lastfm_youtube_found} YouTube fallbacks"
-    )
+        logger.info(
+            f"Last.fm scraping fallback: {lastfm_spotify_found} Spotify URLs, {lastfm_youtube_found} YouTube URLs"
+        )
+    else:
+        logger.info("No missing streaming links, skipping Last.fm scraping")
 
     final_youtube_count = sum(1 for t in tracks_data if t.get("youtube_url"))
     final_spotify_count = sum(1 for t in tracks_data if t.get("spotify_url"))
