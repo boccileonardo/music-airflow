@@ -1356,37 +1356,36 @@ def merge_candidate_sources(
             }
         )
 
-    # Process each source: normalize scores, limit, and filter played tracks
-    def process_source(
-        source_lf,
-        source_name: str,
-        filter_played: bool = True,
-    ):
-        """Normalize scores using percentile ranks, limit to top N, optionally filter played tracks."""
-        filtered = source_lf.filter(pl.col("username") == username)
-
-        # Check if source has track_name/artist_name columns
-        # old_favorites doesn't have these - need to join with tracks dimension
-        source_columns = filtered.collect_schema().names()
-        has_track_metadata = (
-            "track_name" in source_columns and "artist_name" in source_columns
+    # Load artists dimension to resolve source_artist_id to artist_name
+    try:
+        artists_dim_lf = delta_mgr_silver.read_delta("artists").select(
+            ["artist_id", "artist_name"]
+        )
+    except (FileNotFoundError, TableNotFoundError):
+        artists_dim_lf = pl.LazyFrame(
+            schema={"artist_id": pl.String, "artist_name": pl.String}
         )
 
-        if not has_track_metadata:
-            # Join with tracks dimension to get metadata
-            # During bootstrapping, tracks_dim_lf will be empty schema, so tracks without metadata
-            filtered = filtered.join(
-                tracks_dim_lf.select(["track_id", "track_name", "artist_name"]),
-                on="track_id",
-                how="left",
-            )
+    # Process similar artist candidates with "why" details
+    def process_similar_artist(source_lf) -> pl.LazyFrame:
+        filtered = source_lf.filter(pl.col("username") == username)
+        filtered = filtered.join(played_track_ids, on="track_id", how="anti")
 
-        # Filter out already-played tracks (except for old_favorites which ARE played tracks)
-        if filter_played:
-            filtered = filtered.join(played_track_ids, on="track_id", how="anti")
+        # Resolve source_artist_id to source_artist_name
+        filtered = filtered.join(
+            artists_dim_lf.rename({"artist_name": "source_artist_name"}),
+            left_on="source_artist_id",
+            right_on="artist_id",
+            how="left",
+        ).with_columns(
+            # Fallback: title-case the artist_id if dimension lookup fails
+            pl.coalesce(
+                pl.col("source_artist_name"),
+                pl.col("source_artist_id").str.replace_all("_", " ").str.to_titlecase(),
+            ).alias("source_artist_name")
+        )
 
-        # Normalize scores using percentile rank (0-1) to avoid outlier domination
-        # This is more robust than min-max normalization
+        # Normalize scores
         filtered = (
             filtered.with_columns(pl.col("score").rank(method="average").alias("rank"))
             .with_columns(
@@ -1394,19 +1393,8 @@ def merge_candidate_sources(
             )
             .drop("rank")
         )
-
-        # Limit to top N tracks by original score
         filtered = filtered.sort("score", descending=True).limit(tracks_per_source)
 
-        # Add source flags
-        filtered = filtered.with_columns(
-            pl.lit(source_name == "similar_artist").alias("similar_artist"),
-            pl.lit(source_name == "similar_tag").alias("similar_tag"),
-            pl.lit(source_name == "deep_cut").alias("deep_cut_same_artist"),
-            pl.lit(source_name == "old_favorite").alias("old_favorite"),
-        )
-
-        # Select standard columns (keep track_name/artist_name for new track enrichment)
         return filtered.select(
             [
                 "username",
@@ -1414,50 +1402,181 @@ def merge_candidate_sources(
                 "track_name",
                 "artist_name",
                 "normalized_score",
-                "similar_artist",
-                "similar_tag",
-                "deep_cut_same_artist",
-                "old_favorite",
+                # "why" details for similar artist
+                pl.col("source_artist_name").alias("why_similar_artist_name"),
+                (pl.col("similarity") * 100).round(1).alias("why_similar_artist_pct"),
             ]
         )
 
-    similar_artists_processed = process_source(
-        similar_artists_lf,
-        "similar_artist",
-        filter_played=True,
-    )
-    similar_tags_processed = process_source(
-        similar_tags_lf,
-        "similar_tag",
-        filter_played=True,
-    )
-    deep_cuts_processed = process_source(
-        deep_cuts_lf,
-        "deep_cut",
-        filter_played=True,
-    )
+    # Process similar tag candidates with "why" details
+    def process_similar_tag(source_lf) -> pl.LazyFrame:
+        filtered = source_lf.filter(pl.col("username") == username)
+        filtered = filtered.join(played_track_ids, on="track_id", how="anti")
 
-    # Process old_favorites if available (don't filter played - they ARE played tracks)
-    sources_to_concat = [
-        similar_artists_processed,
-        similar_tags_processed,
-        deep_cuts_processed,
-    ]
-
-    if old_favorites_lf is not None:
-        old_favorites_processed = process_source(
-            old_favorites_lf,
-            "old_favorite",
-            filter_played=False,  # Don't filter - these ARE old plays
+        # Normalize scores
+        filtered = (
+            filtered.with_columns(pl.col("score").rank(method="average").alias("rank"))
+            .with_columns(
+                (pl.col("rank") / pl.col("rank").max()).alias("normalized_score")
+            )
+            .drop("rank")
         )
-        sources_to_concat.append(old_favorites_processed)
+        filtered = filtered.sort("score", descending=True).limit(tracks_per_source)
 
-    # Concatenate all sources
-    all_candidates = pl.concat(sources_to_concat)
+        return filtered.select(
+            [
+                "username",
+                "track_id",
+                "track_name",
+                "artist_name",
+                "normalized_score",
+                # "why" details for similar tag
+                pl.col("source_tags").alias("why_similar_tags"),
+                pl.col("tag_match_count").alias("why_tag_match_count"),
+            ]
+        )
 
-    # Deduplicate by track_id, aggregating source flags and summing normalized scores
-    # Summing scores rewards tracks recommended by multiple generators (consensus)
-    # Keep track_name/artist_name from candidates for new track enrichment
+    # Process deep cut candidates with "why" details
+    def process_deep_cut(source_lf) -> pl.LazyFrame:
+        filtered = source_lf.filter(pl.col("username") == username)
+        filtered = filtered.join(played_track_ids, on="track_id", how="anti")
+
+        # Resolve source_artist_id to source_artist_name
+        filtered = filtered.join(
+            artists_dim_lf.rename({"artist_name": "deep_cut_artist_name"}),
+            left_on="source_artist_id",
+            right_on="artist_id",
+            how="left",
+        ).with_columns(
+            pl.coalesce(
+                pl.col("deep_cut_artist_name"),
+                pl.col("source_artist_id").str.replace_all("_", " ").str.to_titlecase(),
+            ).alias("deep_cut_artist_name")
+        )
+
+        # Normalize scores
+        filtered = (
+            filtered.with_columns(pl.col("score").rank(method="average").alias("rank"))
+            .with_columns(
+                (pl.col("rank") / pl.col("rank").max()).alias("normalized_score")
+            )
+            .drop("rank")
+        )
+        filtered = filtered.sort("score", descending=True).limit(tracks_per_source)
+
+        return filtered.select(
+            [
+                "username",
+                "track_id",
+                "track_name",
+                "artist_name",
+                "normalized_score",
+                # "why" details for deep cut
+                pl.col("deep_cut_artist_name").alias("why_deep_cut_artist"),
+            ]
+        )
+
+    # Process old favorites (no extra "why" details needed - the flag is self-explanatory)
+    def process_old_favorites(source_lf) -> pl.LazyFrame:
+        filtered = source_lf.filter(pl.col("username") == username)
+
+        # Check if source has track_name/artist_name columns
+        source_columns = filtered.collect_schema().names()
+        if "track_name" not in source_columns or "artist_name" not in source_columns:
+            filtered = filtered.join(
+                tracks_dim_lf.select(["track_id", "track_name", "artist_name"]),
+                on="track_id",
+                how="left",
+            )
+
+        # Normalize scores
+        filtered = (
+            filtered.with_columns(pl.col("score").rank(method="average").alias("rank"))
+            .with_columns(
+                (pl.col("rank") / pl.col("rank").max()).alias("normalized_score")
+            )
+            .drop("rank")
+        )
+        filtered = filtered.sort("score", descending=True).limit(tracks_per_source)
+
+        return filtered.select(
+            [
+                "username",
+                "track_id",
+                "track_name",
+                "artist_name",
+                "normalized_score",
+            ]
+        )
+
+    # Process each source with its specific "why" details
+    similar_artists_processed = process_similar_artist(similar_artists_lf)
+    similar_tags_processed = process_similar_tag(similar_tags_lf)
+    deep_cuts_processed = process_deep_cut(deep_cuts_lf)
+
+    # Process old favorites if available
+    old_favorites_processed = None
+    if old_favorites_lf is not None:
+        old_favorites_processed = process_old_favorites(old_favorites_lf)
+
+    # Prepare each source with its flags and "why" columns
+    sources = []
+
+    # Similar artists
+    sa = similar_artists_processed.with_columns(
+        pl.lit(True).alias("similar_artist"),
+        pl.lit(False).alias("similar_tag"),
+        pl.lit(False).alias("deep_cut_same_artist"),
+        pl.lit(False).alias("old_favorite"),
+        pl.lit(None).cast(pl.String).alias("why_similar_tags"),
+        pl.lit(None).cast(pl.Int64).alias("why_tag_match_count"),
+        pl.lit(None).cast(pl.String).alias("why_deep_cut_artist"),
+    ).rename({"normalized_score": "score"})
+    sources.append(sa)
+
+    # Similar tags
+    st = similar_tags_processed.with_columns(
+        pl.lit(False).alias("similar_artist"),
+        pl.lit(True).alias("similar_tag"),
+        pl.lit(False).alias("deep_cut_same_artist"),
+        pl.lit(False).alias("old_favorite"),
+        pl.lit(None).cast(pl.String).alias("why_similar_artist_name"),
+        pl.lit(None).cast(pl.Float64).alias("why_similar_artist_pct"),
+        pl.lit(None).cast(pl.String).alias("why_deep_cut_artist"),
+    ).rename({"normalized_score": "score"})
+    sources.append(st)
+
+    # Deep cuts
+    dc = deep_cuts_processed.with_columns(
+        pl.lit(False).alias("similar_artist"),
+        pl.lit(False).alias("similar_tag"),
+        pl.lit(True).alias("deep_cut_same_artist"),
+        pl.lit(False).alias("old_favorite"),
+        pl.lit(None).cast(pl.String).alias("why_similar_artist_name"),
+        pl.lit(None).cast(pl.Float64).alias("why_similar_artist_pct"),
+        pl.lit(None).cast(pl.String).alias("why_similar_tags"),
+        pl.lit(None).cast(pl.Int64).alias("why_tag_match_count"),
+    ).rename({"normalized_score": "score"})
+    sources.append(dc)
+
+    # Old favorites
+    if old_favorites_processed is not None:
+        of = old_favorites_processed.with_columns(
+            pl.lit(False).alias("similar_artist"),
+            pl.lit(False).alias("similar_tag"),
+            pl.lit(False).alias("deep_cut_same_artist"),
+            pl.lit(True).alias("old_favorite"),
+            pl.lit(None).cast(pl.String).alias("why_similar_artist_name"),
+            pl.lit(None).cast(pl.Float64).alias("why_similar_artist_pct"),
+            pl.lit(None).cast(pl.String).alias("why_similar_tags"),
+            pl.lit(None).cast(pl.Int64).alias("why_tag_match_count"),
+            pl.lit(None).cast(pl.String).alias("why_deep_cut_artist"),
+        ).rename({"normalized_score": "score"})
+        sources.append(of)
+
+    # Concat all sources and aggregate
+    all_candidates = pl.concat(sources, how="diagonal_relaxed")
+
     merged_lf = (
         all_candidates.group_by("username", "track_id", "track_name", "artist_name")
         .agg(
@@ -1466,19 +1585,34 @@ def merge_candidate_sources(
                 pl.max("similar_tag").alias("similar_tag"),
                 pl.max("deep_cut_same_artist").alias("deep_cut_same_artist"),
                 pl.max("old_favorite").alias("old_favorite"),
-                pl.sum("normalized_score").alias("score"),  # Sum to reward consensus
+                pl.sum("score").alias("score"),
+                # Keep first non-null "why" value for each type
+                pl.col("why_similar_artist_name")
+                .drop_nulls()
+                .first()
+                .alias("why_similar_artist_name"),
+                pl.col("why_similar_artist_pct")
+                .drop_nulls()
+                .first()
+                .alias("why_similar_artist_pct"),
+                pl.col("why_similar_tags")
+                .drop_nulls()
+                .first()
+                .alias("why_similar_tags"),
+                pl.col("why_tag_match_count")
+                .drop_nulls()
+                .first()
+                .alias("why_tag_match_count"),
+                pl.col("why_deep_cut_artist")
+                .drop_nulls()
+                .first()
+                .alias("why_deep_cut_artist"),
             ]
         )
         .sort("score", descending=True)
     )
 
-    # Note: We no longer enrich tracks here to avoid circular dependency.
-    # New tracks discovered in candidates will be enriched by the
-    # dimension update DAG which reads track_name/artist_name from gold/track_candidates.
-
     # Join with tracks dimension to add streaming links and metadata
-    # Keep candidate track_name/artist_name (from API) for new tracks,
-    # use dimension values (enriched) for existing tracks
     tracks_with_links = tracks_dim_lf.select(
         [
             "track_id",
@@ -1500,19 +1634,37 @@ def merge_candidate_sources(
         )
         .with_columns(
             [
-                # Prefer dimension track_name/artist_name if available, otherwise keep candidate values
+                # Prefer dimension track_name/artist_name if available
                 pl.coalesce([pl.col("track_name_dim"), pl.col("track_name")]).alias(
                     "track_name"
                 ),
                 pl.coalesce([pl.col("artist_name_dim"), pl.col("artist_name")]).alias(
                     "artist_name"
                 ),
-                # Keep dimension enrichment columns (will be NULL for new tracks)
-                pl.col("duration_ms").alias("duration_ms"),
-                pl.col("tags").alias("tags"),
             ]
         )
-        .drop(["track_name_dim", "artist_name_dim"])
+        .select(
+            [
+                "username",
+                "track_id",
+                "track_name",
+                "artist_name",
+                "score",
+                "similar_artist",
+                "similar_tag",
+                "deep_cut_same_artist",
+                "old_favorite",
+                "why_similar_artist_name",
+                "why_similar_artist_pct",
+                "why_similar_tags",
+                "why_tag_match_count",
+                "why_deep_cut_artist",
+                "duration_ms",
+                "tags",
+                "youtube_url",
+                "spotify_url",
+            ]
+        )
     )
 
     # Deduplicate by track_id first (keep highest score)

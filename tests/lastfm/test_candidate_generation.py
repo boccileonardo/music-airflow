@@ -439,8 +439,9 @@ class TestMergeCandidateSources:
 
         artists_df = pl.DataFrame(
             {
-                "artist_id": ["b1", "c1"],
-                "artist_mbid": ["bmbid", "cmbid"],
+                "artist_id": ["a1", "b1", "c1"],
+                "artist_name": ["Artist A", "Artist B", "Artist C"],
+                "artist_mbid": ["ambid", "bmbid", "cmbid"],
             }
         )
         patched_delta_io("silver").write_delta(
@@ -457,6 +458,7 @@ class TestMergeCandidateSources:
                 "track_mbid": ["tmbid"],
                 "artist_mbid": ["bmbid"],
                 "score": [10000],
+                "similarity": [0.85],
                 "source_artist_id": ["a1"],
             }
         )
@@ -525,6 +527,13 @@ class TestMergeCandidateSources:
         # YouTube/Spotify URLs should be present (joined from tracks dimension)
         assert b_row["youtube_url"] == "https://youtube.com/watch?v=1"
         assert b_row["spotify_url"] == "https://open.spotify.com/track/1"
+        # "Why" columns should be present for similar_artist and similar_tag
+        assert (
+            b_row["why_similar_artist_name"] == "Artist A"
+        )  # from source_artist_id a1
+        assert b_row["why_similar_artist_pct"] == 85.0  # 0.85 * 100
+        assert b_row["why_similar_tags"] == "rock,indie,alt"
+        assert b_row["why_tag_match_count"] == 3
 
         c_row = rows["artist c::tag track"]
         assert c_row["similar_artist"] is False
@@ -537,3 +546,7 @@ class TestMergeCandidateSources:
         # YouTube/Spotify URLs should be present
         assert c_row["youtube_url"] == "https://youtube.com/watch?v=2"
         assert c_row["spotify_url"] == "https://open.spotify.com/track/2"
+        # "Why" columns should be present for similar_tag and deep_cut
+        assert c_row["why_similar_tags"] == "rock,indie,alt,pop"
+        assert c_row["why_tag_match_count"] == 4
+        assert c_row["why_deep_cut_artist"] == "Artist C"  # from source_artist_id c1
