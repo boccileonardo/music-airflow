@@ -3,6 +3,9 @@ Playlist export UI components for the Streamlit app.
 
 Handles the UI for exporting recommendations to YouTube Music and Spotify playlists.
 Supports per-user OAuth authentication with tokens stored in Firestore.
+
+Security: When app authentication is enabled, OAuth tokens are scoped to the
+authenticated user. Users can only connect and use their own OAuth tokens.
 """
 
 import logging
@@ -10,6 +13,7 @@ import traceback
 
 import streamlit as st
 
+from music_airflow.app.auth import get_authenticated_username, is_auth_configured
 from music_airflow.app.oauth_storage import get_oauth_storage
 from music_airflow.app.spotify_playlist import (
     SpotifyPlaylistGenerator,
@@ -32,6 +36,9 @@ def handle_oauth_callback() -> None:
 
     This should be called early in the app to process redirects from OAuth providers.
     The state parameter contains the provider and username: "provider:username:nonce"
+
+    Security: When authentication is enabled, verifies that the OAuth callback's
+    username matches the authenticated user before storing tokens.
     """
     params = st.query_params
 
@@ -52,6 +59,18 @@ def handle_oauth_callback() -> None:
 
         provider, username, _nonce = parts
 
+        # Security check: verify username matches authenticated user
+        if not _verify_oauth_user(username):
+            logging.warning(
+                f"OAuth callback rejected: username mismatch for {provider}"
+            )
+            st.query_params.clear()
+            st.error(
+                "Security error: OAuth callback does not match your account. "
+                "Please try connecting again."
+            )
+            return
+
         if provider == "spotify":
             _process_spotify_callback(code, username)
             st.query_params.clear()
@@ -60,6 +79,27 @@ def handle_oauth_callback() -> None:
             _process_youtube_callback(code, username)
             st.query_params.clear()
             st.rerun()
+
+
+def _verify_oauth_user(callback_username: str) -> bool:
+    """
+    Verify that the OAuth callback username matches the authenticated user.
+
+    When authentication is not configured, allows all usernames (dev mode).
+    When authentication is configured, only allows the authenticated user's username.
+
+    Returns:
+        True if the username is allowed, False otherwise.
+    """
+    if not is_auth_configured():
+        return True
+
+    auth_username = get_authenticated_username()
+    if auth_username is None:
+        # User not authenticated - reject
+        return False
+
+    return callback_username == auth_username
 
 
 def _process_spotify_callback(code: str, username: str) -> None:

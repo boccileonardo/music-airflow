@@ -9,6 +9,10 @@ import logging
 import polars as pl
 import streamlit as st
 
+from music_airflow.app.auth import (
+    render_user_menu,
+    require_authentication,
+)
 from music_airflow.app.data_loading import (
     load_top_artists,
     load_track_candidates,
@@ -38,6 +42,9 @@ logging.basicConfig(
 
 
 def main():
+    # Check authentication first (will show login page if needed)
+    auth_username = require_authentication()
+
     st.set_page_config(
         page_title="AirStream.FM",
         page_icon="🎵",
@@ -52,8 +59,12 @@ def main():
     prefetch_all_users_track_candidates()
 
     # Render sidebar and get settings
-    settings = _render_sidebar()
+    # Pass auth_username to restrict user selection when auth is enabled
+    settings = _render_sidebar(auth_username)
     username = settings["username"]
+
+    # Render user menu (logout button) in sidebar
+    render_user_menu()
 
     # Render main content
     _render_user_profile(username)
@@ -67,15 +78,26 @@ def main():
     render_playlist_export_section()
 
 
-def _render_sidebar() -> dict:
-    """Render sidebar and return settings."""
+def _render_sidebar(auth_username: str | None = None) -> dict:
+    """Render sidebar and return settings.
+
+    Args:
+        auth_username: If set, restrict user selection to this username only.
+                      When auth is enabled, users can only view their own data.
+    """
     with st.sidebar:
         st.title("🎵 AirStream.FM")
         st.caption("Music Recommendation System")
 
         st.divider()
 
-        username = st.selectbox("👤 User", options=LAST_FM_USERNAMES)
+        # When auth is enabled, lock to authenticated user's username
+        if auth_username:
+            username = auth_username
+            st.text(f"👤 {username}")
+        else:
+            # Dev mode: allow selecting any user
+            username = st.selectbox("👤 User", options=LAST_FM_USERNAMES)
 
         st.divider()
         st.subheader("⚙️ Recommendation Settings")
