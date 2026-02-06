@@ -99,10 +99,12 @@ def get_youtube_redirect_uri() -> str:
     if override:
         return override
 
-    # Use Streamlit's URL if available (works on Streamlit Cloud)
+    # Use Streamlit's context URL if available (works on Streamlit Cloud)
     try:
-        if "streamlit_url" in st.session_state:
-            return st.session_state["streamlit_url"]
+        url = st.context.url
+        if url and not url.startswith("http://localhost"):
+            # Ensure URL ends with / for consistency
+            return url if url.endswith("/") else f"{url}/"
 
         # Default to loopback IP for local development
         return "http://127.0.0.1:8501/"
