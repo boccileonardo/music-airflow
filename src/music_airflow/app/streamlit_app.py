@@ -4,7 +4,7 @@ import traceback
 import polars as pl
 import streamlit as st
 
-from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
+from music_airflow.utils.firestore_io_manager import FirestoreIOManager
 from music_airflow.utils.constants import LAST_FM_USERNAMES
 from music_airflow.app.youtube_playlist import (
     YouTubePlaylistGenerator,
@@ -180,67 +180,42 @@ def remove_excluded_artist_local(username: str, artist_name: str) -> None:
 
 @st.cache_data(ttl=300)  # 5 minutes
 def load_track_candidates_cached(username: str) -> pl.DataFrame:
-    """Load and cache track candidates from gold table."""
-    gold_io = PolarsDeltaIOManager("gold")
-    return (
-        gold_io.read_delta("track_candidates")
-        .filter(pl.col("username") == username)
-        .sort("score", descending=True)
-        .limit(INTERNAL_LIMIT)
-        .collect()
-    )
+    """Load and cache track candidates from Firestore."""
+    firestore_io = FirestoreIOManager()
+    df = firestore_io.read_track_candidates(username, limit=INTERNAL_LIMIT)
+    return df.sort("score", descending=True)
 
 
 def load_track_candidates(username: str) -> pl.LazyFrame:
-    """Load track candidates from gold table - presentation-ready data."""
+    """Load track candidates from Firestore - presentation-ready data."""
     # Use cached DataFrame and convert back to LazyFrame for filtering
     return load_track_candidates_cached(username).lazy()
 
 
 @st.cache_data(ttl="1d")
 def load_user_statistics(username: str) -> dict:
-    """Load user play statistics from gold aggregation tables."""
-    gold_io = PolarsDeltaIOManager("gold")
+    """Load user play statistics from Firestore."""
+    firestore_io = FirestoreIOManager()
 
-    stats = {}
+    # Get pre-computed stats from Firestore
+    stats = firestore_io.read_user_stats(username)
 
-    # Load track play counts
-    try:
-        track_plays = (
-            gold_io.read_delta("track_play_count")
-            .filter(pl.col("username") == username)
-            .collect()
-        )
-        stats["total_tracks_played"] = len(track_plays)
-        stats["total_plays"] = track_plays["play_count"].sum()
-    except Exception:
-        stats["total_tracks_played"] = 0
-        stats["total_plays"] = 0
-
-    # Load artist play counts
-    try:
-        artist_plays = (
-            gold_io.read_delta("artist_play_count")
-            .filter(pl.col("username") == username)
-            .collect()
-        )
+    # Also count artists if not in stats
+    if "total_artists_played" not in stats:
+        artist_plays = firestore_io.read_artist_play_counts(username)
         stats["total_artists_played"] = len(artist_plays)
-    except Exception:
-        stats["total_artists_played"] = 0
 
     return stats
 
 
 @st.cache_data(ttl="1d")
 def load_top_artists(username: str, limit: int = 10) -> pl.DataFrame:
-    """Load top artists by play count."""
-    gold_io = PolarsDeltaIOManager("gold")
+    """Load top artists by play count from Firestore."""
+    firestore_io = FirestoreIOManager()
 
     try:
-        artist_plays = gold_io.read_delta("artist_play_count").filter(
-            (pl.col("username") == username) & pl.col("artist_name").is_not_null()
-        )
-        return artist_plays.sort("play_count", descending=True).head(limit).collect()
+        artist_plays = firestore_io.read_artist_play_counts(username, limit=limit)
+        return artist_plays.filter(pl.col("artist_name").is_not_null())
     except Exception:
         return pl.DataFrame(schema={"artist_name": pl.String, "play_count": pl.Int64})
 
@@ -351,7 +326,7 @@ def filter_candidates(
 
 def main():
     st.set_page_config(
-        page_title="KainosFM",
+        page_title="AirStream.FM",
         page_icon="🎵",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -359,7 +334,7 @@ def main():
 
     # --- Sidebar: All Settings ---
     with st.sidebar:
-        st.title("🎵 KainosFM")
+        st.title("🎵 AirStream.FM")
         st.caption("Music Recommendation System")
 
         st.divider()
@@ -1010,7 +985,7 @@ def main():
             with col1:
                 playlist_name = st.text_input(
                     "Playlist Name",
-                    value=f"{st.session_state.get('username', 'User')} - KainosFM",
+                    value=f"{st.session_state.get('username', 'User')} - AirStream.FM",
                     key="playlist_name_input",
                     label_visibility="collapsed",
                     placeholder="Playlist name...",

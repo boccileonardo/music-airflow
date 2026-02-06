@@ -500,17 +500,31 @@ class TestMergeCandidateSources:
             deep_cut_df, table_name="candidate_deep_cut", mode="overwrite"
         )
 
-        with patch(
-            "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
-        ) as MockDeltaIO:
+        # Track Firestore writes
+        firestore_writes = {}
+
+        class MockFirestoreIOManager:
+            def write_track_candidates(self, username: str, df: pl.DataFrame) -> dict:
+                firestore_writes[username] = df
+                return {"rows": len(df), "username": username}
+
+        with (
+            patch(
+                "music_airflow.transform.candidate_generation.PolarsDeltaIOManager"
+            ) as MockDeltaIO,
+            patch(
+                "music_airflow.transform.candidate_generation.FirestoreIOManager",
+                MockFirestoreIOManager,
+            ),
+        ):
             MockDeltaIO.side_effect = lambda medallion_layer="silver": patched_delta_io(
                 medallion_layer
             )
             result = merge_candidate_sources(username="user1")
         assert result["table_name"] == "track_candidates"
-        out_path = Path(result["path"])  # data/gold/track_candidates
-        assert out_path.exists()
-        merged = pl.read_delta(str(out_path)).sort("track_id")
+        assert result["path"] == "firestore://users/user1/track_candidates"
+        assert "user1" in firestore_writes
+        merged = firestore_writes["user1"].sort("track_id")
 
         # Expect two deduped rows with correct flags
         assert merged.shape[0] == 2

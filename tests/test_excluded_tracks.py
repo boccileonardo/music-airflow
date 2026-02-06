@@ -1,7 +1,11 @@
 """
 Tests for excluded track and artist recommendation functionality.
+
+Uses an in-memory mock of FirestoreIOManager to avoid requiring
+actual Firestore credentials in tests.
 """
 
+import datetime as dt
 import polars as pl
 import pytest
 from music_airflow.app.excluded_tracks import (
@@ -12,38 +16,120 @@ from music_airflow.app.excluded_tracks import (
     remove_excluded_track,
     remove_excluded_artist,
 )
-from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
 
-@pytest.fixture
-def temp_gold_dir(tmp_path, monkeypatch):
-    """Create a temporary gold directory for testing."""
-    gold_dir = tmp_path / "data" / "gold"
-    gold_dir.mkdir(parents=True, exist_ok=True)
+class MockFirestoreIOManager:
+    """In-memory mock of FirestoreIOManager for testing."""
 
-    # Monkey-patch the __init__ in PolarsDeltaIOManager
-    original_init = PolarsDeltaIOManager.__init__
+    # Class-level storage to persist across instances
+    _excluded_tracks: dict[str, list[dict]] = {}
+    _excluded_artists: dict[str, list[dict]] = {}
 
-    def mock_init(self, medallion_layer: str = "silver"):
-        if medallion_layer not in ["bronze", "silver", "gold"]:
-            raise ValueError(
-                f"medallion_layer must be 'bronze', 'silver', or 'gold', got '{medallion_layer}'"
+    @classmethod
+    def reset(cls):
+        """Reset all stored data."""
+        cls._excluded_tracks = {}
+        cls._excluded_artists = {}
+
+    def write_excluded_track(
+        self, username: str, track_id: str, track_name: str, artist_name: str
+    ) -> dict:
+        if username not in self._excluded_tracks:
+            self._excluded_tracks[username] = []
+
+        # Check if already exists, update timestamp if so
+        for track in self._excluded_tracks[username]:
+            if track["track_id"] == track_id:
+                track["excluded_at"] = dt.datetime.now(tz=dt.timezone.utc)
+                return {"username": username, "track_id": track_id}
+
+        self._excluded_tracks[username].append(
+            {
+                "username": username,
+                "track_id": track_id,
+                "track_name": track_name,
+                "artist_name": artist_name,
+                "excluded_at": dt.datetime.now(tz=dt.timezone.utc),
+            }
+        )
+        return {"username": username, "track_id": track_id}
+
+    def read_excluded_tracks(self, username: str) -> pl.DataFrame:
+        tracks = self._excluded_tracks.get(username, [])
+        if not tracks:
+            return pl.DataFrame(
+                schema={
+                    "username": pl.String,
+                    "track_id": pl.String,
+                    "track_name": pl.String,
+                    "artist_name": pl.String,
+                    "excluded_at": pl.Datetime(time_zone="UTC"),
+                }
             )
-        self.medallion_layer = medallion_layer
-        self.base_uri = str(tmp_path / "data" / medallion_layer)
-        self.is_cloud = False
-        self.storage_options = None
+        return pl.DataFrame(tracks)
 
-    monkeypatch.setattr(PolarsDeltaIOManager, "__init__", mock_init)
+    def delete_excluded_track(self, username: str, track_id: str) -> dict:
+        if username in self._excluded_tracks:
+            self._excluded_tracks[username] = [
+                t for t in self._excluded_tracks[username] if t["track_id"] != track_id
+            ]
+        return {"username": username, "track_id": track_id, "deleted": True}
 
-    yield gold_dir
+    def write_excluded_artist(self, username: str, artist_name: str) -> dict:
+        if username not in self._excluded_artists:
+            self._excluded_artists[username] = []
 
-    # Restore original __init__
-    monkeypatch.setattr(PolarsDeltaIOManager, "__init__", original_init)
+        # Check if already exists, update timestamp if so
+        for artist in self._excluded_artists[username]:
+            if artist["artist_name"] == artist_name:
+                artist["excluded_at"] = dt.datetime.now(tz=dt.timezone.utc)
+                return {"username": username, "artist_name": artist_name}
+
+        self._excluded_artists[username].append(
+            {
+                "username": username,
+                "artist_name": artist_name,
+                "excluded_at": dt.datetime.now(tz=dt.timezone.utc),
+            }
+        )
+        return {"username": username, "artist_name": artist_name}
+
+    def read_excluded_artists(self, username: str) -> pl.DataFrame:
+        artists = self._excluded_artists.get(username, [])
+        if not artists:
+            return pl.DataFrame(
+                schema={
+                    "username": pl.String,
+                    "artist_name": pl.String,
+                    "excluded_at": pl.Datetime(time_zone="UTC"),
+                }
+            )
+        return pl.DataFrame(artists)
+
+    def delete_excluded_artist(self, username: str, artist_name: str) -> dict:
+        if username in self._excluded_artists:
+            self._excluded_artists[username] = [
+                a
+                for a in self._excluded_artists[username]
+                if a["artist_name"] != artist_name
+            ]
+        return {"username": username, "artist_name": artist_name, "deleted": True}
 
 
-def test_write_excluded_track_creates_table(temp_gold_dir):
-    """Test that writing an excluded track creates the table."""
+@pytest.fixture(autouse=True)
+def mock_firestore(monkeypatch):
+    """Mock FirestoreIOManager for all tests."""
+    MockFirestoreIOManager.reset()
+
+    monkeypatch.setattr(
+        "music_airflow.app.excluded_tracks.FirestoreIOManager", MockFirestoreIOManager
+    )
+
+    yield MockFirestoreIOManager
+
+
+def test_write_excluded_track_creates_entry():
+    """Test that writing an excluded track creates an entry."""
     result = write_excluded_track(
         username="testuser",
         track_id="track1|artist1",
@@ -51,17 +137,11 @@ def test_write_excluded_track_creates_table(temp_gold_dir):
         artist_name="Test Artist",
     )
 
-    assert result["table_name"] == "excluded_recommendations"
-    assert result["rows"] == 1
-    assert result["format"] == "delta"
-
-    # Verify table was created
-    table_path = temp_gold_dir / "excluded_recommendations"
-    assert table_path.exists()
-    assert (table_path / "_delta_log").exists()
+    assert result["username"] == "testuser"
+    assert result["track_id"] == "track1|artist1"
 
 
-def test_write_excluded_track_merge_updates_timestamp(temp_gold_dir):
+def test_write_excluded_track_merge_updates_timestamp():
     """Test that writing the same track again updates the timestamp."""
     # First write
     write_excluded_track(
@@ -97,7 +177,7 @@ def test_write_excluded_track_merge_updates_timestamp(temp_gold_dir):
     assert second_timestamp > first_timestamp
 
 
-def test_read_excluded_tracks_filters_by_username(temp_gold_dir):
+def test_read_excluded_tracks_filters_by_username():
     """Test that read_excluded_tracks returns only tracks for the specified user."""
     # Write tracks for two users
     write_excluded_track(
@@ -130,8 +210,8 @@ def test_read_excluded_tracks_filters_by_username(temp_gold_dir):
     assert all(user2_excluded["username"] == "user2")
 
 
-def test_read_excluded_tracks_empty_table(temp_gold_dir):
-    """Test that read_excluded_tracks returns empty LazyFrame when table doesn't exist."""
+def test_read_excluded_tracks_empty_table():
+    """Test that read_excluded_tracks returns empty LazyFrame when no tracks exist."""
     excluded = read_excluded_tracks("nonexistent_user").collect()
 
     assert len(excluded) == 0
@@ -144,7 +224,7 @@ def test_read_excluded_tracks_empty_table(temp_gold_dir):
     }
 
 
-def test_excluded_track_schema(temp_gold_dir):
+def test_excluded_track_schema():
     """Test that excluded tracks have the correct schema."""
     write_excluded_track(
         username="testuser",
@@ -168,7 +248,7 @@ def test_excluded_track_schema(temp_gold_dir):
     assert str(excluded["excluded_at"][0].tzinfo) == "UTC"
 
 
-def test_exclusion_matching_by_name_not_id(temp_gold_dir):
+def test_exclusion_matching_by_name_not_id():
     """
     Test that exclusions match by track_name + artist_name, not track_id.
 
@@ -209,24 +289,18 @@ def test_exclusion_matching_by_name_not_id(temp_gold_dir):
     assert set(filtered["track_name"].to_list()) == {"Other Song", "Track 2"}
 
 
-def test_write_excluded_artist_creates_table(temp_gold_dir):
-    """Test that writing an excluded artist creates the table."""
+def test_write_excluded_artist_creates_entry():
+    """Test that writing an excluded artist creates an entry."""
     result = write_excluded_artist(
         username="testuser",
         artist_name="Blocked Artist",
     )
 
-    assert result["table_name"] == "excluded_artists"
-    assert result["rows"] == 1
-    assert result["format"] == "delta"
-
-    # Verify table was created
-    table_path = temp_gold_dir / "excluded_artists"
-    assert table_path.exists()
-    assert (table_path / "_delta_log").exists()
+    assert result["username"] == "testuser"
+    assert result["artist_name"] == "Blocked Artist"
 
 
-def test_write_excluded_artist_merge_updates_timestamp(temp_gold_dir):
+def test_write_excluded_artist_merge_updates_timestamp():
     """Test that writing the same artist again updates the timestamp."""
     # First write
     write_excluded_artist(
@@ -258,7 +332,7 @@ def test_write_excluded_artist_merge_updates_timestamp(temp_gold_dir):
     assert second_timestamp > first_timestamp
 
 
-def test_read_excluded_artists_filters_by_username(temp_gold_dir):
+def test_read_excluded_artists_filters_by_username():
     """Test that read_excluded_artists returns only artists for the specified user."""
     # Write artists for two users
     write_excluded_artist(username="user1", artist_name="Artist A")
@@ -278,8 +352,8 @@ def test_read_excluded_artists_filters_by_username(temp_gold_dir):
     assert user2_excluded["artist_name"][0] == "Artist B"
 
 
-def test_read_excluded_artists_empty_table(temp_gold_dir):
-    """Test that read_excluded_artists returns empty LazyFrame when table doesn't exist."""
+def test_read_excluded_artists_empty_table():
+    """Test that read_excluded_artists returns empty LazyFrame when no artists exist."""
     excluded = read_excluded_artists("nonexistent_user").collect()
 
     assert len(excluded) == 0
@@ -290,7 +364,7 @@ def test_read_excluded_artists_empty_table(temp_gold_dir):
     }
 
 
-def test_artist_exclusion_filters_all_tracks(temp_gold_dir):
+def test_artist_exclusion_filters_all_tracks():
     """Test that excluding an artist filters out all their tracks from candidates."""
     # Exclude an artist
     write_excluded_artist(
@@ -328,7 +402,7 @@ def test_artist_exclusion_filters_all_tracks(temp_gold_dir):
     assert "Blocked Artist" not in filtered["artist_name"].to_list()
 
 
-def test_remove_excluded_track(temp_gold_dir):
+def test_remove_excluded_track():
     """Test removing an excluded track."""
     # First, exclude a track
     write_excluded_track(
@@ -355,7 +429,7 @@ def test_remove_excluded_track(temp_gold_dir):
     assert len(excluded_after) == 0
 
 
-def test_remove_excluded_track_keeps_other_tracks(temp_gold_dir):
+def test_remove_excluded_track_keeps_other_tracks():
     """Test that removing an excluded track doesn't affect other exclusions."""
     # Exclude multiple tracks
     write_excluded_track(
@@ -400,7 +474,7 @@ def test_remove_excluded_track_keeps_other_tracks(temp_gold_dir):
     assert other_excluded["track_name"][0] == "Track 3"
 
 
-def test_remove_excluded_track_nonexistent(temp_gold_dir):
+def test_remove_excluded_track_nonexistent():
     """Test removing a track that isn't excluded (should not error)."""
     # Try to remove a track that was never excluded
     result = remove_excluded_track(
@@ -410,13 +484,13 @@ def test_remove_excluded_track_nonexistent(temp_gold_dir):
         artist_name="Artist",
     )
 
-    # Should not error, just return empty result
-    assert result == {}
+    # Should not error, returns metadata about the delete attempt
+    assert result["deleted"]
 
 
-def test_remove_excluded_track_empty_table(temp_gold_dir):
-    """Test removing a track when the table doesn't exist yet."""
-    # Try to remove when table doesn't exist
+def test_remove_excluded_track_empty_storage():
+    """Test removing a track when no tracks exist yet."""
+    # Try to remove when no tracks exist
     result = remove_excluded_track(
         username="testuser",
         track_id="track1|artist1",
@@ -425,10 +499,10 @@ def test_remove_excluded_track_empty_table(temp_gold_dir):
     )
 
     # Should not error
-    assert result == {}
+    assert result["deleted"]
 
 
-def test_remove_excluded_artist(temp_gold_dir):
+def test_remove_excluded_artist():
     """Test removing an excluded artist."""
     # First, exclude an artist
     write_excluded_artist(
@@ -451,7 +525,7 @@ def test_remove_excluded_artist(temp_gold_dir):
     assert len(excluded_after) == 0
 
 
-def test_remove_excluded_artist_keeps_other_artists(temp_gold_dir):
+def test_remove_excluded_artist_keeps_other_artists():
     """Test that removing an excluded artist doesn't affect other exclusions."""
     # Exclude multiple artists
     write_excluded_artist(username="testuser", artist_name="Artist 1")
@@ -476,7 +550,7 @@ def test_remove_excluded_artist_keeps_other_artists(temp_gold_dir):
     assert other_excluded["artist_name"][0] == "Artist 3"
 
 
-def test_remove_excluded_artist_nonexistent(temp_gold_dir):
+def test_remove_excluded_artist_nonexistent():
     """Test removing an artist that isn't excluded (should not error)."""
     # Try to remove an artist that was never excluded
     result = remove_excluded_artist(
@@ -484,23 +558,23 @@ def test_remove_excluded_artist_nonexistent(temp_gold_dir):
         artist_name="Nonexistent Artist",
     )
 
-    # Should not error, just return empty result
-    assert result == {}
+    # Should not error, returns metadata about the delete attempt
+    assert result["deleted"]
 
 
-def test_remove_excluded_artist_empty_table(temp_gold_dir):
-    """Test removing an artist when the table doesn't exist yet."""
-    # Try to remove when table doesn't exist
+def test_remove_excluded_artist_empty_storage():
+    """Test removing an artist when no artists exist yet."""
+    # Try to remove when no artists exist
     result = remove_excluded_artist(
         username="testuser",
         artist_name="Test Artist",
     )
 
     # Should not error
-    assert result == {}
+    assert result["deleted"]
 
 
-def test_remove_and_re_exclude_track(temp_gold_dir):
+def test_remove_and_re_exclude_track():
     """Test that a track can be removed and then excluded again."""
     # Exclude a track
     write_excluded_track(
@@ -536,7 +610,7 @@ def test_remove_and_re_exclude_track(temp_gold_dir):
     assert excluded_again["track_name"][0] == "Test Track"
 
 
-def test_remove_and_re_exclude_artist(temp_gold_dir):
+def test_remove_and_re_exclude_artist():
     """Test that an artist can be removed and then excluded again."""
     # Exclude an artist
     write_excluded_artist(username="testuser", artist_name="Test Artist")

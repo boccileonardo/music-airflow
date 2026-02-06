@@ -20,6 +20,7 @@ import polars as pl
 
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
+from music_airflow.utils.firestore_io_manager import FirestoreIOManager
 from music_airflow.utils.text_normalization import generate_canonical_track_id
 
 logger = logging.getLogger(__name__)
@@ -1317,9 +1318,8 @@ def merge_candidate_sources(
     """
     from deltalake.exceptions import TableNotFoundError
 
-    # IO managers for silver and gold layers
+    # IO manager for silver layer (candidates still stored in Delta)
     delta_mgr_silver = PolarsDeltaIOManager(medallion_layer="silver")
-    delta_mgr_gold = PolarsDeltaIOManager(medallion_layer="gold")
 
     # Load from silver candidate tables
     similar_artists_lf = delta_mgr_silver.read_delta("candidate_similar_artist")
@@ -1690,17 +1690,13 @@ def merge_candidate_sources(
         .drop("_dedup_key")
     )
 
-    # Write gold candidate table (includes both enriched and unenriched tracks)
+    # Write to Firestore (gold layer serving)
     df = merged_deduped.collect()
-    write_meta = delta_mgr_gold.write_delta(
-        df,
-        table_name="track_candidates",
-        mode="overwrite",
-        partition_by="username",
-    )
+    firestore_io = FirestoreIOManager()
+    write_meta = firestore_io.write_track_candidates(username, df)
 
     return {
-        "path": write_meta["path"],
+        "path": f"firestore://users/{username}/track_candidates",
         "rows": write_meta["rows"],
-        "table_name": write_meta["table_name"],
+        "table_name": "track_candidates",
     }

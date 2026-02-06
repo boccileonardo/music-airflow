@@ -353,9 +353,24 @@ class TestComputeArtistPlayCountsIntegration:
         artists_df.write_delta(str(silver_dir / "artists"))
         tracks_df.write_delta(str(silver_dir / "tracks"))
 
+        # Track what Firestore receives
+        firestore_writes = {}
+
+        class MockFirestoreIOManager:
+            def write_artist_play_counts(self, username, df):
+                firestore_writes[username] = df
+                return {"rows": len(df), "username": username}
+
+            def write_user_stats(self, username, stats):
+                pass
+
         # Patch IO managers to use test directories
         with (
             patch("music_airflow.transform.gold_plays.PolarsDeltaIOManager") as mock_io,
+            patch(
+                "music_airflow.transform.gold_plays.FirestoreIOManager",
+                MockFirestoreIOManager,
+            ),
         ):
             from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
@@ -372,18 +387,13 @@ class TestComputeArtistPlayCountsIntegration:
 
         # Verify result metadata
         assert result["table_name"] == "artist_play_count"
-        assert result["format"] == "delta"
+        assert result["format"] == "firestore"
         assert result["medallion_layer"] == "gold"
-        assert result["mode"] == "overwrite"
         assert "execution_date" in result
 
-        # Verify gold table was created
-        gold_table_path = gold_dir / "artist_play_count"
-        assert gold_table_path.exists()
-
-        # Verify content
-        gold_df = pl.read_delta(str(gold_table_path))
-        assert len(gold_df) == 2  # 2 user-artist combinations
+        # Verify Firestore received the data
+        assert "user1" in firestore_writes
+        gold_df = firestore_writes["user1"]
         assert "play_count" in gold_df.columns
         assert "recency_score" in gold_df.columns
         assert "days_since_last_play" in gold_df.columns
@@ -450,9 +460,25 @@ class TestComputeTrackPlayCountsIntegration:
         plays_df.write_delta(str(silver_dir / "plays"))
         dim_users_df.write_delta(str(silver_dir / "dim_users"))
 
+        # Track what Firestore receives
+        firestore_writes = {}
+        user_stats = {}
+
+        class MockFirestoreIOManager:
+            def write_track_play_counts(self, username, df):
+                firestore_writes[username] = df
+                return {"rows": len(df), "username": username}
+
+            def write_user_stats(self, username, stats):
+                user_stats[username] = stats
+
         # Patch IO managers to use test directories
         with (
             patch("music_airflow.transform.gold_plays.PolarsDeltaIOManager") as mock_io,
+            patch(
+                "music_airflow.transform.gold_plays.FirestoreIOManager",
+                MockFirestoreIOManager,
+            ),
         ):
             from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 
@@ -469,18 +495,19 @@ class TestComputeTrackPlayCountsIntegration:
 
         # Verify result metadata
         assert result["table_name"] == "track_play_count"
-        assert result["format"] == "delta"
+        assert result["format"] == "firestore"
         assert result["medallion_layer"] == "gold"
-        assert result["mode"] == "overwrite"
         assert "execution_date" in result
 
-        # Verify gold table was created
-        gold_table_path = gold_dir / "track_play_count"
-        assert gold_table_path.exists()
+        # Verify Firestore received the data
+        assert "user1" in firestore_writes
 
         # Verify content
-        gold_df = pl.read_delta(str(gold_table_path))
-        assert len(gold_df) == 3  # 3 user-track combinations
+        gold_df = firestore_writes["user1"]
         assert "play_count" in gold_df.columns
         assert "recency_score" in gold_df.columns
         assert "days_since_last_play" in gold_df.columns
+
+        # Verify user stats were written
+        assert "user1" in user_stats
+        assert user_stats["user1"]["total_tracks_played"] > 0

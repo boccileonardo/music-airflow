@@ -12,17 +12,18 @@ The system avoids recommendation feedback loops by using exponential decay scori
 - Track metadata (on-demand for new tracks)
 - Artist metadata (on-demand for new tracks)
 
-**Silver**: Structured Delta tables
+**Silver**: Structured Delta tables (GCS)
 
 - Normalized plays (partitioned by user)
 - Track and artist dimensions
 - User profiles with computed half-life values
 - Four types of recommendation candidates
 
-**Gold**: Business aggregations
+**Gold**: Firestore (low-latency serving)
 
 - Play counts with recency scores
 - Unified track candidates ready for recommendations
+- User exclusions (blocked tracks/artists)
 
 ## Data Pipeline
 
@@ -39,7 +40,7 @@ graph TB
         B3[artists JSON<br/>on-demand]
     end
 
-    subgraph "Silver Layer"
+    subgraph "Silver Layer (GCS Delta)"
         S1[plays Delta<br/>partitioned by user]
         S2[tracks Delta<br/>dimension]
         S3[artists Delta<br/>dimension]
@@ -47,10 +48,11 @@ graph TB
         S5[candidate_* Delta<br/>4 types per user]
     end
 
-    subgraph "Gold Layer"
+    subgraph "Gold Layer (Firestore)"
         G1[artist_play_count<br/>with recency]
         G2[track_play_count<br/>with recency]
         G3[track_candidates<br/>unified]
+        G4[user exclusions<br/>tracks & artists]
     end
 
     subgraph "Application"
@@ -82,7 +84,11 @@ graph TB
     S4 --> G2
 
     G3 --> APP
+    G1 --> APP
+    G2 --> APP
+    G4 --> APP
     APP --> YT
+    APP --> G4
 ```
 
 ## DAG Orchestration

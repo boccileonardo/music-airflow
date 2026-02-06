@@ -3,6 +3,8 @@ Gold layer fact table transformations for play aggregations.
 
 Creates aggregate fact tables from silver plays with recency measures
 for recommendation systems. Uses user dimension table for per-user half-life.
+
+Writes to Firestore for low-latency serving in Streamlit app.
 """
 
 from datetime import datetime
@@ -11,6 +13,7 @@ from typing import Any
 import polars as pl
 
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
+from music_airflow.utils.firestore_io_manager import FirestoreIOManager
 
 
 def compute_artist_play_counts(execution_date: datetime) -> dict[str, Any]:
@@ -58,27 +61,11 @@ def compute_artist_play_counts(execution_date: datetime) -> dict[str, Any]:
     # Handle case when tracks/artists don't exist (bootstrapping)
     if not io_manager.table_exists("tracks") or not io_manager.table_exists("artists"):
         # Return empty result - cannot compute artist aggregations without dimensions
-        gold_io_manager = PolarsDeltaIOManager(medallion_layer="gold")
-        empty_df = pl.DataFrame(
-            schema={
-                "username": pl.String,
-                "artist_id": pl.String,
-                "artist_name": pl.String,
-                "play_count": pl.Int64,
-                "first_played_on": pl.Datetime("us", "UTC"),
-                "last_played_on": pl.Datetime("us", "UTC"),
-                "recency_score": pl.Float64,
-                "days_since_last_play": pl.Int32,
-            }
-        )
-        write_metadata = gold_io_manager.write_delta(
-            empty_df,
-            table_name="artist_play_count",
-            mode="overwrite",
-            partition_by="username",
-        )
         return {
-            **write_metadata,
+            "table_name": "artist_play_count",
+            "rows": 0,
+            "format": "firestore",
+            "medallion_layer": "gold",
             "execution_date": execution_date.isoformat(),
             "skipped": True,
             "reason": "tracks or artists table not yet available",
@@ -92,17 +79,26 @@ def compute_artist_play_counts(execution_date: datetime) -> dict[str, Any]:
         plays_lf, dim_users_lf, tracks_lf, artists_lf, execution_date
     )
 
-    # Write to gold layer
-    gold_io_manager = PolarsDeltaIOManager(medallion_layer="gold")
-    write_metadata = gold_io_manager.write_delta(
-        gold_lf,
-        table_name="artist_play_count",
-        mode="overwrite",  # Full refresh - recompute all aggregates
-        partition_by="username",
-    )
+    # Collect the DataFrame
+    gold_df = gold_lf.collect()
+
+    # Write to Firestore (gold layer serving)
+    firestore_io = FirestoreIOManager()
+
+    # Get unique usernames and write per-user
+    usernames = gold_df["username"].unique().to_list()
+    total_rows = 0
+
+    for username in usernames:
+        user_df = gold_df.filter(pl.col("username") == username)
+        result = firestore_io.write_artist_play_counts(username, user_df)
+        total_rows += result["rows"]
 
     return {
-        **write_metadata,
+        "table_name": "artist_play_count",
+        "rows": total_rows,
+        "format": "firestore",
+        "medallion_layer": "gold",
         "execution_date": execution_date.isoformat(),
     }
 
@@ -152,17 +148,34 @@ def compute_track_play_counts(execution_date: datetime) -> dict[str, Any]:
     # Compute aggregations with per-user recency measures
     gold_lf = _compute_track_aggregations(plays_lf, dim_users_lf, execution_date)
 
-    # Write to gold layer
-    gold_io_manager = PolarsDeltaIOManager(medallion_layer="gold")
-    write_metadata = gold_io_manager.write_delta(
-        gold_lf,
-        table_name="track_play_count",
-        mode="overwrite",  # Full refresh - recompute all aggregates
-        partition_by="username",
-    )
+    # Collect the DataFrame
+    gold_df = gold_lf.collect()
+
+    # Write to Firestore (gold layer serving)
+    firestore_io = FirestoreIOManager()
+
+    # Get unique usernames and write per-user
+    usernames = gold_df["username"].unique().to_list()
+    total_rows = 0
+
+    # Also compute user stats while we have the data
+    for username in usernames:
+        user_df = gold_df.filter(pl.col("username") == username)
+        result = firestore_io.write_track_play_counts(username, user_df)
+        total_rows += result["rows"]
+
+        # Write user stats (derived from track play counts)
+        stats = {
+            "total_tracks_played": len(user_df),
+            "total_plays": int(user_df["play_count"].sum()),
+        }
+        firestore_io.write_user_stats(username, stats)
 
     return {
-        **write_metadata,
+        "table_name": "track_play_count",
+        "rows": total_rows,
+        "format": "firestore",
+        "medallion_layer": "gold",
         "execution_date": execution_date.isoformat(),
     }
 

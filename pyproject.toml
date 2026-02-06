@@ -24,6 +24,7 @@ dependencies = [
   "gcsfs>=2026.1",
   "google-api-python-client>=2.187",
   "google-auth-oauthlib>=1.2.3",
+  "google-cloud-firestore>=2.23",
   "polars>=1.36.1",
   "python-dotenv>=1.2.1",
   "requests>=2.32.5",
