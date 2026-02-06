@@ -16,6 +16,7 @@ Playlist creation costs 50 units per insert.
 Search now uses ytmusicapi (no quota cost) instead of YouTube Data API.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -28,8 +29,8 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
+import httpx
 import polars as pl
-import requests
 import streamlit as st
 from ytmusicapi import YTMusic
 
@@ -94,38 +95,44 @@ def poll_device_token(
     """
     Poll once for device authorization token.
 
+    Uses async httpx for non-blocking network calls.
     Returns token_info dict if authorized, None if still pending.
     Raises Exception on permanent errors.
     """
-    token_response = requests.post(
-        TOKEN_URI,
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "device_code": device_code,
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        },
-    )
 
-    token_data = token_response.json()
+    async def _poll() -> Optional[dict]:
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                TOKEN_URI,
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+            )
 
-    if "access_token" in token_data:
-        return {
-            "access_token": token_data["access_token"],
-            "refresh_token": token_data.get("refresh_token"),
-            "expires_in": token_data.get("expires_in"),
-            "token_type": "Bearer",
-        }
+            token_data = token_response.json()
 
-    error = token_data.get("error")
-    if error == "authorization_pending":
-        return None
-    elif error == "slow_down":
-        return None
-    else:
-        raise Exception(
-            f"OAuth error: {error} - {token_data.get('error_description', '')}"
-        )
+            if "access_token" in token_data:
+                return {
+                    "access_token": token_data["access_token"],
+                    "refresh_token": token_data.get("refresh_token"),
+                    "expires_in": token_data.get("expires_in"),
+                    "token_type": "Bearer",
+                }
+
+            error = token_data.get("error")
+            if error == "authorization_pending":
+                return None
+            elif error == "slow_down":
+                return None
+            else:
+                raise Exception(
+                    f"OAuth error: {error} - {token_data.get('error_description', '')}"
+                )
+
+    return asyncio.run(_poll())
 
 
 def run_youtube_oauth(
@@ -134,31 +141,37 @@ def run_youtube_oauth(
     """
     Run YouTube Data API OAuth flow using device authorization.
 
+    Uses async httpx for non-blocking network calls.
     Returns tuple of (device_info, None). Use poll_device_token() to get tokens.
     """
-    device_response = requests.post(
-        "https://oauth2.googleapis.com/device/code",
-        data={
-            "client_id": client_id,
-            "scope": " ".join(YOUTUBE_SCOPES),
-        },
-    )
 
-    if device_response.status_code != 200:
-        logger.error(f"Device code request failed: {device_response.text}")
-        return None, None
+    async def _get_device_code() -> tuple[Optional[dict], Optional[dict]]:
+        async with httpx.AsyncClient() as client:
+            device_response = await client.post(
+                "https://oauth2.googleapis.com/device/code",
+                data={
+                    "client_id": client_id,
+                    "scope": " ".join(YOUTUBE_SCOPES),
+                },
+            )
 
-    device_data = device_response.json()
+            if device_response.status_code != 200:
+                logger.error(f"Device code request failed: {device_response.text}")
+                return None, None
 
-    device_info = {
-        "device_code": device_data["device_code"],
-        "verification_url": device_data["verification_url"],
-        "user_code": device_data["user_code"],
-        "interval": device_data.get("interval", 5),
-        "expires_in": device_data.get("expires_in", 1800),
-    }
+            device_data = device_response.json()
 
-    return device_info, None
+            device_info = {
+                "device_code": device_data["device_code"],
+                "verification_url": device_data["verification_url"],
+                "user_code": device_data["user_code"],
+                "interval": device_data.get("interval", 5),
+                "expires_in": device_data.get("expires_in", 1800),
+            }
+
+            return device_info, None
+
+    return asyncio.run(_get_device_code())
 
 
 class YouTubePlaylistGenerator:

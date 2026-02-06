@@ -118,11 +118,26 @@ class MockFirestoreIOManager:
 
 @pytest.fixture(autouse=True)
 def mock_firestore(monkeypatch):
-    """Mock FirestoreIOManager for all tests."""
+    """Mock FirestoreIOManager and AsyncFirestoreReader for all tests."""
     MockFirestoreIOManager.reset()
 
     monkeypatch.setattr(
         "music_airflow.app.excluded_tracks.FirestoreIOManager", MockFirestoreIOManager
+    )
+
+    # Also mock the AsyncFirestoreReader used for reads
+    class MockAsyncFirestoreReader:
+        """Mock async reader that delegates to MockFirestoreIOManager."""
+
+        async def read_excluded_tracks(self, username: str) -> pl.DataFrame:
+            return MockFirestoreIOManager().read_excluded_tracks(username)
+
+        async def read_excluded_artists(self, username: str) -> pl.DataFrame:
+            return MockFirestoreIOManager().read_excluded_artists(username)
+
+    monkeypatch.setattr(
+        "music_airflow.app.excluded_tracks.AsyncFirestoreReader",
+        MockAsyncFirestoreReader,
     )
 
     yield MockFirestoreIOManager

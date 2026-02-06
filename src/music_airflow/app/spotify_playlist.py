@@ -14,6 +14,7 @@ Note: Creating playlists and adding tracks requires user authorization.
 The client credentials flow (used for search) is not sufficient.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -21,8 +22,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 from dotenv import load_dotenv
+import httpx
 import polars as pl
-import requests
 import streamlit as st
 from spotipy import Spotify
 
@@ -92,32 +93,38 @@ def refresh_spotify_token(
     """
     Refresh Spotify access token using refresh token.
 
+    Uses async httpx for non-blocking network calls.
     Returns token_info dict if successful, None otherwise.
     """
-    try:
-        response = requests.post(
-            TOKEN_URI,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            },
-            auth=(client_id, client_secret),
-        )
 
-        if response.status_code == 200:
-            token_data = response.json()
-            return {
-                "access_token": token_data["access_token"],
-                "refresh_token": token_data.get("refresh_token", refresh_token),
-                "expires_in": token_data.get("expires_in"),
-                "token_type": "Bearer",
-            }
-        else:
-            logger.error(f"Token refresh failed: {response.text}")
+    async def _refresh() -> Optional[dict]:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    TOKEN_URI,
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                    },
+                    auth=(client_id, client_secret),
+                )
+
+                if response.status_code == 200:
+                    token_data = response.json()
+                    return {
+                        "access_token": token_data["access_token"],
+                        "refresh_token": token_data.get("refresh_token", refresh_token),
+                        "expires_in": token_data.get("expires_in"),
+                        "token_type": "Bearer",
+                    }
+                else:
+                    logger.error(f"Token refresh failed: {response.text}")
+                    return None
+        except Exception as e:
+            logger.error(f"Token refresh error: {e}")
             return None
-    except Exception as e:
-        logger.error(f"Token refresh error: {e}")
-        return None
+
+    return asyncio.run(_refresh())
 
 
 def poll_device_token(
@@ -126,38 +133,44 @@ def poll_device_token(
     """
     Poll once for device authorization token.
 
+    Uses async httpx for non-blocking network calls.
     Returns token_info dict if authorized, None if still pending.
     Raises Exception on permanent errors.
     """
-    token_response = requests.post(
-        TOKEN_URI,
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "device_code": device_code,
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        },
-    )
 
-    token_data = token_response.json()
+    async def _poll() -> Optional[dict]:
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                TOKEN_URI,
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+            )
 
-    if "access_token" in token_data:
-        return {
-            "access_token": token_data["access_token"],
-            "refresh_token": token_data.get("refresh_token"),
-            "expires_in": token_data.get("expires_in"),
-            "token_type": "Bearer",
-        }
+            token_data = token_response.json()
 
-    error = token_data.get("error")
-    if error == "authorization_pending":
-        return None
-    elif error == "slow_down":
-        return None
-    else:
-        raise Exception(
-            f"OAuth error: {error} - {token_data.get('error_description', '')}"
-        )
+            if "access_token" in token_data:
+                return {
+                    "access_token": token_data["access_token"],
+                    "refresh_token": token_data.get("refresh_token"),
+                    "expires_in": token_data.get("expires_in"),
+                    "token_type": "Bearer",
+                }
+
+            error = token_data.get("error")
+            if error == "authorization_pending":
+                return None
+            elif error == "slow_down":
+                return None
+            else:
+                raise Exception(
+                    f"OAuth error: {error} - {token_data.get('error_description', '')}"
+                )
+
+    return asyncio.run(_poll())
 
 
 def run_spotify_oauth(client_id: str, client_secret: str) -> tuple[str, str]:
@@ -194,36 +207,40 @@ def exchange_code_for_token(
     """
     Exchange authorization code for access/refresh tokens.
 
+    Uses async httpx for non-blocking network calls.
     Returns token_info dict if successful, None otherwise.
     """
-    # Must match the redirect_uri used in authorization request
     redirect_uri = "http://127.0.0.1:8501/"
 
-    try:
-        response = requests.post(
-            TOKEN_URI,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-            },
-            auth=(client_id, client_secret),
-        )
+    async def _exchange() -> Optional[dict]:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    TOKEN_URI,
+                    data={
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                    },
+                    auth=(client_id, client_secret),
+                )
 
-        if response.status_code == 200:
-            token_data = response.json()
-            return {
-                "access_token": token_data["access_token"],
-                "refresh_token": token_data.get("refresh_token"),
-                "expires_in": token_data.get("expires_in"),
-                "token_type": "Bearer",
-            }
-        else:
-            logger.error(f"Token exchange failed: {response.text}")
+                if response.status_code == 200:
+                    token_data = response.json()
+                    return {
+                        "access_token": token_data["access_token"],
+                        "refresh_token": token_data.get("refresh_token"),
+                        "expires_in": token_data.get("expires_in"),
+                        "token_type": "Bearer",
+                    }
+                else:
+                    logger.error(f"Token exchange failed: {response.text}")
+                    return None
+        except Exception as e:
+            logger.error(f"Token exchange error: {e}")
             return None
-    except Exception as e:
-        logger.error(f"Token exchange error: {e}")
-        return None
+
+    return asyncio.run(_exchange())
 
 
 class SpotifyPlaylistGenerator:
