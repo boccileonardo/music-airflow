@@ -10,8 +10,8 @@ import polars as pl
 import streamlit as st
 
 from music_airflow.app.auth import (
+    get_auth_state,
     render_user_menu,
-    require_authentication,
 )
 from music_airflow.app.data_loading import (
     load_top_artists,
@@ -42,8 +42,8 @@ logging.basicConfig(
 
 
 def main():
-    # Check authentication first (will show login page if needed)
-    auth_username = require_authentication()
+    # Get authentication state (demo mode or full access)
+    auth_state = get_auth_state()
 
     st.set_page_config(
         page_title="AirStream.FM",
@@ -53,18 +53,38 @@ def main():
     )
 
     # Handle OAuth callbacks early (before other rendering)
-    handle_oauth_callback()
+    # Only process if not in demo mode (to prevent unauthorized token storage)
+    if not auth_state.is_demo_mode:
+        handle_oauth_callback()
 
     # Prefetch track candidates for all users to enable instant switching
     prefetch_all_users_track_candidates()
 
     # Render sidebar and get settings
-    # Pass auth_username to restrict user selection when auth is enabled
-    settings = _render_sidebar(auth_username)
-    username = settings["username"]
+    # - Dev mode: show user selector (no auth configured)
+    # - Demo mode: locked to default user (read-only)
+    # - Full access: locked to authenticated user's username
+    if auth_state.is_dev_mode:
+        # Dev mode: show user selector
+        settings = _render_sidebar(auth_username=None, is_demo_mode=False)
+        username = settings["username"]
+    elif auth_state.is_demo_mode:
+        # Demo mode: locked to default user
+        settings = _render_sidebar(auth_username=None, is_demo_mode=True)
+        username = auth_state.username
+    else:
+        # Full access: locked to authenticated user
+        settings = _render_sidebar(
+            auth_username=auth_state.username, is_demo_mode=False
+        )
+        username = auth_state.username
 
-    # Render user menu (logout button) in sidebar
-    render_user_menu()
+    # Render user menu (login/logout button) in sidebar
+    render_user_menu(auth_state.is_demo_mode)
+
+    # Show demo mode banner if applicable
+    if auth_state.is_demo_mode:
+        _render_demo_banner()
 
     # Render main content
     _render_user_profile(username)
@@ -73,17 +93,34 @@ def main():
     if recommendations is not None:
         _render_recommendations(recommendations)
         _render_why_recommended_expander(recommendations)
-        render_exclusions_expander(username, recommendations)
 
-    render_playlist_export_section()
+        # Only show exclusions management in full access mode
+        if not auth_state.is_demo_mode:
+            render_exclusions_expander(username, recommendations)
+
+    # Only show playlist export in full access mode
+    if not auth_state.is_demo_mode:
+        render_playlist_export_section()
 
 
-def _render_sidebar(auth_username: str | None = None) -> dict:
+def _render_demo_banner() -> None:
+    """Render a banner indicating demo mode with limited functionality."""
+    st.info(
+        "👁️ **Demo Mode** — You're viewing sample recommendations. "
+        "Sign in with a registered account to manage exclusions and create playlists.",
+        icon="ℹ️",
+    )
+
+
+def _render_sidebar(
+    auth_username: str | None = None, is_demo_mode: bool = False
+) -> dict:
     """Render sidebar and return settings.
 
     Args:
         auth_username: If set, restrict user selection to this username only.
                       When auth is enabled, users can only view their own data.
+        is_demo_mode: If True, user is in demo mode (read-only access to default user).
     """
     with st.sidebar:
         st.title("🎵 AirStream.FM")
@@ -91,8 +128,13 @@ def _render_sidebar(auth_username: str | None = None) -> dict:
 
         st.divider()
 
-        # When auth is enabled, lock to authenticated user's username
-        if auth_username:
+        # Determine username display based on mode
+        if is_demo_mode:
+            # Demo mode: locked to default user, shown as demo
+            username = LAST_FM_USERNAMES[0]  # Default user
+            st.text(f"👤 {username} (demo)")
+        elif auth_username:
+            # Full access: locked to authenticated user
             username = auth_username
             st.text(f"👤 {username}")
         else:

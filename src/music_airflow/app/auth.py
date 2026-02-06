@@ -3,12 +3,19 @@ Authentication module for the Streamlit app.
 
 Uses Streamlit's built-in OIDC authentication to verify user identity.
 Maps authenticated emails to Last.fm usernames for data access.
+
+Supports two modes:
+- Full access: Authenticated user with mapped Last.fm username
+- Demo mode: Unauthenticated or unmapped users can view default user's data (read-only)
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import streamlit as st
+
+from music_airflow.utils.constants import DEFAULT_USERNAME
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +25,17 @@ EMAIL_TO_USERNAME: dict[str, str] = {
     "lelopolel@gmail.com": "lelopolel",
     "mzkzjz@gmail.com": "Martazie",
 }
+
+
+@dataclass
+class AuthState:
+    """Authentication state for the current session."""
+
+    username: str
+    is_demo_mode: bool
+    is_dev_mode: bool = False  # True when auth is not configured (local development)
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
 
 
 def is_auth_configured() -> bool:
@@ -58,101 +76,72 @@ def get_authenticated_username() -> Optional[str]:
     return EMAIL_TO_USERNAME.get(email)
 
 
-def require_authentication() -> Optional[str]:
+def get_auth_state() -> AuthState:
     """
-    Require authentication and return the username.
-
-    Shows login UI if not authenticated.
-    Shows error if authenticated but not authorized.
+    Get the authentication state for the current session.
 
     Returns:
-        Last.fm username if authorized, None if login UI shown.
+        AuthState with username and demo_mode flag.
+        - Dev mode: auth not configured (local development), full access with user selector
+        - Full access: authenticated user with mapped username
+        - Demo mode: unauthenticated or unmapped user viewing default user's data (read-only)
     """
     if not is_auth_configured():
-        # Auth not configured - allow all users (development mode)
+        # Auth not configured - development mode, full access with user selector
         logger.warning("Authentication not configured - running in development mode")
-        return None
+        return AuthState(
+            username=DEFAULT_USERNAME, is_demo_mode=False, is_dev_mode=True
+        )
 
     user = get_authenticated_user()
 
     if not user:
-        _render_login_page()
-        return None
+        # Not logged in - demo mode
+        return AuthState(username=DEFAULT_USERNAME, is_demo_mode=True)
 
     email = user.get("email", "").lower()
     username = EMAIL_TO_USERNAME.get(email)
 
     if not username:
-        _render_unauthorized_page(email)
-        return None
+        # Logged in but not mapped - demo mode
+        return AuthState(
+            username=DEFAULT_USERNAME,
+            is_demo_mode=True,
+            user_email=email,
+            user_name=user.get("name"),
+        )
 
-    return username
-
-
-def _render_login_page() -> None:
-    """Render the login page."""
-    st.set_page_config(
-        page_title="AirStream.FM - Login",
-        page_icon="🎵",
-        layout="centered",
+    # Fully authenticated and mapped
+    return AuthState(
+        username=username,
+        is_demo_mode=False,
+        user_email=email,
+        user_name=user.get("name"),
     )
 
-    st.title("🎵 AirStream.FM")
-    st.subheader("Music Recommendation System")
 
-    st.divider()
-
-    st.markdown(
-        """
-        Welcome to AirStream.FM! This app provides personalized music
-        recommendations based on your Last.fm listening history.
-
-        Please sign in to access your recommendations.
-        """
-    )
-
-    if st.button("🔐 Sign in with Google", type="primary", use_container_width=True):
-        st.login()
-
-    st.stop()
-
-
-def _render_unauthorized_page(email: str) -> None:
-    """Render the unauthorized page for users not in the allowed list."""
-    st.set_page_config(
-        page_title="AirStream.FM - Unauthorized",
-        page_icon="🎵",
-        layout="centered",
-    )
-
-    st.title("🎵 AirStream.FM")
-
-    st.error(
-        f"**Access Denied**\n\n"
-        f"The email `{email}` is not authorized to use this app.\n\n"
-        f"If you believe this is an error, please contact the administrator."
-    )
-
-    if st.button("🚪 Sign out", type="secondary"):
-        st.logout()
-
-    st.stop()
-
-
-def render_user_menu() -> None:
+def render_user_menu(is_demo_mode: bool = False) -> None:
     """Render user menu in sidebar showing logged-in user with logout option."""
     if not is_auth_configured():
         return
 
     user = get_authenticated_user()
-    if not user:
-        return
 
     with st.sidebar:
         st.divider()
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.caption(f"👤 {user.get('name', user.get('email', 'User'))}")
-        with col2:
-            if st.button("Logout", key="logout_btn", type="secondary"):
-                st.logout()
+        if user:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                display_name = user.get("name", user.get("email", "User"))
+                if is_demo_mode:
+                    st.caption(f"👤 {display_name} (Demo)")
+                else:
+                    st.caption(f"👤 {display_name}")
+            with col2:
+                if st.button("Logout", key="logout_btn", type="secondary"):
+                    st.logout()
+        else:
+            # Show login button for demo mode users
+            st.caption("👁️ Demo Mode")
+            if st.button("🔐 Sign in", key="login_btn", type="primary"):
+                st.login()

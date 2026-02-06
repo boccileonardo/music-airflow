@@ -2,6 +2,20 @@
 
 This guide covers the steps required to add a new user to the AirStream.FM music recommendation system.
 
+## Access Modes
+
+The app supports three access modes:
+
+| Mode | Who | Capabilities |
+|------|-----|--------------|
+| **Dev Mode** | Local development (no auth configured) | Full access, user selector dropdown |
+| **Demo Mode** | Unauthenticated or unmapped users | View-only access to default user's recommendations |
+| **Full Access** | Authenticated users with mapped Last.fm username | Full access to own data, exclusions, playlist export |
+
+Users in demo mode can browse the app and see sample recommendations, but cannot:
+- Manage exclusions
+- Export playlists to Spotify/YouTube
+
 ## Step 1: Add User to Code Configuration
 
 ### 1.1 Add Email-to-Username Mapping
@@ -16,7 +30,7 @@ EMAIL_TO_USERNAME: dict[str, str] = {
 ```
 
 This mapping:
-- Controls who can access the app (authorization)
+- Controls who gets full access to the app
 - Links the user's Google login email to their Last.fm username
 - Ensures users can only access their own data and OAuth tokens
 
