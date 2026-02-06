@@ -165,26 +165,38 @@ class TestSpotifyPlaylistGenerator:
         """Test needs_authentication returns True when no tokens."""
         from music_airflow.app.spotify_playlist import SpotifyPlaylistGenerator
 
-        with patch(
-            "music_airflow.app.spotify_playlist.load_spotify_creds"
-        ) as mock_load:
+        with (
+            patch("music_airflow.app.spotify_playlist.load_spotify_creds") as mock_load,
+            patch(
+                "music_airflow.app.spotify_playlist.get_oauth_storage"
+            ) as mock_storage,
+        ):
             mock_creds = MagicMock()
             mock_creds.has_client_creds.return_value = True
-            mock_creds.has_tokens.return_value = False
             mock_load.return_value = mock_creds
 
-            assert SpotifyPlaylistGenerator.needs_authentication() is True
+            mock_storage_instance = MagicMock()
+            mock_storage_instance.has_tokens.return_value = False
+            mock_storage.return_value = mock_storage_instance
+
+            assert SpotifyPlaylistGenerator.needs_authentication("testuser") is True
 
     def test_needs_authentication_with_tokens(self):
         """Test needs_authentication returns False when tokens exist."""
         from music_airflow.app.spotify_playlist import SpotifyPlaylistGenerator
 
-        with patch(
-            "music_airflow.app.spotify_playlist.load_spotify_creds"
-        ) as mock_load:
+        with (
+            patch("music_airflow.app.spotify_playlist.load_spotify_creds") as mock_load,
+            patch(
+                "music_airflow.app.spotify_playlist.get_oauth_storage"
+            ) as mock_storage,
+        ):
             mock_creds = MagicMock()
             mock_creds.has_client_creds.return_value = True
-            mock_creds.has_tokens.return_value = True
             mock_load.return_value = mock_creds
 
-            assert SpotifyPlaylistGenerator.needs_authentication() is False
+            mock_storage_instance = MagicMock()
+            mock_storage_instance.has_tokens.return_value = True
+            mock_storage.return_value = mock_storage_instance
+
+            assert SpotifyPlaylistGenerator.needs_authentication("testuser") is False

@@ -26,7 +26,10 @@ from music_airflow.app.filtering import (
     filter_candidates,
     load_recommendation_reasons,
 )
-from music_airflow.app.playlist_export_ui import render_playlist_export_section
+from music_airflow.app.playlist_export_ui import (
+    handle_oauth_callback,
+    render_playlist_export_section,
+)
 from music_airflow.utils.constants import LAST_FM_USERNAMES
 
 logging.basicConfig(
@@ -41,6 +44,9 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
     )
+
+    # Handle OAuth callbacks early (before other rendering)
+    handle_oauth_callback()
 
     # Prefetch track candidates for all users to enable instant switching
     prefetch_all_users_track_candidates()

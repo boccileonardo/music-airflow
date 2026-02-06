@@ -6,9 +6,9 @@ Uses spotipy library for API interactions.
 
 Authentication:
 --------------
-Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env
-Run OAuth flow from Streamlit UI to get user tokens
-Tokens stored in SPOTIFY_ACCESS_TOKEN and SPOTIFY_REFRESH_TOKEN
+Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env or Streamlit secrets.
+Users authenticate via OAuth in the Streamlit app.
+Tokens are stored per-user in Firestore for multi-tenant support.
 
 Note: Creating playlists and adding tracks requires user authorization.
 The client credentials flow (used for search) is not sufficient.
@@ -20,12 +20,15 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 import httpx
 import polars as pl
 import streamlit as st
 from spotipy import Spotify
+
+from music_airflow.app.oauth_storage import get_oauth_storage
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +43,13 @@ AUTH_URI = "https://accounts.spotify.com/authorize"
 
 @dataclass
 class SpotifyOAuthCredentials:
-    """OAuth credentials for Spotify API."""
+    """OAuth credentials for Spotify API (app-level only)."""
 
     client_id: str
     client_secret: str
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
 
     def has_client_creds(self) -> bool:
         return bool(self.client_id and self.client_secret)
-
-    def has_tokens(self) -> bool:
-        return bool(self.refresh_token)
 
 
 def _get_secret(key: str) -> Optional[str]:
@@ -72,7 +70,7 @@ def _get_secret(key: str) -> Optional[str]:
 
 
 def load_spotify_creds() -> Optional[SpotifyOAuthCredentials]:
-    """Load Spotify API OAuth credentials."""
+    """Load Spotify API OAuth credentials (app-level only)."""
     client_id = _get_secret("SPOTIFY_CLIENT_ID")
     client_secret = _get_secret("SPOTIFY_CLIENT_SECRET")
 
@@ -82,9 +80,26 @@ def load_spotify_creds() -> Optional[SpotifyOAuthCredentials]:
     return SpotifyOAuthCredentials(
         client_id=client_id,
         client_secret=client_secret,
-        access_token=_get_secret("SPOTIFY_ACCESS_TOKEN"),
-        refresh_token=_get_secret("SPOTIFY_REFRESH_TOKEN"),
     )
+
+
+def get_spotify_redirect_uri() -> str:
+    """Get the redirect URI for Spotify OAuth based on deployment context."""
+    # Check for explicit override
+    override = _get_secret("SPOTIFY_REDIRECT_URI")
+    if override:
+        return override
+
+    # Use Streamlit's URL if available (works on Streamlit Cloud)
+    try:
+        # Get the base URL from session state or construct from context
+        if "streamlit_url" in st.session_state:
+            return st.session_state["streamlit_url"]
+
+        # Default to loopback IP for local development (localhost not allowed by Spotify)
+        return "http://127.0.0.1:8501/"
+    except Exception:
+        return "http://127.0.0.1:8501/"
 
 
 def refresh_spotify_token(
@@ -127,65 +142,22 @@ def refresh_spotify_token(
     return asyncio.run(_refresh())
 
 
-def poll_device_token(
-    client_id: str, client_secret: str, device_code: str
-) -> Optional[dict]:
-    """
-    Poll once for device authorization token.
-
-    Uses async httpx for non-blocking network calls.
-    Returns token_info dict if authorized, None if still pending.
-    Raises Exception on permanent errors.
-    """
-
-    async def _poll() -> Optional[dict]:
-        async with httpx.AsyncClient() as client:
-            token_response = await client.post(
-                TOKEN_URI,
-                data={
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "device_code": device_code,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                },
-            )
-
-            token_data = token_response.json()
-
-            if "access_token" in token_data:
-                return {
-                    "access_token": token_data["access_token"],
-                    "refresh_token": token_data.get("refresh_token"),
-                    "expires_in": token_data.get("expires_in"),
-                    "token_type": "Bearer",
-                }
-
-            error = token_data.get("error")
-            if error == "authorization_pending":
-                return None
-            elif error == "slow_down":
-                return None
-            else:
-                raise Exception(
-                    f"OAuth error: {error} - {token_data.get('error_description', '')}"
-                )
-
-    return asyncio.run(_poll())
-
-
-def run_spotify_oauth(client_id: str, client_secret: str) -> tuple[str, str]:
+def run_spotify_oauth(
+    client_id: str, client_secret: str, username: str
+) -> tuple[str, str]:
     """
     Generate Spotify OAuth authorization URL.
 
     Returns tuple of (auth_url, state).
+    State includes username to persist across redirect.
     User must visit auth_url and authorize, then we get the code from redirect.
     """
     import secrets
-    from urllib.parse import urlencode
 
-    state = secrets.token_urlsafe(16)
-    # Use loopback IP (not localhost) - must match exactly what's registered in Spotify Dashboard
-    redirect_uri = "http://127.0.0.1:8501/"
+    # Encode username in state to survive page reload
+    nonce = secrets.token_urlsafe(16)
+    state = f"spotify:{username}:{nonce}"
+    redirect_uri = get_spotify_redirect_uri()
 
     params = {
         "client_id": client_id,
@@ -196,7 +168,6 @@ def run_spotify_oauth(client_id: str, client_secret: str) -> tuple[str, str]:
         "show_dialog": "true",
     }
 
-    # Use urlencode to properly encode spaces and special characters
     auth_url = f"{AUTH_URI}?{urlencode(params)}"
     return auth_url, state
 
@@ -210,7 +181,7 @@ def exchange_code_for_token(
     Uses async httpx for non-blocking network calls.
     Returns token_info dict if successful, None otherwise.
     """
-    redirect_uri = "http://127.0.0.1:8501/"
+    redirect_uri = get_spotify_redirect_uri()
 
     async def _exchange() -> Optional[dict]:
         try:
@@ -246,25 +217,35 @@ def exchange_code_for_token(
 class SpotifyPlaylistGenerator:
     """Generate Spotify playlists from track recommendations."""
 
-    def __init__(self):
+    def __init__(self, username: str):
+        """
+        Initialize generator for a specific user.
+
+        Args:
+            username: The app username (for token storage)
+        """
+        self.username = username
         self.spotify: Optional[Spotify] = None
-        self.user_id: Optional[str] = None
+        self.spotify_user_id: Optional[str] = None
         self.search_cache: dict[str, Optional[str]] = {}
 
     def authenticate(self) -> bool:
-        """Authenticate with Spotify API using stored tokens."""
+        """Authenticate with Spotify API using stored tokens from Firestore."""
         creds = load_spotify_creds()
         if not creds or not creds.has_client_creds():
             logger.error("No Spotify client credentials found")
             return False
 
-        if not creds.has_tokens():
+        # Get tokens from Firestore
+        storage = get_oauth_storage()
+        tokens = storage.get_tokens(self.username, "spotify")
+
+        if not tokens or not tokens.get("refresh_token"):
             logger.error("No Spotify tokens found - authentication required")
             return False
 
-        # Try to use stored tokens
-        access_token = creds.access_token
-        refresh_token = creds.refresh_token
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
 
         # Try to refresh the token
         if refresh_token:
@@ -273,7 +254,14 @@ class SpotifyPlaylistGenerator:
             )
             if token_info:
                 access_token = token_info["access_token"]
-                self._store_refreshed_token(token_info)
+                # Update tokens in Firestore
+                storage.update_access_token(
+                    self.username,
+                    "spotify",
+                    access_token,
+                    token_info.get("refresh_token"),
+                    token_info.get("expires_in"),
+                )
                 logger.info("Spotify token refreshed successfully")
 
         if not access_token:
@@ -284,40 +272,38 @@ class SpotifyPlaylistGenerator:
             self.spotify = Spotify(auth=access_token)
             # Verify authentication by getting user profile
             user = self.spotify.current_user()
-            self.user_id = user["id"]
-            logger.info(f"Spotify authenticated as user: {self.user_id}")
+            self.spotify_user_id = user["id"]
+            logger.info(f"Spotify authenticated as user: {self.spotify_user_id}")
             return True
         except Exception as e:
             logger.error(f"Spotify authentication failed: {e}")
             return False
 
-    def _store_refreshed_token(self, token_info: dict) -> None:
-        """Store refreshed token in session state for UI display."""
-        try:
-            st.session_state.refreshed_spotify_token = {
-                "access_token": token_info.get("access_token"),
-                "refresh_token": token_info.get("refresh_token"),
-            }
-        except Exception:
-            pass
-
     @staticmethod
-    def get_auth_status() -> dict:
-        """Check authentication status."""
-        spotify = load_spotify_creds()
+    def get_auth_status(username: str) -> dict:
+        """Check authentication status for a user."""
+        creds = load_spotify_creds()
+        storage = get_oauth_storage()
+        has_tokens = storage.has_tokens(username, "spotify")
 
         return {
             "spotify": {
-                "has_client": spotify.has_client_creds() if spotify else False,
-                "has_tokens": spotify.has_tokens() if spotify else False,
+                "has_client": creds.has_client_creds() if creds else False,
+                "has_tokens": has_tokens,
             },
         }
 
     @staticmethod
-    def needs_authentication() -> bool:
-        """Check if authentication is needed."""
-        status = SpotifyPlaylistGenerator.get_auth_status()
+    def needs_authentication(username: str) -> bool:
+        """Check if authentication is needed for a user."""
+        status = SpotifyPlaylistGenerator.get_auth_status(username)
         return not status["spotify"]["has_tokens"]
+
+    @staticmethod
+    def disconnect(username: str) -> bool:
+        """Disconnect Spotify (remove tokens) for a user."""
+        storage = get_oauth_storage()
+        return storage.delete_tokens(username, "spotify")
 
     def search_track(self, track_name: str, artist_name: str) -> Optional[str]:
         """
@@ -365,7 +351,7 @@ class SpotifyPlaylistGenerator:
 
     def find_playlist_by_title(self, title: str) -> Optional[str]:
         """Find playlist by title in user's playlists."""
-        if not self.spotify or not self.user_id:
+        if not self.spotify or not self.spotify_user_id:
             return None
 
         try:
@@ -380,7 +366,10 @@ class SpotifyPlaylistGenerator:
                     break
 
                 for item in items:
-                    if item["name"] == title and item["owner"]["id"] == self.user_id:
+                    if (
+                        item["name"] == title
+                        and item["owner"]["id"] == self.spotify_user_id
+                    ):
                         return item["id"]
 
                 if len(items) < limit:
@@ -395,12 +384,12 @@ class SpotifyPlaylistGenerator:
         self, title: str, description: str = "", public: bool = True
     ) -> Optional[str]:
         """Create a new playlist."""
-        if not self.spotify or not self.user_id:
+        if not self.spotify or not self.spotify_user_id:
             return None
 
         try:
             response = self.spotify.user_playlist_create(
-                user=self.user_id,
+                user=self.spotify_user_id,
                 name=title,
                 public=public,
                 description=description,

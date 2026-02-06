@@ -11,6 +11,9 @@ from music_airflow.app.youtube_playlist import (
 )
 
 
+TEST_USERNAME = "testuser"
+
+
 @pytest.fixture
 def sample_tracks():
     """Sample tracks DataFrame with correct column names."""
@@ -53,7 +56,7 @@ class TestYTMusicSearch:
 
     def test_search_track_ytmusic_returns_song(self):
         """Test YTMusic search prioritizes songs over videos."""
-        generator = YouTubePlaylistGenerator()
+        generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
         mock_ytmusic = MagicMock()
         mock_ytmusic.search.return_value = [
@@ -75,7 +78,7 @@ class TestYTMusicSearch:
 
     def test_search_track_ytmusic_fallback_no_filter(self):
         """Test YTMusic fallback to unfiltered search if no songs found."""
-        generator = YouTubePlaylistGenerator()
+        generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
         mock_ytmusic = MagicMock()
         # First call (filtered songs) returns empty
@@ -99,7 +102,7 @@ class TestYTMusicSearch:
 
     def test_search_track_ytmusic_none_when_no_client(self):
         """Test search returns None when YTMusic client not available."""
-        generator = YouTubePlaylistGenerator()
+        generator = YouTubePlaylistGenerator(TEST_USERNAME)
         generator.ytmusic = None
 
         video_id = generator.search_track_ytmusic("Track", "Artist")
@@ -108,7 +111,7 @@ class TestYTMusicSearch:
 
     def test_search_track_ytmusic_handles_exception(self):
         """Test YTMusic search handles exceptions gracefully."""
-        generator = YouTubePlaylistGenerator()
+        generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
         mock_ytmusic = MagicMock()
         mock_ytmusic.search.side_effect = Exception("API Error")
@@ -124,7 +127,7 @@ class TestSearchTrackIntegration:
 
     def test_search_track_uses_ytmusic_first(self):
         """Test that search_track tries YTMusic before YouTube Data API."""
-        generator = YouTubePlaylistGenerator()
+        generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
         mock_ytmusic = MagicMock()
         mock_ytmusic.search.return_value = [
@@ -143,7 +146,7 @@ class TestSearchTrackIntegration:
 
     def test_search_track_falls_back_to_youtube_api(self):
         """Test fallback to YouTube Data API when YTMusic fails."""
-        generator = YouTubePlaylistGenerator()
+        generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
         # YTMusic returns nothing
         mock_ytmusic = MagicMock()
@@ -173,7 +176,7 @@ class TestSearchTrackIntegration:
 
 def test_search_track_success():
     """Test successful track search via YouTube API fallback."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     # Disable YTMusic to test YouTube API path
     generator.ytmusic = None
@@ -207,7 +210,7 @@ def test_search_track_success():
 
 def test_search_track_prioritizes_topic_channel():
     """Test that Topic channels are prioritized in YouTube API fallback."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     # Disable YTMusic
     generator.ytmusic = None
@@ -244,7 +247,7 @@ def test_search_track_prioritizes_topic_channel():
 
 def test_search_track_filters_music_videos():
     """Test that music videos are filtered out when possible in YouTube API fallback."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     # Disable YTMusic
     generator.ytmusic = None
@@ -281,7 +284,7 @@ def test_search_track_filters_music_videos():
 
 def test_search_track_no_results():
     """Test track search with no results from both YTMusic and YouTube API."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     # YTMusic returns nothing
     mock_ytmusic = MagicMock()
@@ -306,7 +309,7 @@ def test_search_track_no_results():
 
 def test_search_track_uses_cache():
     """Test that search results are cached."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     # YTMusic returns result
     mock_ytmusic = MagicMock()
@@ -329,7 +332,7 @@ def test_search_track_uses_cache():
 
 def test_create_playlist_success():
     """Test successful playlist creation."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     mock_youtube = MagicMock()
     mock_playlists = MagicMock()
@@ -353,7 +356,7 @@ def test_create_playlist_success():
 
 def test_delete_playlist_success():
     """Test successful playlist deletion."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     mock_youtube = MagicMock()
     mock_playlists = MagicMock()
@@ -373,7 +376,7 @@ def test_delete_playlist_success():
 
 def test_add_video_to_playlist_success():
     """Test successfully adding video to playlist."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     mock_youtube = MagicMock()
     mock_playlist_items = MagicMock()
@@ -393,7 +396,7 @@ def test_add_video_to_playlist_success():
 
 def test_add_video_to_playlist_retries_on_409():
     """Test that 409 errors trigger retry logic."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     mock_youtube = MagicMock()
     mock_playlist_items = MagicMock()
@@ -421,7 +424,7 @@ def test_add_video_to_playlist_retries_on_409():
 
 def test_add_video_to_playlist_stops_on_quota_exceeded():
     """Test that quota exceeded errors don't trigger retries."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     mock_youtube = MagicMock()
     mock_playlist_items = MagicMock()
@@ -450,7 +453,7 @@ def test_add_video_to_playlist_stops_on_quota_exceeded():
 
 def test_find_playlist_by_title_found():
     """Test finding an existing playlist by title."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     mock_youtube = MagicMock()
     mock_playlists = MagicMock()
@@ -474,7 +477,7 @@ def test_find_playlist_by_title_found():
 
 def test_find_playlist_by_title_not_found():
     """Test when playlist is not found."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     mock_youtube = MagicMock()
     mock_playlists = MagicMock()
@@ -528,7 +531,7 @@ def test_get_playlist_url():
 @patch("time.sleep")  # Mock sleep to speed up tests
 def test_create_playlist_from_urls(mock_sleep, sample_tracks_with_urls):
     """Test creating playlist directly from YouTube URLs."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     # Mock YouTube API
     mock_youtube = MagicMock()
@@ -570,7 +573,7 @@ def test_create_playlist_from_urls(mock_sleep, sample_tracks_with_urls):
 @patch("time.sleep")  # Mock sleep to speed up tests
 def test_create_playlist_tracks_without_urls(mock_sleep, sample_tracks):
     """Test creating playlist when tracks don't have youtube_url - they should be skipped."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     # Mock YouTube API (for playlist operations)
     mock_youtube = MagicMock()
@@ -605,7 +608,7 @@ def test_create_playlist_tracks_without_urls(mock_sleep, sample_tracks):
 @patch("time.sleep")  # Mock sleep to speed up tests
 def test_create_playlist_updates_existing(mock_sleep, sample_tracks_with_urls):
     """Test that existing playlist is deleted and recreated."""
-    generator = YouTubePlaylistGenerator()
+    generator = YouTubePlaylistGenerator(TEST_USERNAME)
 
     # Mock YouTube API
     mock_youtube = MagicMock()
@@ -668,18 +671,6 @@ class TestOAuthCredentials:
         """Test has_client_creds returns False when client_secret missing."""
         creds = OAuthCredentials(client_id="id", client_secret="")
         assert creds.has_client_creds() is False
-
-    def test_has_tokens_with_refresh_token(self):
-        """Test has_tokens returns True when refresh_token present."""
-        creds = OAuthCredentials(
-            client_id="id", client_secret="secret", refresh_token="refresh"
-        )
-        assert creds.has_tokens() is True
-
-    def test_has_tokens_without_refresh(self):
-        """Test has_tokens returns False when no refresh_token."""
-        creds = OAuthCredentials(client_id="id", client_secret="secret")
-        assert creds.has_tokens() is False
 
 
 class TestCredentialLoading:

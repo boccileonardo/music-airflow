@@ -2,6 +2,7 @@
 Playlist export UI components for the Streamlit app.
 
 Handles the UI for exporting recommendations to YouTube Music and Spotify playlists.
+Supports per-user OAuth authentication with tokens stored in Firestore.
 """
 
 import logging
@@ -9,18 +10,114 @@ import traceback
 
 import streamlit as st
 
+from music_airflow.app.oauth_storage import get_oauth_storage
 from music_airflow.app.spotify_playlist import (
     SpotifyPlaylistGenerator,
     exchange_code_for_token,
+    get_spotify_redirect_uri,
     load_spotify_creds,
     run_spotify_oauth,
 )
 from music_airflow.app.youtube_playlist import (
     YouTubePlaylistGenerator,
+    exchange_youtube_code_for_token,
     load_youtube_creds,
-    poll_device_token,
     run_youtube_oauth,
 )
+
+
+def handle_oauth_callback() -> None:
+    """
+    Handle OAuth callback from URL query parameters.
+
+    This should be called early in the app to process redirects from OAuth providers.
+    The state parameter contains the provider and username: "provider:username:nonce"
+    """
+    params = st.query_params
+
+    # Handle OAuth callback (Spotify or YouTube)
+    if "code" in params and "state" in params:
+        code = params.get("code")
+        state = params.get("state")
+
+        if not code or not state:
+            return
+
+        # Parse state to get provider and username
+        # Format: "provider:username:nonce"
+        parts = state.split(":", 2)
+        if len(parts) < 3:
+            logging.warning(f"Invalid OAuth state format: {state}")
+            return
+
+        provider, username, _nonce = parts
+
+        if provider == "spotify":
+            _process_spotify_callback(code, username)
+            st.query_params.clear()
+            st.rerun()
+        elif provider == "youtube":
+            _process_youtube_callback(code, username)
+            st.query_params.clear()
+            st.rerun()
+
+
+def _process_spotify_callback(code: str, username: str) -> None:
+    """Process Spotify OAuth callback and store tokens."""
+    spotify_creds = load_spotify_creds()
+    if not spotify_creds:
+        st.error("Spotify credentials not configured")
+        return
+
+    token_info = exchange_code_for_token(
+        spotify_creds.client_id,
+        spotify_creds.client_secret,
+        code,
+    )
+
+    if token_info:
+        storage = get_oauth_storage()
+        storage.save_tokens(
+            username,
+            "spotify",
+            token_info["access_token"],
+            token_info["refresh_token"],
+            token_info.get("expires_in"),
+        )
+        st.session_state["spotify_connected"] = True
+        st.session_state["username"] = username  # Restore username in session
+        st.toast("✅ Spotify connected successfully!", icon="🎵")
+    else:
+        st.error("Failed to connect Spotify. Please try again.")
+
+
+def _process_youtube_callback(code: str, username: str) -> None:
+    """Process YouTube OAuth callback and store tokens."""
+    youtube_creds = load_youtube_creds()
+    if not youtube_creds:
+        st.error("YouTube credentials not configured")
+        return
+
+    token_info = exchange_youtube_code_for_token(
+        youtube_creds.client_id,
+        youtube_creds.client_secret,
+        code,
+    )
+
+    if token_info:
+        storage = get_oauth_storage()
+        storage.save_tokens(
+            username,
+            "youtube",
+            token_info["access_token"],
+            token_info["refresh_token"],
+            token_info.get("expires_in"),
+        )
+        st.session_state["youtube_connected"] = True
+        st.session_state["username"] = username  # Restore username in session
+        st.toast("✅ YouTube connected successfully!", icon="🎬")
+    else:
+        st.error("Failed to connect YouTube. Please try again.")
 
 
 def render_playlist_export_section() -> None:
@@ -52,7 +149,7 @@ def render_playlist_export_section() -> None:
             index=0,
             key="youtube_privacy_selector",
         )
-        _render_youtube_tab(playlist_name, youtube_privacy)
+        _render_youtube_tab(username, playlist_name, youtube_privacy)
 
     with spotify_tab:
         spotify_public = st.selectbox(
@@ -61,15 +158,17 @@ def render_playlist_export_section() -> None:
             index=0,
             key="spotify_privacy_selector",
         )
-        _render_spotify_tab(playlist_name, spotify_public == "public")
+        _render_spotify_tab(username, playlist_name, spotify_public == "public")
 
 
-def _render_youtube_tab(playlist_name: str, privacy: str) -> None:
+def _render_youtube_tab(username: str, playlist_name: str, privacy: str) -> None:
     """Render YouTube Music export tab."""
-    needs_auth = YouTubePlaylistGenerator.needs_authentication()
+    needs_auth = YouTubePlaylistGenerator.needs_authentication(username)
 
     if needs_auth:
-        _render_youtube_auth_flow()
+        _render_youtube_auth_flow(username)
+    else:
+        _render_youtube_connected_status(username)
 
     if st.button(
         "🎬 Create YouTube Playlist",
@@ -78,70 +177,52 @@ def _render_youtube_tab(playlist_name: str, privacy: str) -> None:
         width="stretch",
         key="create_youtube_playlist",
     ):
-        _create_youtube_playlist(playlist_name, privacy)
+        _create_youtube_playlist(username, playlist_name, privacy)
 
 
-def _render_youtube_auth_flow() -> None:
+def _render_youtube_connected_status(username: str) -> None:
+    """Render connected status with disconnect option."""
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.success("✅ YouTube connected")
+    with col2:
+        if st.button("Disconnect", key="disconnect_youtube", type="secondary"):
+            YouTubePlaylistGenerator.disconnect(username)
+            st.rerun()
+
+
+def _render_youtube_auth_flow(username: str) -> None:
     """Render YouTube OAuth flow UI."""
     with st.container(border=True):
-        st.warning("⚠️ YouTube authentication required")
-        st.caption("Configure credentials in .env, then run OAuth flow below.")
+        st.warning("⚠️ Connect your YouTube account to create playlists")
 
         youtube_creds = load_youtube_creds()
         if youtube_creds and youtube_creds.has_client_creds():
-            if st.button("🔐 Authenticate with YouTube", type="primary"):
-                device_info, _ = run_youtube_oauth(
-                    youtube_creds.client_id, youtube_creds.client_secret
+            if st.button("🔐 Connect YouTube", type="primary", key="auth_youtube"):
+                auth_url, _state = run_youtube_oauth(
+                    youtube_creds.client_id,
+                    youtube_creds.client_secret,
+                    username,
                 )
-                if device_info:
-                    st.session_state["youtube_device_info"] = device_info
-                    st.session_state["youtube_client_id"] = youtube_creds.client_id
-                    st.session_state["youtube_client_secret"] = (
-                        youtube_creds.client_secret
-                    )
-                    st.rerun()
-                else:
-                    st.error("Failed to start OAuth flow")
+                # Redirect to YouTube authorization
+                st.markdown(
+                    f'<meta http-equiv="refresh" content="0;url={auth_url}">',
+                    unsafe_allow_html=True,
+                )
+                st.info("Redirecting to YouTube for authorization...")
+                st.stop()
         else:
-            st.info("Set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET in .env")
-
-        if "youtube_device_info" in st.session_state:
-            device_info = st.session_state["youtube_device_info"]
-            st.markdown("---")
-            st.markdown(f"**1.** Go to: `{device_info['verification_url']}`")
-            st.markdown(f"**2.** Enter code: `{device_info['user_code']}`")
-            st.markdown("**3.** Click below after authorizing:")
-
-            if st.button("✅ I've authorized", key="poll_youtube"):
-                try:
-                    token_info = poll_device_token(
-                        st.session_state["youtube_client_id"],
-                        st.session_state["youtube_client_secret"],
-                        device_info["device_code"],
-                    )
-                    if token_info:
-                        st.success("✅ Authenticated! Add to .env:")
-                        st.code(
-                            f"YOUTUBE_ACCESS_TOKEN={token_info.get('access_token', '')}\n"
-                            f"YOUTUBE_REFRESH_TOKEN={token_info.get('refresh_token', '')}",
-                            language="bash",
-                        )
-                        del st.session_state["youtube_device_info"]
-                        del st.session_state["youtube_client_id"]
-                        del st.session_state["youtube_client_secret"]
-                    else:
-                        st.warning("Still pending. Complete the flow and try again.")
-                except Exception as e:
-                    st.error(f"OAuth failed: {e}")
-                    del st.session_state["youtube_device_info"]
+            st.info("YouTube API not configured. Contact the app administrator.")
 
 
-def _render_spotify_tab(playlist_name: str, public: bool) -> None:
+def _render_spotify_tab(username: str, playlist_name: str, public: bool) -> None:
     """Render Spotify export tab."""
-    needs_auth = SpotifyPlaylistGenerator.needs_authentication()
+    needs_auth = SpotifyPlaylistGenerator.needs_authentication(username)
 
     if needs_auth:
-        _render_spotify_auth_flow()
+        _render_spotify_auth_flow(username)
+    else:
+        _render_spotify_connected_status(username)
 
     if st.button(
         "🎧 Create Spotify Playlist",
@@ -150,103 +231,48 @@ def _render_spotify_tab(playlist_name: str, public: bool) -> None:
         width="stretch",
         key="create_spotify_playlist",
     ):
-        _create_spotify_playlist(playlist_name, public)
+        _create_spotify_playlist(username, playlist_name, public)
 
 
-def _render_spotify_auth_flow() -> None:
-    """Render Spotify OAuth flow UI."""
-    with st.container(border=True):
-        st.warning("⚠️ Spotify authentication required")
-        st.caption("Configure credentials in .env, then run OAuth flow below.")
-
-        spotify_creds = load_spotify_creds()
-        if spotify_creds and spotify_creds.has_client_creds():
-            if "spotify_auth_url" not in st.session_state:
-                if st.button("🔐 Authenticate with Spotify", type="primary"):
-                    auth_url, state = run_spotify_oauth(
-                        spotify_creds.client_id,
-                        spotify_creds.client_secret,
-                    )
-                    st.session_state["spotify_auth_url"] = auth_url
-                    st.session_state["spotify_auth_state"] = state
-                    st.session_state["spotify_client_id"] = spotify_creds.client_id
-                    st.session_state["spotify_client_secret"] = (
-                        spotify_creds.client_secret
-                    )
-                    st.rerun()
-
-            if "spotify_auth_url" in st.session_state:
-                _render_spotify_code_entry()
-        else:
-            st.info("Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env")
-
-
-def _render_spotify_code_entry() -> None:
-    """Render Spotify authorization code entry UI."""
-    auth_url = st.session_state["spotify_auth_url"]
-    st.markdown("---")
-    st.info(
-        "**Important:** Add `http://localhost:8501/` as a Redirect URI in your "
-        "[Spotify Developer Dashboard](https://developer.spotify.com/dashboard) app settings."
-    )
-    st.markdown("**Step 1:** Click the button below to authorize:")
-    st.link_button("🔗 Open Spotify Authorization", auth_url, type="primary")
-    st.markdown("**Step 2:** After authorizing, you'll be redirected back here.")
-    st.markdown("**Step 3:** Copy the `code` from the URL bar and paste below:")
-    st.caption(
-        "The URL will look like: `http://localhost:8501/?code=AQB...xyz&state=...`"
-    )
-    st.caption("Copy **only** the part after `code=` and before `&state=`")
-
-    auth_code = st.text_input(
-        "Authorization Code",
-        placeholder="Paste the code from the redirect URL...",
-        key="spotify_auth_code_input",
-    )
-
-    col1, col2 = st.columns(2)
+def _render_spotify_connected_status(username: str) -> None:
+    """Render connected status with disconnect option."""
+    col1, col2 = st.columns([3, 1])
     with col1:
-        if st.button(
-            "✅ Complete Authentication", key="complete_spotify_auth", type="primary"
-        ):
-            if auth_code:
-                token_info = exchange_code_for_token(
-                    st.session_state["spotify_client_id"],
-                    st.session_state["spotify_client_secret"],
-                    auth_code,
-                )
-                if token_info:
-                    st.success("✅ Authenticated! Add to .env:")
-                    st.code(
-                        f"SPOTIFY_ACCESS_TOKEN={token_info.get('access_token', '')}\n"
-                        f"SPOTIFY_REFRESH_TOKEN={token_info.get('refresh_token', '')}",
-                        language="bash",
-                    )
-                    _clear_spotify_session_state()
-                else:
-                    st.error(
-                        "Failed to exchange code for token. The code may have expired - try again."
-                    )
-            else:
-                st.warning("Please paste the authorization code")
+        st.success("✅ Spotify connected")
     with col2:
-        if st.button("❌ Cancel", key="cancel_spotify_auth"):
-            _clear_spotify_session_state()
+        if st.button("Disconnect", key="disconnect_spotify", type="secondary"):
+            SpotifyPlaylistGenerator.disconnect(username)
             st.rerun()
 
 
-def _clear_spotify_session_state() -> None:
-    """Clear Spotify OAuth session state."""
-    for key in [
-        "spotify_auth_url",
-        "spotify_auth_state",
-        "spotify_client_id",
-        "spotify_client_secret",
-    ]:
-        st.session_state.pop(key, None)
+def _render_spotify_auth_flow(username: str) -> None:
+    """Render Spotify OAuth flow UI."""
+    with st.container(border=True):
+        st.warning("⚠️ Connect your Spotify account to create playlists")
+
+        spotify_creds = load_spotify_creds()
+        if spotify_creds and spotify_creds.has_client_creds():
+            redirect_uri = get_spotify_redirect_uri()
+            st.caption(f"Redirect URI: `{redirect_uri}`")
+
+            if st.button("🔐 Connect Spotify", type="primary", key="auth_spotify"):
+                auth_url, _state = run_spotify_oauth(
+                    spotify_creds.client_id,
+                    spotify_creds.client_secret,
+                    username,
+                )
+                # Redirect to Spotify authorization
+                st.markdown(
+                    f'<meta http-equiv="refresh" content="0;url={auth_url}">',
+                    unsafe_allow_html=True,
+                )
+                st.info("Redirecting to Spotify for authorization...")
+                st.stop()
+        else:
+            st.info("Spotify API not configured. Contact the app administrator.")
 
 
-def _create_youtube_playlist(playlist_name: str, privacy: str) -> None:
+def _create_youtube_playlist(username: str, playlist_name: str, privacy: str) -> None:
     """Create a YouTube playlist from recommendations."""
     try:
         recommendations = st.session_state.recommendations
@@ -257,7 +283,7 @@ def _create_youtube_playlist(playlist_name: str, privacy: str) -> None:
             f"Tracks with youtube_url: {recommendations['youtube_url'].is_not_null().sum()}"
         )
 
-        playlist_generator = YouTubePlaylistGenerator()
+        playlist_generator = YouTubePlaylistGenerator(username)
 
         if not playlist_generator.authenticate():
             st.error(
@@ -375,7 +401,7 @@ def _handle_youtube_error(e: Exception) -> None:
         st.code(traceback.format_exc())
 
 
-def _create_spotify_playlist(playlist_name: str, public: bool) -> None:
+def _create_spotify_playlist(username: str, playlist_name: str, public: bool) -> None:
     """Create a Spotify playlist from recommendations."""
     try:
         recommendations = st.session_state.recommendations
@@ -385,7 +411,7 @@ def _create_spotify_playlist(playlist_name: str, public: bool) -> None:
             f"Tracks with spotify_url: {recommendations['spotify_url'].is_not_null().sum()}"
         )
 
-        playlist_generator = SpotifyPlaylistGenerator()
+        playlist_generator = SpotifyPlaylistGenerator(username)
 
         if not playlist_generator.authenticate():
             st.error(
