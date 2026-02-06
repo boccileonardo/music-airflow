@@ -75,7 +75,7 @@ def _render_youtube_tab(playlist_name: str, privacy: str) -> None:
         "🎬 Create YouTube Playlist",
         type="primary" if not needs_auth else "secondary",
         disabled=needs_auth,
-        use_container_width=True,
+        width="stretch",
         key="create_youtube_playlist",
     ):
         _create_youtube_playlist(playlist_name, privacy)
@@ -147,7 +147,7 @@ def _render_spotify_tab(playlist_name: str, public: bool) -> None:
         "🎧 Create Spotify Playlist",
         type="primary" if not needs_auth else "secondary",
         disabled=needs_auth,
-        use_container_width=True,
+        width="stretch",
         key="create_spotify_playlist",
     ):
         _create_spotify_playlist(playlist_name, public)

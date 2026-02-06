@@ -253,7 +253,7 @@ def _render_track_exclusions(
                 pl.col("artist_name").alias("Artist"),
             ]
         )
-        st.dataframe(display_excluded_tracks, use_container_width=True, hide_index=True)
+        st.dataframe(display_excluded_tracks, width="stretch", hide_index=True)
 
         track_to_revert_options = {
             f"{row['track_name']} - {row['artist_name']}": row
@@ -362,9 +362,7 @@ def _render_artist_exclusions(
         display_excluded_artists = excluded_artists_collected.select(
             pl.col("artist_name").alias("Artist")
         )
-        st.dataframe(
-            display_excluded_artists, use_container_width=True, hide_index=True
-        )
+        st.dataframe(display_excluded_artists, width="stretch", hide_index=True)
 
         artist_to_revert_options = (
             excluded_artists_collected.select("artist_name").to_series().to_list()

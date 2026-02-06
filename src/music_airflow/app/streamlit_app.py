@@ -156,7 +156,7 @@ def _render_user_profile(username: str) -> None:
                 .select(["artist_name", "Plays"])
                 .rename({"artist_name": "Artist"})
             )
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_df, width="stretch", hide_index=True)
         else:
             st.info("No artist play data available yet.")
 
@@ -261,7 +261,7 @@ def _render_recommendations(recommendations: pl.DataFrame) -> None:
 
     st.dataframe(
         display_recommendations,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Score": st.column_config.ProgressColumn(

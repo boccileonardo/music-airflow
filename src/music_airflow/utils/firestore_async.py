@@ -159,12 +159,12 @@ class AsyncFirestoreReader:
         async for doc in query.stream():
             rows.append(doc.to_dict())
 
-        if not rows:
-            return pl.DataFrame(
-                schema={"artist_name": pl.String, "play_count": pl.Int64}
-            )
+        schema = {"artist_name": pl.String, "play_count": pl.Int64}
 
-        return pl.DataFrame(rows)
+        if not rows:
+            return pl.DataFrame(schema=schema)
+
+        return pl.DataFrame(rows, schema=schema)
 
     async def read_excluded_tracks(self, username: str) -> pl.DataFrame:
         """
@@ -186,18 +186,18 @@ class AsyncFirestoreReader:
         async for doc in collection_ref.stream():
             rows.append(doc.to_dict())
 
-        if not rows:
-            return pl.DataFrame(
-                schema={
-                    "username": pl.String,
-                    "track_id": pl.String,
-                    "track_name": pl.String,
-                    "artist_name": pl.String,
-                    "excluded_at": pl.Datetime(time_zone="UTC"),
-                }
-            )
+        schema = {
+            "username": pl.String,
+            "track_id": pl.String,
+            "track_name": pl.String,
+            "artist_name": pl.String,
+            "excluded_at": pl.Datetime(time_zone="UTC"),
+        }
 
-        return pl.DataFrame(rows)
+        if not rows:
+            return pl.DataFrame(schema=schema)
+
+        return pl.DataFrame(rows, schema=schema)
 
     async def read_excluded_artists(self, username: str) -> pl.DataFrame:
         """
@@ -219,16 +219,16 @@ class AsyncFirestoreReader:
         async for doc in collection_ref.stream():
             rows.append(doc.to_dict())
 
-        if not rows:
-            return pl.DataFrame(
-                schema={
-                    "username": pl.String,
-                    "artist_name": pl.String,
-                    "excluded_at": pl.Datetime(time_zone="UTC"),
-                }
-            )
+        schema = {
+            "username": pl.String,
+            "artist_name": pl.String,
+            "excluded_at": pl.Datetime(time_zone="UTC"),
+        }
 
-        return pl.DataFrame(rows)
+        if not rows:
+            return pl.DataFrame(schema=schema)
+
+        return pl.DataFrame(rows, schema=schema)
 
     def _get_candidates_schema(self) -> dict:
         """Get the expected schema for track candidates."""
