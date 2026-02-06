@@ -2,9 +2,10 @@
 
 Personalized music recommendation engine using Apache Airflow, Last.fm data, and Delta Lake. Balances music discovery with forgotten favorites using exponential decay scoring to avoid feedback loops.
 
-## Architecture
+## Documentation
 
-[System Architecture](complete-architecture.md) - Complete pipeline overview with DAG orchestration, data layers, and key techniques.
+- [System Architecture](complete-architecture.md) - Complete pipeline overview with DAG orchestration, data layers, and key techniques
+- [User Onboarding](user-onboarding.md) - How to add new users to the system
 
 ## Quick Reference
 
