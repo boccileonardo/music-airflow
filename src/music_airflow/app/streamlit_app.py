@@ -74,21 +74,19 @@ def _render_sidebar() -> dict:
         st.divider()
         st.subheader("⚙️ Recommendation Settings")
 
-        discovery_weight = st.slider(
-            "Discovery Balance",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.5,
-            step=0.1,
-            help="0 = Replay old favorites · 1 = Discover new music",
+        discovery_mode = st.radio(
+            "Discovery Mode",
+            options=["🔍 Discover New", "⚖️ Balanced", "🔄 Old Favorites"],
+            index=1,
+            horizontal=True,
+            help="Choose how to balance new discoveries vs familiar tracks",
         )
 
-        if discovery_weight < 0.3:
-            st.caption("🔄 *Focusing on familiar favorites*")
-        elif discovery_weight > 0.7:
-            st.caption("🔍 *Exploring new music*")
-        else:
-            st.caption("⚖️ *Balanced mix*")
+        discovery_weight = {
+            "🔍 Discover New": 1.0,
+            "⚖️ Balanced": 0.5,
+            "🔄 Old Favorites": 0.0,
+        }[discovery_mode]
 
         n_recommendations = st.slider(
             "Number of Tracks",

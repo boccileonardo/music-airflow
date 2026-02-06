@@ -648,13 +648,13 @@ class TestStreamlitAppIntegration:
                     headers = at.header
                     assert len(headers) >= 2
 
-    def test_slider_widgets_exist(
+    def test_sidebar_widgets_exist(
         self,
         mock_async_firestore,
         empty_excluded_tracks,
         empty_excluded_artists,
     ):
-        """Test that slider widgets are present in sidebar."""
+        """Test that slider and radio widgets are present in sidebar."""
         with patch(
             "music_airflow.app.data_loading.AsyncFirestoreReader",
             return_value=mock_async_firestore,
@@ -674,7 +674,9 @@ class TestStreamlitAppIntegration:
                     at.run()
 
                     sliders = at.sidebar.slider
-                    assert len(sliders) >= 2
+                    assert len(sliders) >= 1
+                    radios = at.sidebar.radio
+                    assert len(radios) >= 1
 
     def test_checkbox_widgets_exist(
         self,

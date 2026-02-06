@@ -14,7 +14,7 @@ from music_airflow.utils.constants import LAST_FM_USERNAMES
 from music_airflow.utils.firestore_async import AsyncFirestoreReader
 
 # Internal limit for caching - always compute up to this to reuse cache
-INTERNAL_LIMIT = 300
+INTERNAL_LIMIT = 500
 
 
 def _run_async(coro):

@@ -34,33 +34,34 @@ def render_playlist_export_section() -> None:
     st.divider()
     st.header("📤 Export to Playlist")
 
+    username = st.session_state.get("username", "User")
+    playlist_name = st.text_input(
+        "Playlist Name",
+        value=f"{username} - AirStream.FM",
+        key=f"playlist_name_input_{username}",
+        label_visibility="collapsed",
+        placeholder="Playlist name...",
+    )
+
     youtube_tab, spotify_tab = st.tabs(["🎬 YouTube Music", "🎧 Spotify"])
 
-    # Common playlist settings
-    col1, col2 = st.columns([3, 1])
-    username = st.session_state.get("username", "User")
-    with col1:
-        playlist_name = st.text_input(
-            "Playlist Name",
-            value=f"{username} - AirStream.FM",
-            key=f"playlist_name_input_{username}",
-            label_visibility="collapsed",
-            placeholder="Playlist name...",
-        )
-    with col2:
-        privacy = st.selectbox(
-            "Privacy",
+    with youtube_tab:
+        youtube_privacy = st.selectbox(
+            "Visibility",
             options=["public", "private", "unlisted"],
             index=0,
-            key="privacy_selector",
-            label_visibility="collapsed",
+            key="youtube_privacy_selector",
         )
-
-    with youtube_tab:
-        _render_youtube_tab(playlist_name, privacy)
+        _render_youtube_tab(playlist_name, youtube_privacy)
 
     with spotify_tab:
-        _render_spotify_tab(playlist_name, privacy == "public")
+        spotify_public = st.selectbox(
+            "Visibility",
+            options=["public", "private"],
+            index=0,
+            key="spotify_privacy_selector",
+        )
+        _render_spotify_tab(playlist_name, spotify_public == "public")
 
 
 def _render_youtube_tab(playlist_name: str, privacy: str) -> None:
