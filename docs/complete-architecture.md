@@ -110,6 +110,14 @@ graph LR
 - Builds plays table incrementally with catchup enabled for backfills
 - Triggers candidate generation
 
+**backfill_user** (manual trigger):
+
+- Backfills historical play data for a specific user
+- Use when adding a new user to the system
+- Parameters: username, start_date, end_date
+- Processes each day sequentially, respecting API rate limits
+- Triggers downstream DAGs via plays asset update
+
 **candidate_generation** (asset-triggered by plays):
 
 - Generates four types of candidates (similar artists, similar tags, deep cuts, old favorites)

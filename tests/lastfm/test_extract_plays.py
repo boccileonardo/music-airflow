@@ -10,7 +10,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from airflow.exceptions import AirflowSkipException
 
 from music_airflow.extract.plays import extract_plays_to_bronze
 
@@ -75,8 +74,8 @@ class TestExtractPlaysIntegration:
     @pytest.mark.asyncio
     @patch("music_airflow.extract.plays.LastFMClient")
     @pytest.mark.asyncio
-    async def test_empty_response_raises_skip(self, mock_client_class):
-        """Test that empty response raises AirflowSkipException."""
+    async def test_empty_response_returns_skipped(self, mock_client_class):
+        """Test that empty response returns skipped metadata instead of raising."""
         mock_client = MagicMock()
         mock_client.get_recent_tracks = AsyncMock(return_value=[])
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -86,13 +85,14 @@ class TestExtractPlaysIntegration:
         from_dt = dt.datetime(2021, 1, 1, 0, 0, 0, tzinfo=dt.timezone.utc)
         to_dt = dt.datetime(2021, 1, 2, 0, 0, 0, tzinfo=dt.timezone.utc)
 
-        # Should raise before any file I/O happens
-        with pytest.raises(
-            AirflowSkipException, match="No plays found for testuser on 20210101"
-        ):
-            await extract_plays_to_bronze(
-                username="testuser", from_dt=from_dt, to_dt=to_dt
-            )
+        # Should return skipped metadata (not raise) so downstream mapped tasks continue
+        result = await extract_plays_to_bronze(
+            username="testuser", from_dt=from_dt, to_dt=to_dt
+        )
+
+        assert result["skipped"] is True
+        assert "No plays found for testuser on 20210101" in result["reason"]
+        assert result["username"] == "testuser"
 
     @patch("music_airflow.extract.plays.LastFMClient")
     @patch("music_airflow.extract.plays.JSONIOManager")

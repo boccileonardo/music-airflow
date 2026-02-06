@@ -5,8 +5,6 @@ Extract music play history to bronze layer.
 import datetime as dt
 from typing import Any
 
-from airflow.exceptions import AirflowSkipException
-
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.polars_io_manager import JSONIOManager
 
@@ -20,7 +18,7 @@ async def extract_plays_to_bronze(
     Extract plays from Last.fm API for a specific date range to bronze layer.
 
     Handles API interaction, pagination, and data persistence to bronze layer.
-    Raises AirflowSkipException if no data is found (user not yet signed up or no activity).
+    Returns metadata with skipped=True if no data is found (allows downstream to continue).
 
     Args:
         username: Last.fm username to fetch data for
@@ -29,9 +27,7 @@ async def extract_plays_to_bronze(
 
     Returns:
         Metadata dict with path, filename, rows, format, medallion_layer, username, from/to datetimes
-
-    Raises:
-        AirflowSkipException: If no plays found for the date range
+        Or dict with skipped=True if no plays found
     """
     # Convert to timestamps for API call
     from_ts = int(from_dt.timestamp())
@@ -46,10 +42,13 @@ async def extract_plays_to_bronze(
         # Check if empty (user not yet signed up or no activity this day)
         date_str = from_dt.strftime("%Y%m%d")
         if not tracks:
-            raise AirflowSkipException(
-                f"No plays found for {username} on {date_str} "
-                f"(may not be signed up yet or no activity)"
-            )
+            return {
+                "skipped": True,
+                "reason": f"No plays found for {username} on {date_str}",
+                "username": username,
+                "from_datetime": from_dt.isoformat(),
+                "to_datetime": to_dt.isoformat(),
+            }
 
         # Save raw JSON for this interval (bronze layer)
         filename = f"plays/{username}/{date_str}.json"

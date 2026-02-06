@@ -63,9 +63,7 @@ def lastfm_plays():
 
         Returns:
             Metadata dict with path, filename, rows, format, medallion_layer, username, from/to datetimes
-
-        Raises:
-            AirflowSkipException: If no plays found for the date range
+            Or dict with skipped=True if no plays found for the date range
         """
         import asyncio
         from airflow.sdk import get_current_context

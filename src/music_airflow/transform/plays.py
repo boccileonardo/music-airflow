@@ -8,6 +8,8 @@ from bronze to silver layer using Delta Lake.
 from typing import Any
 import polars as pl
 
+from airflow.exceptions import AirflowSkipException
+
 from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
 from music_airflow.utils.text_normalization import generate_canonical_track_id
 
@@ -46,8 +48,15 @@ def transform_plays_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]:
         - username: User whose data was processed
         - from_datetime, to_datetime: Time range processed
 
-        Or dict with skipped=True if no tracks in time range
+    Raises:
+        AirflowSkipException: If upstream was skipped (no plays for user on date)
     """
+    # Check if upstream was skipped (no plays for this user on this date)
+    if fetch_metadata.get("skipped"):
+        raise AirflowSkipException(
+            fetch_metadata.get("reason", "Upstream task was skipped")
+        )
+
     # Read raw JSON using Polars
     io_manager = JSONIOManager(medallion_layer="bronze")
     filename = fetch_metadata["filename"]

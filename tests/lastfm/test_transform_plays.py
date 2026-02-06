@@ -267,6 +267,22 @@ class TestTransformPlaysRawToStructuredIntegration:
         assert result["path"] is None
         assert result["reason"] == "No tracks in time range"
 
+    def test_upstream_skipped_raises_skip_exception(self):
+        """Test that skipped upstream metadata raises AirflowSkipException."""
+        from airflow.exceptions import AirflowSkipException
+        import pytest
+
+        fetch_metadata = {
+            "skipped": True,
+            "reason": "No plays found for user",
+            "username": "testuser",
+        }
+
+        with pytest.raises(AirflowSkipException) as exc_info:
+            transform_plays_to_silver(fetch_metadata)
+
+        assert "No plays found for user" in str(exc_info.value)
+
     def test_multiple_users_in_single_table(self, test_data_dir):
         """Test that multiple users write to the same Delta table with partitioning."""
         bronze_dir = test_data_dir / "bronze" / "plays"
