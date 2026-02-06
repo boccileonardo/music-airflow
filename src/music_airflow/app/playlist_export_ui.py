@@ -238,19 +238,17 @@ def _render_youtube_auth_flow(username: str) -> None:
 
         youtube_creds = load_youtube_creds()
         if youtube_creds and youtube_creds.has_client_creds():
-            if st.button("🔐 Connect YouTube", type="primary", key="auth_youtube"):
-                auth_url, _state = run_youtube_oauth(
-                    youtube_creds.client_id,
-                    youtube_creds.client_secret,
-                    username,
-                )
-                # Redirect to YouTube authorization
-                st.markdown(
-                    f'<meta http-equiv="refresh" content="0;url={auth_url}">',
-                    unsafe_allow_html=True,
-                )
-                st.info("Redirecting to YouTube for authorization...")
-                st.stop()
+            auth_url, _state = run_youtube_oauth(
+                youtube_creds.client_id,
+                youtube_creds.client_secret,
+                username,
+            )
+            st.link_button(
+                "🔐 Connect YouTube",
+                auth_url,
+                type="primary",
+                use_container_width=True,
+            )
         else:
             st.info("YouTube API not configured. Contact the app administrator.")
 
@@ -295,19 +293,17 @@ def _render_spotify_auth_flow(username: str) -> None:
             redirect_uri = get_spotify_redirect_uri()
             st.caption(f"Redirect URI: `{redirect_uri}`")
 
-            if st.button("🔐 Connect Spotify", type="primary", key="auth_spotify"):
-                auth_url, _state = run_spotify_oauth(
-                    spotify_creds.client_id,
-                    spotify_creds.client_secret,
-                    username,
-                )
-                # Redirect to Spotify authorization
-                st.markdown(
-                    f'<meta http-equiv="refresh" content="0;url={auth_url}">',
-                    unsafe_allow_html=True,
-                )
-                st.info("Redirecting to Spotify for authorization...")
-                st.stop()
+            auth_url, _state = run_spotify_oauth(
+                spotify_creds.client_id,
+                spotify_creds.client_secret,
+                username,
+            )
+            st.link_button(
+                "🔐 Connect Spotify",
+                auth_url,
+                type="primary",
+                use_container_width=True,
+            )
         else:
             st.info("Spotify API not configured. Contact the app administrator.")
 
