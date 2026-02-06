@@ -6,14 +6,13 @@ for the low-latency serving layer. Designed for small document collections
 (~300 items per user) with fast read access from Streamlit.
 
 Firestore Configuration:
-    Set FIRESTORE_PROJECT_ID in .env (or use GCP default project).
-    Set FIRESTORE_DATABASE_ID in .env (default: "airstream").
+    Set GOOGLE_CLOUD_PROJECT in .env (or use GCP default project).
+    Set FIRESTORE_DATABASE_ID in .env (optional, uses default database).
 
-    Authentication uses Application Default Credentials (ADC):
-    - Locally: Run `gcloud auth application-default login`
-    - On GCP: Automatically uses service account credentials
-
-    Alternatively, set GOOGLE_APPLICATION_CREDENTIALS to path of a service account JSON.
+    Authentication (in order of preference):
+    1. Streamlit Cloud: st.secrets["gcp_service_account"] (JSON key contents)
+    2. Local: GOOGLE_APPLICATION_CREDENTIALS env var or ADC
+    3. On GCP: Automatically uses service account credentials
 
 Document Structure:
     users/{username}/
@@ -34,22 +33,64 @@ from typing import Any
 from dotenv import load_dotenv
 import polars as pl
 from google.cloud import firestore
+from google.oauth2 import service_account
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 
+def _get_streamlit_credentials() -> tuple[
+    service_account.Credentials | None, str | None, str | None
+]:
+    """
+    Try to get GCP credentials from Streamlit secrets.
+
+    Returns:
+        Tuple of (credentials, project_id, database_id) or (None, None, None)
+    """
+    try:
+        import streamlit as st
+
+        if "gcp_service_account" in st.secrets:
+            creds_info = dict(st.secrets["gcp_service_account"])
+            credentials = service_account.Credentials.from_service_account_info(
+                creds_info
+            )
+            project_id = st.secrets.get("GOOGLE_CLOUD_PROJECT") or creds_info.get(
+                "project_id"
+            )
+            database_id = st.secrets.get("FIRESTORE_DATABASE_ID")
+            return credentials, project_id, database_id
+    except Exception:
+        pass
+    return None, None, None
+
+
 def get_firestore_client() -> firestore.Client:
     """
     Get Firestore client with appropriate credentials.
 
-    Uses GOOGLE_CLOUD_PROJECT for project ID and FIRESTORE_DATABASE_ID for database.
-    Falls back to default database if FIRESTORE_DATABASE_ID not set.
+    Supports:
+    - Streamlit Cloud: Uses st.secrets["gcp_service_account"]
+    - Local/Airflow: Uses environment variables and ADC
 
     Returns:
         Firestore client instance
     """
+    # Try Streamlit secrets first (for Streamlit Cloud deployment)
+    credentials, st_project_id, st_database_id = _get_streamlit_credentials()
+
+    if credentials:
+        project_id = st_project_id
+        database_id = st_database_id
+        if database_id:
+            return firestore.Client(
+                project=project_id, database=database_id, credentials=credentials
+            )
+        return firestore.Client(project=project_id, credentials=credentials)
+
+    # Fall back to environment variables and ADC (local/Airflow)
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
     if not project_id:
         raise ValueError(
@@ -59,11 +100,9 @@ def get_firestore_client() -> firestore.Client:
 
     database_id = os.getenv("FIRESTORE_DATABASE_ID")
 
-    # Use default database if not specified
     if database_id:
         return firestore.Client(project=project_id, database=database_id)
-    else:
-        return firestore.Client(project=project_id)
+    return firestore.Client(project=project_id)
 
 
 class FirestoreIOManager:

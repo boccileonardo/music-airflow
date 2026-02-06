@@ -7,6 +7,11 @@ gold layer, optimized for the Streamlit UI where responsiveness is key.
 The async client avoids blocking the Streamlit event loop during Firestore
 network calls, making the UI feel more responsive during data loading.
 
+Authentication (in order of preference):
+1. Streamlit Cloud: st.secrets["gcp_service_account"] (JSON key contents)
+2. Local: GOOGLE_APPLICATION_CREDENTIALS env var or ADC
+3. On GCP: Automatically uses service account credentials
+
 Note: Write operations remain synchronous as they are typically:
 1. Called from background tasks (Airflow DAGs)
 2. Don't need UI responsiveness
@@ -19,22 +24,64 @@ from typing import Any
 from dotenv import load_dotenv
 import polars as pl
 from google.cloud.firestore import AsyncClient, AsyncQuery
+from google.oauth2 import service_account
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 
+def _get_streamlit_credentials() -> tuple[
+    service_account.Credentials | None, str | None, str | None
+]:
+    """
+    Try to get GCP credentials from Streamlit secrets.
+
+    Returns:
+        Tuple of (credentials, project_id, database_id) or (None, None, None)
+    """
+    try:
+        import streamlit as st
+
+        if "gcp_service_account" in st.secrets:
+            creds_info = dict(st.secrets["gcp_service_account"])
+            credentials = service_account.Credentials.from_service_account_info(
+                creds_info
+            )
+            project_id = st.secrets.get("GOOGLE_CLOUD_PROJECT") or creds_info.get(
+                "project_id"
+            )
+            database_id = st.secrets.get("FIRESTORE_DATABASE_ID")
+            return credentials, project_id, database_id
+    except Exception:
+        pass
+    return None, None, None
+
+
 def get_async_firestore_client() -> AsyncClient:
     """
     Get async Firestore client with appropriate credentials.
 
-    Uses GOOGLE_CLOUD_PROJECT for project ID and FIRESTORE_DATABASE_ID for database.
-    Falls back to default database if FIRESTORE_DATABASE_ID not set.
+    Supports:
+    - Streamlit Cloud: Uses st.secrets["gcp_service_account"]
+    - Local/Airflow: Uses environment variables and ADC
 
     Returns:
         Async Firestore client instance
     """
+    # Try Streamlit secrets first (for Streamlit Cloud deployment)
+    credentials, st_project_id, st_database_id = _get_streamlit_credentials()
+
+    if credentials:
+        project_id = st_project_id
+        database_id = st_database_id
+        if database_id:
+            return AsyncClient(
+                project=project_id, database=database_id, credentials=credentials
+            )
+        return AsyncClient(project=project_id, credentials=credentials)
+
+    # Fall back to environment variables and ADC (local/Airflow)
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
     if not project_id:
         raise ValueError(
@@ -46,8 +93,7 @@ def get_async_firestore_client() -> AsyncClient:
 
     if database_id:
         return AsyncClient(project=project_id, database=database_id)
-    else:
-        return AsyncClient(project=project_id)
+    return AsyncClient(project=project_id)
 
 
 class AsyncFirestoreReader:
