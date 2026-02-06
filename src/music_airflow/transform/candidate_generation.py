@@ -21,7 +21,10 @@ import polars as pl
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager
 from music_airflow.utils.firestore_io_manager import FirestoreIOManager
-from music_airflow.utils.text_normalization import generate_canonical_track_id
+from music_airflow.utils.text_normalization import (
+    generate_canonical_track_id,
+    generate_canonical_track_id_expr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -163,14 +166,9 @@ def _resolve_track_ids(
     # Create DataFrame
     df = pl.DataFrame(track_data)
 
-    # Generate canonical track_id from normalized names
+    # Generate canonical track_id using native Polars expressions (faster)
     df = df.with_columns(
-        pl.struct(["track_name", "artist_name"])
-        .map_elements(
-            lambda x: generate_canonical_track_id(x["track_name"], x["artist_name"]),
-            return_dtype=pl.Utf8,
-        )
-        .alias("track_id")
+        generate_canonical_track_id_expr("track_name", "artist_name").alias("track_id")
     )
 
     return df

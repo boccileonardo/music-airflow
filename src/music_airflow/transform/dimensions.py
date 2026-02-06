@@ -14,9 +14,9 @@ from deltalake.exceptions import TableNotFoundError
 
 from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
 from music_airflow.utils.text_normalization import (
-    generate_canonical_track_id,
-    generate_canonical_artist_id,
-    is_music_video,
+    generate_canonical_track_id_expr,
+    generate_canonical_artist_id_expr,
+    is_music_video_expr,
 )
 
 logger = logging.getLogger(__name__)
@@ -318,25 +318,14 @@ def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
     has_youtube = "youtube_url" in schema_names
     has_spotify = "spotify_url" in schema_names
 
-    # Add helper columns for deduplication
+    # Add helper columns for deduplication using native Polars expressions
     tracks_with_helpers = tracks_lf.with_columns(
-        [
-            # Generate canonical track_id from normalized names
-            pl.struct(["track_name", "artist_name"])
-            .map_elements(
-                lambda x: generate_canonical_track_id(
-                    x["track_name"], x["artist_name"]
-                ),
-                return_dtype=pl.Utf8,
-            )
-            .alias("track_id"),
-            # Detect music videos
-            pl.col("track_name")
-            .map_elements(is_music_video, return_dtype=pl.Boolean)
-            .alias("is_music_video"),
-            # Fill null playcount for sorting
-            pl.col("playcount").fill_null(0).alias("playcount_filled"),
-        ]
+        # Generate canonical track_id from normalized names
+        generate_canonical_track_id_expr("track_name", "artist_name").alias("track_id"),
+        # Detect music videos
+        is_music_video_expr("track_name").alias("is_music_video"),
+        # Fill null playcount for sorting
+        pl.col("playcount").fill_null(0).alias("playcount_filled"),
     )
 
     # Sort: non-videos first, then by playcount descending
@@ -370,11 +359,9 @@ def _deduplicate_tracks(tracks_lf: pl.LazyFrame) -> pl.LazyFrame:
     # Group by canonical track_id
     deduplicated = sorted_tracks.group_by("track_id").agg(agg_list)
 
-    # Generate artist_id using normalized artist name
+    # Generate artist_id using native Polars normalization
     deduplicated = deduplicated.with_columns(
-        pl.col("artist_name")
-        .map_elements(generate_canonical_artist_id, return_dtype=pl.Utf8)
-        .alias("artist_id")
+        generate_canonical_artist_id_expr("artist_name").alias("artist_id")
     )
 
     return deduplicated
@@ -393,11 +380,9 @@ def _deduplicate_artists(artists_lf: pl.LazyFrame) -> pl.LazyFrame:
     Returns:
         Deduplicated LazyFrame with canonical artist_id
     """
-    # Generate canonical artist_id from normalized name
+    # Generate canonical artist_id using native Polars normalization
     artists_with_id = artists_lf.with_columns(
-        pl.col("artist_name")
-        .map_elements(generate_canonical_artist_id, return_dtype=pl.Utf8)
-        .alias("artist_id")
+        generate_canonical_artist_id_expr("artist_name").alias("artist_id")
     )
 
     # Sort by playcount descending to get best version first

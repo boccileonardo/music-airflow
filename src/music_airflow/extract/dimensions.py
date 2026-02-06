@@ -16,7 +16,10 @@ from deltalake.exceptions import TableNotFoundError
 from music_airflow.lastfm_client import LastFMClient
 from music_airflow.utils.polars_io_manager import PolarsDeltaIOManager, JSONIOManager
 from music_airflow.utils.lastfm_scraper import LastFMScraper
-from music_airflow.utils.text_normalization import normalize_text
+from music_airflow.utils.text_normalization import (
+    normalize_text,
+    generate_canonical_artist_id_expr,
+)
 from music_airflow.utils.ytmusic_search import search_youtube_url
 from music_airflow.utils.spotify_search import search_spotify_url, is_spotify_configured
 import polars as pl
@@ -55,38 +58,43 @@ async def extract_tracks_to_bronze() -> dict[str, Any]:
         raise AirflowSkipException("No plays data available yet - run plays DAG first")
 
     # Get unique tracks from plays (keep as LazyFrame)
-    unique_tracks_lf = plays_lf.select(["track_name", "artist_name"]).unique()
+    # Silver plays already has canonical track_id computed during transform
+    unique_tracks_lf = plays_lf.select(
+        ["track_id", "track_name", "artist_name"]
+    ).unique(subset=["track_id"])
 
     # Also check for tracks from candidate_generation (gold layer)
-    # Candidates include track_name and artist_name for API calls
+    # Candidates also have track_id pre-computed
     try:
         gold_io = PolarsDeltaIOManager(medallion_layer="gold")
         candidates_lf = gold_io.read_delta("track_candidates")
 
-        # Extract track names from candidates (use original names for API calls)
+        # Extract tracks from candidates (track_id already exists)
         candidate_tracks_lf = (
-            candidates_lf.select(["track_name", "artist_name"])
+            candidates_lf.select(["track_id", "track_name", "artist_name"])
             .filter(
                 pl.col("track_name").is_not_null() & pl.col("artist_name").is_not_null()
             )
-            .unique()
+            .unique(subset=["track_id"])
         )
-        # Union with play tracks
-        unique_tracks_lf = pl.concat([unique_tracks_lf, candidate_tracks_lf]).unique()
+        # Union with play tracks (dedupe by track_id to keep one representative name pair)
+        unique_tracks_lf = pl.concat([unique_tracks_lf, candidate_tracks_lf]).unique(
+            subset=["track_id"]
+        )
     except (FileNotFoundError, TableNotFoundError):
         # No candidates yet, just use tracks from plays
         pass
 
-    # Check which tracks already exist in silver
+    # Check which tracks already exist in silver using track_id
+    # This correctly matches tracks regardless of capitalization differences
+    # between plays/candidates and the canonical names returned by Last.fm API
     try:
         silver_io = PolarsDeltaIOManager(medallion_layer="silver")
-        existing_tracks_lf = silver_io.read_delta("tracks").select(
-            ["track_name", "artist_name"]
-        )
-        # Anti-join to find new tracks
+        existing_track_ids_lf = silver_io.read_delta("tracks").select(["track_id"])
+        # Anti-join on track_id to find new tracks
         new_tracks_lf = unique_tracks_lf.join(
-            existing_tracks_lf,
-            on=["track_name", "artist_name"],
+            existing_track_ids_lf,
+            on="track_id",
             how="anti",
         )
     except (FileNotFoundError, TableNotFoundError):
@@ -309,16 +317,25 @@ async def extract_artists_to_bronze() -> dict[str, Any]:
         raise AirflowSkipException("No plays data available yet - run plays DAG first")
 
     # Get unique artists (keep as LazyFrame)
-    unique_artists_lf = plays_lf.select(["artist_name"]).unique()
+    # Generate canonical artist_id for matching against silver artists
+    # Using native Polars expressions (faster than map_elements)
+    unique_artists_lf = (
+        plays_lf.select(["artist_name"])
+        .unique()
+        .with_columns(
+            generate_canonical_artist_id_expr("artist_name").alias("artist_id")
+        )
+    )
 
-    # Check which artists already exist in silver (transform writes to silver, not bronze)
+    # Check which artists already exist in silver using artist_id
+    # This correctly matches artists regardless of capitalization differences
     try:
         silver_io = PolarsDeltaIOManager(medallion_layer="silver")
-        existing_artists_lf = silver_io.read_delta("artists").select(["artist_name"])
-        # Anti-join to find new artists
+        existing_artist_ids_lf = silver_io.read_delta("artists").select(["artist_id"])
+        # Anti-join on artist_id to find new artists
         new_artists_lf = unique_artists_lf.join(
-            existing_artists_lf,
-            on=["artist_name"],
+            existing_artist_ids_lf,
+            on="artist_id",
             how="anti",
         )
     except (FileNotFoundError, TableNotFoundError):

@@ -11,7 +11,7 @@ import polars as pl
 from airflow.exceptions import AirflowSkipException
 
 from music_airflow.utils.polars_io_manager import JSONIOManager, PolarsDeltaIOManager
-from music_airflow.utils.text_normalization import generate_canonical_track_id
+from music_airflow.utils.text_normalization import generate_canonical_track_id_expr
 
 
 def transform_plays_to_silver(fetch_metadata: dict[str, Any]) -> dict[str, Any]:
@@ -162,17 +162,10 @@ def transform_plays_raw_to_structured(
             ]
         )
         .with_columns(
-            [
-                # Create track_id using canonical normalization
-                pl.struct(["track_name", "artist_name"])
-                .map_elements(
-                    lambda x: generate_canonical_track_id(
-                        x["track_name"], x["artist_name"]
-                    ),
-                    return_dtype=pl.Utf8,
-                )
-                .alias("track_id"),
-            ]
+            # Create track_id using native Polars normalization (faster than map_elements)
+            generate_canonical_track_id_expr("track_name", "artist_name").alias(
+                "track_id"
+            )
         )
         .sort("scrobbled_at")
     )

@@ -8,6 +8,8 @@ identification across different recordings and versions.
 import re
 from typing import Pattern
 
+import polars as pl
+
 
 # Compiled regex patterns for performance
 
@@ -158,6 +160,202 @@ _TRAILING_SUFFIX_PATTERN: Pattern = re.compile(
     r")$",
     re.IGNORECASE,
 )
+
+
+# =============================================================================
+# Native Polars expressions for text normalization (faster than map_elements)
+# =============================================================================
+
+# All patterns use (?i) for case-insensitivity (Rust regex inline flag)
+
+# Dash-separated suffixes (e.g., "Song - Remastered 2012", "Song - Live at Wembley")
+_POLARS_DASH_SUFFIX = (
+    r"(?i)\s+-\s+("
+    r"\d{4}\s+(remaster(ed)?(\s+edition)?|mix|version)|"
+    r"remaster(ed)?(\s+\d{4}|\s+edition)?|re-master(ed)?|"
+    r"radio\s+edit|remix|extended|single|"
+    r"(early\s+)?demo|early\s+take|take\s+\d+|"
+    r"(\w+\s+)*(instrumental|demo|take|rehearsal|rough)|"
+    r"(studio\s+)?(guide\s+vocal\s+)?(instrumental\s+)?rough|"
+    r"sessions?(\s+\w+)*\s*((&|and)\s*)?outtakes?|outtakes?|"
+    r"alternate\s+mix|"
+    r"(\w+\s+)+mix|"
+    r"live(\s+at\s+\w+.*)?|at\s+\w+.*|"
+    r"mono(\s*/\s*remastered.*)?|stereo|"
+    r"instrumental|acoustic(\s+\w+)*|"
+    r"official\s+(music\s+)?video|music\s+video|"
+    r"official\s+(hd|4k|animated)?\s*video|"
+    r"(official\s+)?lyric\s+video|"
+    r"(hd|4k)\s+video|visuali[sz]er|official\s+audio|"
+    r"shortened\s+edit|vocal\s+version|"
+    r"from\s+.+"
+    r").*$"
+)
+
+# Parenthetical patterns - content in () or []
+_POLARS_REMASTER = r"(?i)\s*[\(\[](remaster(ed)?|re-master(ed)?|\d{4}\s+remaster(ed)?|remaster(ed)?\s+\d{4})[\)\]]"
+_POLARS_LIVE = r"(?i)\s*[\(\[]((live|live\s+(at|from|in|on)|live\s+\d{4}|live\s+(version|recording)).*?)[\)\]]"
+_POLARS_VERSION = r"(?i)\s*[\(\[](.*?\s+(version|mix|edit|remix|take)|single\s+version|album\s+version|radio\s+edit|extended(\s+(version|mix|edit))?|remix)[\)\]]"
+_POLARS_EXPLICIT = r"(?i)\s*[\(\[](explicit|clean|censored)[\)\]]"
+_POLARS_AUDIO_FORMAT = r"(?i)\s*[\(\[]((stereo|mono)(\s+(mix|version))?|original\s+(stereo|mono)|true\s+stereo|simulated\s+stereo)[\)\]]"
+_POLARS_DEMO_TAKE = (
+    r"(?i)\s*[\(\[]("
+    r"demo|early\s+demo|"
+    r"take\s+\d+|early\s+take|"
+    r"instrumental|acoustic|"
+    r"(.*\s*-\s*)?(official\s+)?(music\s+)?video|"
+    r"(.*\s*-\s*)?(official\s+)?(hd|4k|animated(\s+music)?|animated)?\s*video|"
+    r"(.*\s*-\s*)?(official\s+)?lyric\s+video|"
+    r"(.*\s*-\s*)?visuali[sz]er|"
+    r"(.*\s*-\s*)?official\s+audio|"
+    r"outtakes?|sessions?|"
+    r"alternate|"
+    r"dub"
+    r")[\)\]]"
+)
+_POLARS_FEAT = r"(?i)\s*[\(\[]?(feat\.?|ft\.?|featuring|with|vs\.?|versus).*?[\)\]]?$"
+_POLARS_YEAR = r"\s*[\(\[]?\d{4}[\)\]]?\s*"
+
+# Trailing suffixes without dash
+_POLARS_TRAILING = (
+    r"(?i)\s+("
+    r"demo|"
+    r"take\s+\d+|"
+    r"instrumental|"
+    r"official\s+(music\s+)?video|"
+    r"(official\s+)?(hd|4k|animated)\s+video|"
+    r"(official\s+)?lyric\s+video|"
+    r"(official\s+)?visuali[sz]er|"
+    r"official\s+audio|"
+    r"at\s+\w+(\s+\w+)*|"
+    r"mono|stereo|"
+    r"excerpt\s+\d+|"
+    r"dub"
+    r")$"
+)
+
+# Punctuation (keep hyphens for "hip-hop" etc)
+_POLARS_PUNCTUATION = r"[^\w\s-]"
+_POLARS_WHITESPACE = r"\s+"
+
+# Music video detection pattern
+_POLARS_MUSIC_VIDEO = r"(?i)(music\s+video|official\s+video|video\s+clip|visuali[sz]er|lyric\s+video|official\s+audio)"
+
+
+def normalize_text_expr(col: str | pl.Expr) -> pl.Expr:
+    """
+    Create a Polars expression that normalizes text for fuzzy matching.
+
+    This is the native Polars version of normalize_text() - much faster
+    than using map_elements with the Python function.
+
+    Args:
+        col: Column name or expression to normalize
+
+    Returns:
+        Polars expression that performs normalization
+
+    Examples:
+        >>> df.with_columns(normalized=normalize_text_expr("track_name"))
+        >>> df.with_columns(normalized=normalize_text_expr(pl.col("track_name")))
+    """
+    if isinstance(col, str):
+        expr = pl.col(col)
+    else:
+        expr = col
+
+    return (
+        expr.str.to_lowercase()
+        .str.strip_chars()
+        # Remove dash-separated suffixes first
+        .str.replace_all(_POLARS_DASH_SUFFIX, "")
+        # Remove parenthetical patterns
+        .str.replace_all(_POLARS_REMASTER, "")
+        .str.replace_all(_POLARS_LIVE, "")
+        .str.replace_all(_POLARS_VERSION, "")
+        .str.replace_all(_POLARS_EXPLICIT, "")
+        .str.replace_all(_POLARS_AUDIO_FORMAT, "")
+        .str.replace_all(_POLARS_DEMO_TAKE, "")
+        .str.replace_all(_POLARS_FEAT, "")
+        .str.replace_all(_POLARS_YEAR, "")
+        # Remove trailing suffixes
+        .str.replace_all(_POLARS_TRAILING, "")
+        # Remove punctuation except hyphens
+        .str.replace_all(_POLARS_PUNCTUATION, "")
+        # Try dash suffix again for malformed cases
+        .str.replace_all(_POLARS_DASH_SUFFIX, "")
+        # Normalize whitespace
+        .str.replace_all(_POLARS_WHITESPACE, " ")
+        .str.strip_chars()
+    )
+
+
+def generate_canonical_track_id_expr(
+    track_col: str | pl.Expr, artist_col: str | pl.Expr
+) -> pl.Expr:
+    """
+    Create a Polars expression that generates canonical track IDs.
+
+    This is the native Polars version of generate_canonical_track_id() -
+    much faster than using map_elements with the Python function.
+
+    Args:
+        track_col: Column name or expression for track name
+        artist_col: Column name or expression for artist name
+
+    Returns:
+        Polars expression that generates "normalized_track|normalized_artist" IDs
+
+    Examples:
+        >>> df.with_columns(track_id=generate_canonical_track_id_expr("track_name", "artist_name"))
+    """
+    normalized_track = normalize_text_expr(track_col)
+    normalized_artist = normalize_text_expr(artist_col)
+
+    return pl.concat_str([normalized_track, pl.lit("|"), normalized_artist])
+
+
+def generate_canonical_artist_id_expr(artist_col: str | pl.Expr) -> pl.Expr:
+    """
+    Create a Polars expression that generates canonical artist IDs.
+
+    This is the native Polars version of generate_canonical_artist_id() -
+    much faster than using map_elements with the Python function.
+
+    Args:
+        artist_col: Column name or expression for artist name
+
+    Returns:
+        Polars expression that generates normalized artist ID
+
+    Examples:
+        >>> df.with_columns(artist_id=generate_canonical_artist_id_expr("artist_name"))
+    """
+    return normalize_text_expr(artist_col)
+
+
+def is_music_video_expr(col: str | pl.Expr) -> pl.Expr:
+    """
+    Create a Polars expression that detects music video versions.
+
+    This is the native Polars version of is_music_video() -
+    much faster than using map_elements with the Python function.
+
+    Args:
+        col: Column name or expression for track name
+
+    Returns:
+        Polars boolean expression (True if track appears to be a music video)
+
+    Examples:
+        >>> df.with_columns(is_video=is_music_video_expr("track_name"))
+    """
+    if isinstance(col, str):
+        expr = pl.col(col)
+    else:
+        expr = col
+
+    return expr.str.contains(_POLARS_MUSIC_VIDEO)
 
 
 def normalize_text(text: str) -> str:

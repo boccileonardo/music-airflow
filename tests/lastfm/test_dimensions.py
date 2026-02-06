@@ -203,9 +203,10 @@ class TestExtractTracksToBronze:
         self, mock_json_io, mock_delta_io, mock_client_class, test_data_dir
     ):
         """Test extracting metadata for new tracks."""
-        # Setup: Create silver plays table with tracks
+        # Setup: Create silver plays table with tracks (includes track_id)
         plays_df = pl.LazyFrame(
             {
+                "track_id": ["track a|artist x", "track b|artist y"],
                 "track_name": ["Track A", "Track B"],
                 "artist_name": ["Artist X", "Artist Y"],
                 "track_mbid": ["mbid1", ""],
@@ -310,19 +311,20 @@ class TestExtractTracksToBronze:
     @patch("music_airflow.extract.dimensions.PolarsDeltaIOManager")
     async def test_extract_no_new_tracks_raises_skip(self, mock_delta_io):
         """Test that no new tracks raises AirflowSkipException."""
-        # Setup: plays and existing tracks are the same
+        # Setup: plays and existing tracks are the same (includes track_id)
         plays_df = pl.LazyFrame(
             {
+                "track_id": ["track a|artist x"],
                 "track_name": ["Track A"],
                 "artist_name": ["Artist X"],
                 "track_mbid": ["mbid1"],
             }
         )
 
+        # Silver tracks table now uses track_id for matching (normalized: "track a|artist x")
         existing_tracks_df = pl.LazyFrame(
             {
-                "track_name": ["Track A"],
-                "artist_name": ["Artist X"],
+                "track_id": ["track a|artist x"],
             }
         )
 

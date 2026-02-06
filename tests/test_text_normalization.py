@@ -2,11 +2,17 @@
 Unit tests for text normalization utilities.
 """
 
+import polars as pl
+
 from music_airflow.utils.text_normalization import (
     normalize_text,
     is_music_video,
     generate_canonical_track_id,
     generate_canonical_artist_id,
+    normalize_text_expr,
+    generate_canonical_track_id_expr,
+    generate_canonical_artist_id_expr,
+    is_music_video_expr,
 )
 
 
@@ -443,3 +449,93 @@ class TestIntegration:
         track_id = generate_canonical_track_id("Café del Mar", "Artíst")
         assert "café" in track_id.lower()
         assert "artíst" in track_id.lower()
+
+
+class TestPolarsExpressions:
+    """Tests verifying Polars expressions produce same results as Python functions."""
+
+    def test_normalize_text_expr_matches_python(self):
+        """Verify normalize_text_expr produces same output as normalize_text."""
+        test_cases = [
+            "Highway Star",
+            "Song (Remastered 2012)",
+            "Bohemian Rhapsody (Live)",
+            "Track - Radio Edit",
+            "Song (feat. Artist)",
+            "Song Name demo",
+            "Track (Official Video)",
+            "  Spaced  Text  ",
+            "UPPERCASE TRACK",
+        ]
+
+        df = pl.DataFrame({"text": test_cases})
+        result = (
+            df.with_columns(normalized=normalize_text_expr("text"))
+            .select("normalized")["normalized"]
+            .to_list()
+        )
+
+        expected = [normalize_text(t) for t in test_cases]
+        assert result == expected
+
+    def test_generate_canonical_track_id_expr_matches_python(self):
+        """Verify generate_canonical_track_id_expr produces same output as Python function."""
+        test_cases = [
+            ("Highway Star", "Deep Purple"),
+            ("Song (Remastered)", "Artist"),
+            ("Track (Live at Wembley)", "Band Name"),
+            ("Bohemian Rhapsody", "Queen"),
+        ]
+
+        df = pl.DataFrame(
+            {
+                "track": [t[0] for t in test_cases],
+                "artist": [t[1] for t in test_cases],
+            }
+        )
+        result = (
+            df.with_columns(
+                track_id=generate_canonical_track_id_expr("track", "artist")
+            )
+            .select("track_id")["track_id"]
+            .to_list()
+        )
+
+        expected = [generate_canonical_track_id(t, a) for t, a in test_cases]
+        assert result == expected
+
+    def test_generate_canonical_artist_id_expr_matches_python(self):
+        """Verify generate_canonical_artist_id_expr produces same output as Python function."""
+        test_cases = ["Deep Purple", "The Beatles", "QUEEN", "  Spaced Band  "]
+
+        df = pl.DataFrame({"artist": test_cases})
+        result = (
+            df.with_columns(artist_id=generate_canonical_artist_id_expr("artist"))
+            .select("artist_id")["artist_id"]
+            .to_list()
+        )
+
+        expected = [generate_canonical_artist_id(a) for a in test_cases]
+        assert result == expected
+
+    def test_is_music_video_expr_matches_python(self):
+        """Verify is_music_video_expr produces same output as Python function."""
+        test_cases = [
+            "Song Name",
+            "Song (Official Video)",
+            "Track (Music Video)",
+            "Album Track",
+            "Song - Lyric Video",
+            "Track (Visualizer)",
+            "Regular Song",
+        ]
+
+        df = pl.DataFrame({"track": test_cases})
+        result = (
+            df.with_columns(is_video=is_music_video_expr("track"))
+            .select("is_video")["is_video"]
+            .to_list()
+        )
+
+        expected = [is_music_video(t) for t in test_cases]
+        assert result == expected
