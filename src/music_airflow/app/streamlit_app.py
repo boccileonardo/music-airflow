@@ -749,12 +749,18 @@ def main():
                                         break
 
                                 if replacement is not None and len(replacement) > 0:
-                                    replacement = replacement.select(
-                                        st.session_state.recommendations.columns
-                                    )
+                                    # Select only columns that exist in both DataFrames
+                                    common_columns = [
+                                        c
+                                        for c in st.session_state.recommendations.columns
+                                        if c in pool.columns
+                                    ]
+                                    replacement = replacement.select(common_columns)
                                     st.session_state.recommendations = pl.concat(
                                         [
-                                            st.session_state.recommendations,
+                                            st.session_state.recommendations.select(
+                                                common_columns
+                                            ),
                                             replacement,
                                         ]
                                     )
@@ -906,12 +912,20 @@ def main():
                                         displayed_tracks.add(track_key)
 
                                 if replacements:
+                                    # Select only columns that exist in both DataFrames
+                                    common_columns = [
+                                        c
+                                        for c in st.session_state.recommendations.columns
+                                        if c in pool.columns
+                                    ]
                                     replacement_df = pl.DataFrame(
                                         replacements, schema=pool.schema
-                                    ).select(st.session_state.recommendations.columns)
+                                    ).select(common_columns)
                                     st.session_state.recommendations = pl.concat(
                                         [
-                                            st.session_state.recommendations,
+                                            st.session_state.recommendations.select(
+                                                common_columns
+                                            ),
                                             replacement_df,
                                         ]
                                     )
